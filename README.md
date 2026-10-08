@@ -24,9 +24,11 @@ Open the `ts.net` URL on your phone, then use Share → Add to Home Screen (iOS)
 
 ### Import the spreadsheet (once)
 
+Copy the spreadsheet into `data/` (already mounted in the container at `/data`), then run the importer:
+
 ```sh
-docker compose run --rm -v "/path/to/Game Rating Rubric v2.xlsx:/import.xlsx:ro" \
-  tablescore node server/import-xlsx.js /import.xlsx
+cp "/path/to/Game Rating Rubric v2.xlsx" data/rubric.xlsx
+docker compose run --rm tablescore node server/import-xlsx.js /data/rubric.xlsx
 ```
 
 This loads every game on the Scores tab (scores, old rating, calibration and avoid-theme flags, notes) and the weights and stretch factor from the Weights tab. Games already in the database are skipped. Add `--overwrite` to replace their scores from the sheet.

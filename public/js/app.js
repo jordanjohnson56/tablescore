@@ -15,6 +15,9 @@ const esc = (s) =>
 const fmt = (n, d = 1) => (n == null ? "—" : Number(n).toFixed(d));
 const final = (g) => finalScore(g.scores, state.settings);
 const byId = (id) => state.games.find((g) => g.id === id);
+const isHiddenType = (type) => state.settings.hideExpansions && type === "Expansion";
+/** Games the list, summary and exports show; Settings can hide expansions. */
+const visibleGames = () => state.games.filter((g) => !isHiddenType(g.type));
 
 function loadPrefs() {
   try {
@@ -143,7 +146,7 @@ function filtered() {
     update: (g) => bggDrift(g) != null,
     avoid: (g) => g.avoidTheme,
   };
-  const list = state.games.filter((g) => (tests[prefs.filter] || tests.all)(g) && (!q || g.name.toLowerCase().includes(q)));
+  const list = visibleGames().filter((g) => (tests[prefs.filter] || tests.all)(g) && (!q || g.name.toLowerCase().includes(q)));
   const sorters = {
     score: (a, b) => (final(b) ?? -1) - (final(a) ?? -1) || (b.bggRating ?? -1) - (a.bggRating ?? -1),
     name: (a, b) => a.name.localeCompare(b.name),
@@ -157,7 +160,7 @@ function renderList() {
   view.innerHTML = `
     <div class="toolbar">
       <div class="toolbar-row">
-        <input type="search" id="q" placeholder="Search ${state.games.length} games" value="${esc(prefs.q)}" aria-label="Search games">
+        <input type="search" id="q" placeholder="Search ${visibleGames().length} games" value="${esc(prefs.q)}" aria-label="Search games">
         <select id="sort" aria-label="Sort">
           ${[["score", "Score"], ["name", "Name"], ["plays", "Plays"], ["recent", "Recent"]]
             .map(([v, l]) => `<option value="${v}" ${prefs.sort === v ? "selected" : ""}>${l}</option>`).join("")}
@@ -172,7 +175,7 @@ function renderList() {
     const list = filtered();
     document.getElementById("games").innerHTML = list.length
       ? list.map(rowHtml).join("")
-      : `<li class="empty">${state.games.length ? "No games match." : 'No games yet. Import your spreadsheet or use <a href="#/add">Add</a>.'}</li>`;
+      : `<li class="empty">${visibleGames().length ? "No games match." : state.games.length ? "Every game is an expansion, and expansions are hidden in Settings." : 'No games yet. Import your spreadsheet or use <a href="#/add">Add</a>.'}</li>`;
   };
   fill();
   view.querySelector("#q").addEventListener("input", (e) => {
@@ -411,8 +414,9 @@ function renderAdd() {
       try {
         const rows = await api.get(`/api/bgg/search?q=${encodeURIComponent(q)}`);
         if (mine !== seq) return;
-        results.innerHTML = rows.length
-          ? rows.map((r) => `<li><div class="game-row">
+        const shown = rows.filter((r) => !isHiddenType(r.type));
+        results.innerHTML = shown.length
+          ? shown.map((r) => `<li><div class="game-row">
               <div class="info"><div class="name">${esc(r.name)}${r.type === "Expansion" ? '<span class="tag">Exp</span>' : ""}</div>
               <div class="meta">${r.year ?? ""}</div></div>
               ${r.inList
@@ -445,8 +449,9 @@ function renderAdd() {
 // ---------- summary ----------
 
 function renderSummary() {
-  const scored = state.games.filter((g) => final(g) != null);
-  const olds = state.games.map((g) => g.oldRating).filter((x) => x != null);
+  const games = visibleGames();
+  const scored = games.filter((g) => final(g) != null);
+  const olds = games.map((g) => g.oldRating).filter((x) => x != null);
   const o = spread(olds);
   const n = spread(scored.map(final));
   const pct = (x) => (x == null ? "—" : `${Math.round(x * 100)}%`);
@@ -477,7 +482,7 @@ function renderSummary() {
 
   view.innerHTML = `
     <h1>Summary</h1>
-    <p class="muted small">Old ratings are the spreadsheet baseline. New scores count fully scored games only (${scored.length} of ${state.games.length}).</p>
+    <p class="muted small">Old ratings are the spreadsheet baseline. New scores count fully scored games only (${scored.length} of ${games.length})${state.settings.hideExpansions ? ". Expansions are hidden" : ""}.</p>
     <table>
       <thead><tr><th>Metric</th><th class="num">Old</th><th class="num">New</th><th>Target</th></tr></thead>
       <tbody>${rows.map(([m, a, b, t]) => `<tr><td>${m}</td><td class="num">${a ?? "—"}</td><td class="num">${b ?? "—"}</td><td class="muted small">${t}</td></tr>`).join("")}</tbody>
@@ -497,6 +502,11 @@ function renderSettings() {
   const s = state.settings;
   view.innerHTML = `
     <h1>Settings</h1>
+    <section class="card">
+      <h2 style="margin-top:0">Display</h2>
+      <label class="toggle"><input type="checkbox" id="hideexp" ${s.hideExpansions ? "checked" : ""}> Hide expansions</label>
+      <p class="small muted">Hides expansions from the game list, Summary, BGG search and the Claude export. Their scores are kept.</p>
+    </section>
     <section class="card">
       <h2 style="margin-top:0">Weights</h2>
       <p class="muted small">Points out of 100. Every score updates when you save.</p>
@@ -550,6 +560,15 @@ function renderSettings() {
   });
 
   view.querySelector("#copy").addEventListener("click", copyForClaude);
+  view.querySelector("#hideexp").addEventListener("change", async (e) => {
+    try {
+      state.settings = await api.put("/api/settings", { hideExpansions: e.target.checked });
+      toast(state.settings.hideExpansions ? "Expansions hidden" : "Expansions shown");
+    } catch (err) {
+      e.target.checked = !e.target.checked;
+      toast(`Couldn't save: ${err.message}`, 5000);
+    }
+  });
 
   const syncBtn = view.querySelector("#sync");
   if (!syncBtn) return;
@@ -590,11 +609,11 @@ async function copyForClaude() {
     `My board game ratings from my Tablescore rubric (weights: ${CRITERIA.map((c) => `${c.name} ${w[c.key]}`).join(", ")}; stretch ${state.settings.stretch}).`,
     "Scored games (final score | criteria in that order | plays | status | avoid-theme):",
   ];
-  const scored = state.games.filter((g) => final(g) != null).sort((a, b) => final(b) - final(a));
+  const scored = visibleGames().filter((g) => final(g) != null).sort((a, b) => final(b) - final(a));
   for (const g of scored) {
     lines.push(`- ${g.name}: ${fmt(final(g))} | ${CRITERIA.map((c) => g.scores[c.key]).join("/")} | ${g.plays} plays | ${g.status || "-"}${g.avoidTheme ? " | AVOID THEME" : ""}`);
   }
-  const rest = state.games.filter((g) => final(g) == null && g.bggRating != null).sort((a, b) => b.bggRating - a.bggRating);
+  const rest = visibleGames().filter((g) => final(g) == null && g.bggRating != null).sort((a, b) => b.bggRating - a.bggRating);
   if (rest.length) {
     lines.push("", "Not yet rescored (old BGG rating):");
     for (const g of rest) lines.push(`- ${g.name}: ${fmt(g.bggRating)}${g.status ? ` (${g.status})` : ""}`);

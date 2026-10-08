@@ -32,7 +32,7 @@ export function createApp({ store, bgg, bggUsername }) {
   });
 
   app.put("/api/settings", (req, res) => {
-    const { weights, stretch } = req.body;
+    const { weights, stretch, hideExpansions } = req.body;
     if (weights !== undefined) {
       const ok = CRITERIA.every((c) => typeof weights[c.key] === "number" && weights[c.key] >= 0);
       if (!ok) throw new HttpError(400, "weights needs a non-negative number for every criterion");
@@ -40,7 +40,10 @@ export function createApp({ store, bgg, bggUsername }) {
     if (stretch !== undefined && !(typeof stretch === "number" && stretch > 0 && stretch <= 5)) {
       throw new HttpError(400, "stretch must be a number between 0 and 5");
     }
-    res.json(store.setSettings({ weights, stretch }));
+    if (hideExpansions !== undefined && typeof hideExpansions !== "boolean") {
+      throw new HttpError(400, "hideExpansions must be true or false");
+    }
+    res.json(store.setSettings({ weights, stretch, hideExpansions }));
   });
 
   app.post("/api/games", (req, res) => {
