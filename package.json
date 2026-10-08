@@ -1,9 +1,21 @@
 {
-    "name": "tablescore",
-    "private": true,
-    "type": "module",
-    "scripts": {
-        "test": "node --test",
-        "start": "python3 -m http.server 8080"
-    }
+  "name": "tablescore",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server/index.js",
+    "import-xlsx": "node --disable-warning=ExperimentalWarning server/import-xlsx.js",
+    "test": "node --disable-warning=ExperimentalWarning --test"
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0",
+    "express": "^5.2.1",
+    "fast-xml-parser": "^5.11.2"
+  },
+  "overrides": {
+    "uuid": "^11.1.1"
+  }
 }
