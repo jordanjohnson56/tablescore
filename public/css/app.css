@@ -100,6 +100,7 @@ label.field > span { display: block; font-size: 0.85rem; color: var(--ink-2); ma
 .toolbar { position: sticky; top: 0; background: var(--bg); padding: 12px 0 0; z-index: 5; }
 .toolbar-row { display: flex; gap: 8px; }
 .toolbar-row select { width: auto; flex: none; }
+.list-count { margin: 0; padding: 0 0 8px; font-size: 0.85rem; }
 
 /* Game list */
 .list { list-style: none; margin: 0; padding: 0; }

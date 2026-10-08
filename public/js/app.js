@@ -169,10 +169,12 @@ function renderList() {
       <div class="chips" role="group" aria-label="Filter">
         ${FILTERS.map(([v, l]) => `<button class="chip" data-f="${v}" aria-pressed="${prefs.filter === v}">${l}</button>`).join("")}
       </div>
+      <p class="list-count muted" id="count" aria-live="polite"></p>
     </div>
     <ul class="list" id="games"></ul>`;
   const fill = () => {
     const list = filtered();
+    document.getElementById("count").textContent = `${list.length} ${list.length === 1 ? "game" : "games"}`;
     document.getElementById("games").innerHTML = list.length
       ? list.map(rowHtml).join("")
       : `<li class="empty">${visibleGames().length ? "No games match." : state.games.length ? "Every game is an expansion, and expansions are hidden in Settings." : 'No games yet. Import your spreadsheet or use <a href="#/add">Add</a>.'}</li>`;
