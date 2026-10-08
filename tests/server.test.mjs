@@ -312,3 +312,9 @@ test("backups keep only the newest N daily files", () => {
   const copy = openDb(join(dir, "tablescore-2026-01-05.db"));
   assert.equal(copy.listGames()[0].name, "A");
 });
+
+test("import explains a folder or missing path instead of crashing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ts-imp-"));
+  await assert.rejects(readWorkbook(dir), /is a folder, not a spreadsheet/);
+  await assert.rejects(readWorkbook(join(dir, "nope.xlsx")), /No file at/);
+});
