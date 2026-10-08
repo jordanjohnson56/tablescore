@@ -318,3 +318,17 @@ test("import explains a folder or missing path instead of crashing", async () =>
   await assert.rejects(readWorkbook(dir), /is a folder, not a spreadsheet/);
   await assert.rejects(readWorkbook(join(dir, "nope.xlsx")), /No file at/);
 });
+
+test("hideExpansions setting persists and is validated", async () => {
+  const t = await startApp();
+  try {
+    assert.equal((await t.call("GET", "/api/state")).body.settings.hideExpansions, false);
+    const r = await t.call("PUT", "/api/settings", { hideExpansions: true });
+    assert.equal(r.body.hideExpansions, true);
+    assert.equal(r.body.stretch, 1.25);
+    assert.equal((await t.call("PUT", "/api/settings", { hideExpansions: "yes" })).status, 400);
+    assert.equal((await t.call("PUT", "/api/settings", { stretch: 1.5 })).body.hideExpansions, true);
+  } finally {
+    t.close();
+  }
+});

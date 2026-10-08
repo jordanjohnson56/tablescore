@@ -129,6 +129,7 @@ export const SCALE = [
 export const DEFAULT_SETTINGS = {
   weights: { desire: 40, table: 15, depth: 10, interaction: 10, replay: 10, art: 10, theme: 5 },
   stretch: 1.25,
+  hideExpansions: false,
 };
 
 export const PROVISIONAL_PLAYS = 3;
