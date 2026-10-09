@@ -49,8 +49,8 @@ function players(g) {
   return `${range}p${g.bestPlayers ? ` (best ${g.bestPlayers})` : ""}`;
 }
 
-function metaLine(g) {
-  return [g.status, players(g), g.playTime ? `${g.playTime} min` : "", g.bggWeight ? `wt ${fmt(g.bggWeight, 1)}` : ""]
+function metaDetails(g) {
+  return [players(g), g.playTime ? `${g.playTime} min` : "", g.bggWeight ? `wt ${fmt(g.bggWeight, 1)}` : ""]
     .filter(Boolean)
     .join(" · ");
 }
@@ -200,6 +200,16 @@ function renderList() {
   );
 }
 
+/** Status and tags stay fixed; only the details after them truncate. */
+function metaHtml(g, tags) {
+  const details = metaDetails(g);
+  return [
+    g.status ? `<span class="status">${esc(g.status)}</span>` : "",
+    tags ? `<span class="tags">${tags}</span>` : "",
+    details ? `<span class="details">${g.status ? "· " : ""}${esc(details)}</span>` : "",
+  ].join("");
+}
+
 function rowHtml(g) {
   const f = final(g);
   const n = scoredCount(g.scores);
@@ -220,7 +230,7 @@ function rowHtml(g) {
     : `<div class="thumb" aria-hidden="true"></div>`;
   return `<li class="${g.avoidTheme ? "avoid" : ""}"><a class="game-row" href="#/g/${g.id}">
     ${thumb}
-    <div class="info"><div class="name">${esc(g.name)}${tags}</div><div class="meta">${esc(metaLine(g))}</div></div>
+    <div class="info"><div class="name">${esc(g.name)}</div><div class="meta">${metaHtml(g, tags)}</div></div>
     <div class="score-badge">${badge}</div></a></li>`;
 }
 
