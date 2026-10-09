@@ -127,7 +127,6 @@ const FILTERS = [
   ["all", "All"],
   ["todo", "To score"],
   ["scored", "Scored"],
-  ["calibration", "Calibration"],
   ["owned", "Owned"],
   ["wishlist", "Wishlist"],
   ["update", "Update BGG"],
@@ -140,7 +139,6 @@ function filtered() {
     all: () => true,
     todo: (g) => final(g) == null,
     scored: (g) => final(g) != null,
-    calibration: (g) => g.calibration,
     owned: (g) => g.status === "Owned",
     wishlist: (g) => g.status === "Wishlist" || g.status === "Want" || g.status === "Want to play",
     update: (g) => bggDrift(g) != null,
@@ -157,6 +155,7 @@ function filtered() {
 }
 
 function renderList() {
+  if (!FILTERS.some(([v]) => v === prefs.filter)) prefs.filter = "all";
   view.innerHTML = `
     <div class="toolbar">
       <div class="toolbar-row">
