@@ -130,6 +130,7 @@ export const DEFAULT_SETTINGS = {
   weights: { desire: 40, table: 15, depth: 10, interaction: 10, replay: 10, art: 10, theme: 5 },
   stretch: 1.25,
   hideExpansions: false,
+  includeWatching: false,
 };
 
 export const PROVISIONAL_PLAYS = 3;
@@ -172,6 +173,11 @@ export function finalScore(scores, settings = DEFAULT_SETTINGS) {
   const stretched = 5 + (raw - 5) * settings.stretch;
   // Epsilon nudge so x.x5 rounds half-up like Excel ROUND despite float error.
   return Math.round(Math.max(0, Math.min(10, stretched)) * 10 + 1e-9) / 10;
+}
+
+/** A score, rating or other number for display: one decimal by default, a dash when there is none. */
+export function formatNumber(n, digits = 1) {
+  return n == null ? "—" : Number(n).toFixed(digits);
 }
 
 export function rescoreStatus(scores) {

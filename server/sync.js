@@ -42,11 +42,14 @@ export async function syncCollection(store, bgg, username, progress = () => {}) 
   return { collection: items.length, added, updated, enriched };
 }
 
-/** Add one game by BGG id with its details filled in. */
-export async function addFromBgg(store, bgg, bggId) {
+/**
+ * Add one game by BGG id with its details filled in, plus any watch fields.
+ * A game already in the list is returned unchanged.
+ */
+export async function addFromBgg(store, bgg, bggId, watch = {}) {
   const existing = store.getByBggId(bggId);
   if (existing) return { game: existing, existed: true };
   const [details] = await bgg.things([bggId]);
   if (!details) return { game: null };
-  return { game: store.createGame(details), existed: false };
+  return { game: store.createGame({ ...details, ...watch }), existed: false };
 }
