@@ -74,6 +74,27 @@ npm run export-watchlist -- ~/watchlist-repo/watchlist.json
 cd ~/watchlist-repo && git add watchlist.json && git commit -m "Watchlist $(date +%F)" && git push
 ```
 
+### Import watched games
+
+To seed watched games without typing them on your phone, put them in a JSON file and import it. The file is an array of games in the export's game shape, or a whole watchlist export. Each game needs a `name` and a `watchStage` (`campaign`, `awaiting`, `delivered`, `reviews`, `buy` or `pass`). The other fields (`bggId`, `campaignUrl`, `platform`, `campaignEnd`, `deliveryEst`, `predictedScore`, `targetPrice`, `targetCurrency`, `notes`) are optional, and `decided` is ignored.
+
+```json
+[
+  { "name": "Example Quest", "watchStage": "campaign", "platform": "kickstarter",
+    "campaignUrl": "https://www.kickstarter.com/projects/example/example-quest",
+    "campaignEnd": "2026-11-30", "deliveryEst": "2027-10", "predictedScore": 7.5,
+    "targetPrice": 40, "targetCurrency": "USD", "notes": "" }
+]
+```
+
+```sh
+npm run import-watchlist -- data/watchlist-seed.json
+# With Docker:
+#   docker compose run --rm tablescore node server/import-watchlist.js /data/watchlist-seed.json
+```
+
+A game already in the database is skipped and listed as skipped, never overwritten. It matches by BGG ID, or by name ignoring case when the import has no BGG ID, so running the import twice is harmless. If any game is invalid (no name, an unknown stage, a bad date or price), the import names it and writes nothing. Keep personal seed files under `data/`, which git ignores.
+
 ## Data and backups
 
 Everything lives in `data/tablescore.db`. On start and every 24 h, the server writes `data/backups/tablescore-YYYY-MM-DD.db` and keeps the newest `BACKUP_KEEP` (default 14). Copying `data/` somewhere else is your off-box backup. **Settings → Export JSON** downloads everything, and **Copy scores for Claude** puts a plain-text summary on the clipboard for asking about recommendations.
