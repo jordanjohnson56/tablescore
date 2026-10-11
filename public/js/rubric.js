@@ -175,6 +175,11 @@ export function finalScore(scores, settings = DEFAULT_SETTINGS) {
   return Math.round(Math.max(0, Math.min(10, stretched)) * 10 + 1e-9) / 10;
 }
 
+/** A score, rating or other number for display: one decimal by default, a dash when there is none. */
+export function formatNumber(n, digits = 1) {
+  return n == null ? "—" : Number(n).toFixed(digits);
+}
+
 export function rescoreStatus(scores) {
   const n = scoredCount(scores);
   if (n === CRITERIA.length) return "Scored";

@@ -93,7 +93,7 @@ npm run import-watchlist -- data/watchlist-seed.json
 #   docker compose run --rm tablescore node server/import-watchlist.js /data/watchlist-seed.json
 ```
 
-A game already in the database is skipped and listed as skipped, never overwritten. It matches by BGG ID, or by name ignoring case when the import has no BGG ID, so running the import twice is harmless. If any game is invalid (no name, an unknown stage, a bad date or price), the import names it and writes nothing. Keep personal seed files under `data/`, which git ignores.
+A game already in the database is skipped and listed as skipped, never overwritten. It matches when the BGG IDs are equal or the names match ignoring case, so a game you added by hand without a BGG ID isn't duplicated and running the import twice is harmless. If any game is invalid (no name, an unknown stage, a bad date or price), the import names it and writes nothing. Keep personal seed files under `data/`, which git ignores.
 
 ## Data and backups
 

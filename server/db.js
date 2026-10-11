@@ -21,7 +21,7 @@ const USER_FIELDS = {
 
 // Watch fields, also user-editable, with their column types. Added to existing
 // databases by migrate(); BGG sync never writes them.
-const WATCH_FIELDS = {
+export const WATCH_FIELDS = {
   watchStage: ["watch_stage", "TEXT"],
   campaignUrl: ["campaign_url", "TEXT"],
   platform: ["platform", "TEXT"],
@@ -34,6 +34,8 @@ const WATCH_FIELDS = {
 
 // One check per watch field: true if the (non-null) value is allowed, plus the
 // message a 400 carries otherwise.
+// One decimal at most, allowing for float error (7.3 * 10 isn't exactly 73).
+const oneDecimal = (v) => Math.abs(v * 10 - Math.round(v * 10)) < 1e-9;
 const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v) && new Date(`${v}T00:00:00Z`).toISOString().startsWith(v);
 const WATCH_RULES = {
   watchStage: [(v) => STAGE_KEYS.includes(v), `watchStage must be one of ${STAGE_KEYS.join(", ")} or null`],
@@ -41,7 +43,7 @@ const WATCH_RULES = {
   platform: [(v) => PLATFORMS.some((p) => p.key === v), `platform must be one of ${PLATFORMS.map((p) => p.key).join(", ")} or null`],
   campaignEnd: [(v) => typeof v === "string" && isDate(v), "campaignEnd must be a date like 2026-10-30 or null"],
   deliveryEst: [(v) => typeof v === "string" && /^\d{4}-(0[1-9]|1[0-2])$/.test(v), "deliveryEst must be a month like 2027-09 or null"],
-  predictedScore: [(v) => typeof v === "number" && v >= 0 && v <= 10, "predictedScore must be 0-10 or null"],
+  predictedScore: [(v) => typeof v === "number" && v >= 0 && v <= 10 && oneDecimal(v), "predictedScore must be 0-10 with at most one decimal, or null"],
   targetPrice: [(v) => typeof v === "number" && Number.isFinite(v) && v >= 0, "targetPrice must be a non-negative number or null"],
   targetCurrency: [(v) => typeof v === "string" && /^[A-Z]{3}$/.test(v), "targetCurrency must be a three-letter code like USD or null"],
 };

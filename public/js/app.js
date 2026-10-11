@@ -1,10 +1,10 @@
 import {
-  CRITERIA, BAND_LABELS, bandIndex, finalScore, rawAverage, scaleEntry, scoredCount,
+  CRITERIA, BAND_LABELS, bandIndex, finalScore, formatNumber, rawAverage, scaleEntry, scoredCount,
   rescoreStatus, isProvisional, weightTotal,
 } from "./rubric.js";
 import {
-  STAGES, STAGE_LABELS, PLATFORMS, claudeExport, isWatching, isHiddenType as hiddenType, summaryStats,
-  visibleGames as shownGames, sortWatchlist, awaitingHint, monthLabel,
+  STAGES, STAGE_LABELS, PLATFORMS, DEFAULT_CURRENCY, targetCurrency, claudeExport, isDecided, isWatching, isHiddenType,
+  summaryStats, visibleGames, sortWatchlist, awaitingHint, monthLabel,
 } from "./watchlist.js";
 import { api } from "./api.js";
 
@@ -16,11 +16,9 @@ const prefs = loadPrefs();
 
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
-const fmt = (n, d = 1) => (n == null ? "—" : Number(n).toFixed(d));
 const final = (g) => finalScore(g.scores, state.settings);
 const byId = (id) => state.games.find((g) => g.id === id);
-const isHiddenType = (type) => hiddenType(type, state.settings);
-const visibleGames = () => shownGames(state.games, state.settings);
+const shownGames = () => visibleGames(state.games, state.settings);
 
 function loadPrefs() {
   try {
@@ -53,7 +51,7 @@ function players(g) {
 }
 
 function metaDetails(g) {
-  return [players(g), g.playTime ? `${g.playTime} min` : "", g.bggWeight ? `wt ${fmt(g.bggWeight, 1)}` : ""]
+  return [players(g), g.playTime ? `${g.playTime} min` : "", g.bggWeight ? `wt ${formatNumber(g.bggWeight, 1)}` : ""]
     .filter(Boolean)
     .join(" · ");
 }
@@ -113,20 +111,19 @@ window.addEventListener("pagehide", () => {
 
 // ---------- router ----------
 
+// Each tab's renderer, matched by hash prefix; anything else is the games list.
+const TABS = { watchlist: renderWatchlist, add: renderAdd, summary: renderSummary, settings: renderSettings, games: renderList };
+
 function route() {
   const hash = location.hash || "#/";
-  const tab = hash.startsWith("#/watchlist") ? "watchlist" : hash.startsWith("#/add") ? "add" : hash.startsWith("#/summary") ? "summary" : hash.startsWith("#/settings") ? "settings" : "games";
+  const tab = Object.keys(TABS).find((t) => hash.startsWith(`#/${t}`)) || "games";
   document.querySelectorAll(".tabs a").forEach((a) => {
     if (a.dataset.tab === tab) a.setAttribute("aria-current", "page");
     else a.removeAttribute("aria-current");
   });
   const m = hash.match(/^#\/g\/(\d+)/);
   if (m) return renderScorer(Number(m[1]));
-  if (tab === "watchlist") return renderWatchlist();
-  if (tab === "add") return renderAdd();
-  if (tab === "summary") return renderSummary();
-  if (tab === "settings") return renderSettings();
-  return renderList();
+  return TABS[tab]();
 }
 window.addEventListener("hashchange", () => {
   route();
@@ -156,7 +153,7 @@ function filtered() {
     update: (g) => bggDrift(g) != null,
     avoid: (g) => g.avoidTheme,
   };
-  const list = visibleGames().filter((g) => (tests[prefs.filter] || tests.all)(g) && (!q || g.name.toLowerCase().includes(q)));
+  const list = shownGames().filter((g) => (tests[prefs.filter] || tests.all)(g) && (!q || g.name.toLowerCase().includes(q)));
   const sorters = {
     score: (a, b) => (final(b) ?? -1) - (final(a) ?? -1) || (b.bggRating ?? -1) - (a.bggRating ?? -1),
     name: (a, b) => a.name.localeCompare(b.name),
@@ -171,7 +168,7 @@ function renderList() {
   view.innerHTML = `
     <div class="toolbar">
       <div class="toolbar-row">
-        <input type="search" id="q" placeholder="Search ${visibleGames().length} games" value="${esc(prefs.q)}" aria-label="Search games">
+        <input type="search" id="q" placeholder="Search ${shownGames().length} games" value="${esc(prefs.q)}" aria-label="Search games">
         <select id="sort" aria-label="Sort">
           ${[["score", "Score"], ["name", "Name"], ["plays", "Plays"], ["recent", "Recent"]]
             .map(([v, l]) => `<option value="${v}" ${prefs.sort === v ? "selected" : ""}>${l}</option>`).join("")}
@@ -188,7 +185,7 @@ function renderList() {
     document.getElementById("count").textContent = `${list.length} ${list.length === 1 ? "game" : "games"}`;
     document.getElementById("games").innerHTML = list.length
       ? list.map(rowHtml).join("")
-      : `<li class="empty">${visibleGames().length ? "No games match." : state.games.length ? "Every game is hidden: Settings can hide watched games and expansions from this list." : 'No games yet. Import your spreadsheet or use <a href="#/add">Add</a>.'}</li>`;
+      : `<li class="empty">${shownGames().length ? "No games match." : state.games.length ? "Every game is hidden: Settings can hide watched games and expansions from this list." : 'No games yet. Import your spreadsheet or use <a href="#/add">Add</a>.'}</li>`;
   };
   fill();
   view.querySelector("#q").addEventListener("input", (e) => {
@@ -221,6 +218,12 @@ function metaHtml(g, tags) {
   ].join("");
 }
 
+function thumbHtml(g) {
+  return g.thumbnail
+    ? `<img class="thumb" src="${esc(g.thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer">`
+    : `<div class="thumb" aria-hidden="true"></div>`;
+}
+
 function rowHtml(g) {
   const f = final(g);
   const n = scoredCount(g.scores);
@@ -233,17 +236,14 @@ function rowHtml(g) {
     bggDrift(g) != null ? `<span class="tag warn" title="BGG rating differs">BGG</span>` : "",
   ].join("");
   const badge = f != null
-    ? `<div class="num">${fmt(f)}</div><div class="lbl">score</div>`
+    ? `<div class="num">${formatNumber(f)}</div><div class="lbl">score</div>`
     : isWatching(g)
-      ? `<div class="num predicted">${fmt(g.predictedScore)}</div><div class="lbl">predicted</div>`
+      ? `<div class="num predicted">${formatNumber(g.predictedScore)}</div><div class="lbl">predicted</div>`
       : g.bggRating != null
-        ? `<div class="num old">${fmt(g.bggRating)}</div><div class="lbl">old</div>`
+        ? `<div class="num old">${formatNumber(g.bggRating)}</div><div class="lbl">old</div>`
         : `<div class="num old">—</div>`;
-  const thumb = g.thumbnail
-    ? `<img class="thumb" src="${esc(g.thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer">`
-    : `<div class="thumb" aria-hidden="true"></div>`;
   return `<li class="${g.avoidTheme ? "avoid" : ""}"><a class="game-row" href="#/g/${g.id}">
-    ${thumb}
+    ${thumbHtml(g)}
     <div class="info"><div class="name">${esc(g.name)}</div><div class="meta">${metaHtml(g, tags)}</div></div>
     <div class="score-badge">${badge}</div></a></li>`;
 }
@@ -308,13 +308,13 @@ function renderScorer(id) {
       <label class="toggle"><input type="checkbox" id="calib" ${g.calibration ? "checked" : ""}> Calibration game</label>
       <label class="field"><span>Notes</span><textarea id="notes">${esc(g.notes)}</textarea></label>
       <dl class="facts">
-        <div><dt>BGG rating</dt><dd>${fmt(g.bggRating)}</dd></div>
-        <div><dt>Old rating (sheet)</dt><dd>${fmt(g.oldRating)}</dd></div>
-        <div><dt>BGG average</dt><dd>${fmt(g.bggAvg, 2)}</dd></div>
+        <div><dt>BGG rating</dt><dd>${formatNumber(g.bggRating)}</dd></div>
+        <div><dt>Old rating (sheet)</dt><dd>${formatNumber(g.oldRating)}</dd></div>
+        <div><dt>BGG average</dt><dd>${formatNumber(g.bggAvg, 2)}</dd></div>
         <div><dt>Raw average</dt><dd id="raw">—</dd></div>
         <div><dt>Players</dt><dd>${esc(players(g) || "—")}</dd></div>
         <div><dt>Play time</dt><dd>${g.playTime ? `${g.playTime} min` : "—"}</dd></div>
-        <div><dt>Weight</dt><dd>${fmt(g.bggWeight, 2)}</dd></div>
+        <div><dt>Weight</dt><dd>${formatNumber(g.bggWeight, 2)}</dd></div>
         <div><dt>Year</dt><dd>${g.year ?? "—"}</dd></div>
       </dl>
       ${g.bggId ? `<p class="small"><a href="https://boardgamegeek.com/boardgame/${g.bggId}" target="_blank" rel="noopener">Open on BGG</a></p>` : ""}
@@ -326,16 +326,16 @@ function renderScorer(id) {
     const n = scoredCount(g.scores);
     const [, label] = f != null ? scaleEntry(f) : [];
     view.querySelector("#final").innerHTML = f != null
-      ? `<div class="num">${fmt(f)}</div><div class="lbl">${esc(label)}${isProvisional(g) ? " · prov." : ""}</div>`
+      ? `<div class="num">${formatNumber(f)}</div><div class="lbl">${esc(label)}${isProvisional(g) ? " · prov." : ""}</div>`
       : `<div class="num" style="color:var(--muted)">${n}/7</div><div class="lbl">criteria</div>`;
     const raw = rawAverage(g.scores, state.settings);
     view.querySelector("#raw").textContent = raw == null ? "—" : raw.toFixed(2);
     const d = bggDrift(g);
     view.querySelector("#drift").innerHTML = d != null
       ? `<div class="notice drift">
-          <p>Rate it <b>${fmt(d)}</b> on BGG${g.bggRating != null ? ` (it has ${fmt(g.bggRating)})` : ""}.</p>
+          <p>Rate it <b>${formatNumber(d)}</b> on BGG${g.bggRating != null ? ` (it has ${formatNumber(g.bggRating)})` : ""}.</p>
           <div class="btn-row">
-            <a class="btn primary" data-act="open" href="https://boardgamegeek.com/boardgame/${g.bggId}" target="_blank" rel="noopener">Copy ${fmt(d)} &amp; open BGG</a>
+            <a class="btn primary" data-act="open" href="https://boardgamegeek.com/boardgame/${g.bggId}" target="_blank" rel="noopener">Copy ${formatNumber(d)} &amp; open BGG</a>
             <button class="btn" type="button" data-act="done">I've rated it</button>
           </div>
         </div>`
@@ -347,7 +347,7 @@ function renderScorer(id) {
     const act = e.target.closest("[data-act]")?.dataset.act;
     const d = bggDrift(g);
     if (!act || d == null) return;
-    const rating = Number(fmt(d));
+    const rating = Number(formatNumber(d));
     if (act === "open") {
       copyText(String(rating)).then(() => toast(`Copied ${rating}`));
       return; // the link itself opens BGG
@@ -360,7 +360,7 @@ function renderScorer(id) {
         paintHead();
         toast("Marked as rated on BGG");
       } else if (next) {
-        const left = visibleGames().filter((x) => bggDrift(x) != null).length;
+        const left = shownGames().filter((x) => bggDrift(x) != null).length;
         location.hash = `#/g/${next.id}`;
         toast(`${left} left to rate on BGG`);
       } else {
@@ -377,7 +377,7 @@ function renderScorer(id) {
     const v = g.scores[c.key];
     const set = typeof v === "number";
     card.classList.toggle("unset", !set);
-    card.querySelector(".val").textContent = set ? fmt(v, v % 1 ? 1 : 0) : "—";
+    card.querySelector(".val").textContent = set ? formatNumber(v, v % 1 ? 1 : 0) : "—";
     const range = card.querySelector("input");
     if (document.activeElement !== range) range.value = set ? v : 5;
     const bi = set ? bandIndex(v) : -1;
@@ -459,7 +459,7 @@ function watchHtml(g) {
       <label class="field"><span>Target price</span>
         <input type="number" data-watch="targetPrice" min="0" step="0.01" inputmode="decimal" value="${g.targetPrice ?? ""}"></label>
       <label class="field currency"><span>Currency</span>
-        <input type="text" data-watch="targetCurrency" maxlength="3" autocapitalize="characters" placeholder="USD" value="${esc(g.targetCurrency ?? "")}"></label>
+        <input type="text" data-watch="targetCurrency" maxlength="3" autocapitalize="characters" placeholder="${DEFAULT_CURRENCY}" value="${esc(g.targetCurrency ?? "")}"></label>
     </div>
     <label class="field"><span>Platform</span><select data-watch="platform">${opt(PLATFORMS, g.platform, "Not set")}</select></label>
     <label class="field"><span>Campaign URL</span>
@@ -473,15 +473,17 @@ function watchHtml(g) {
   </section>`;
 }
 
+/** Save a watch stage, then redraw: it changes the game page's layout and the Watchlist's order. */
+function setStage(g, stage, redraw) {
+  g.watchStage = stage;
+  queueSave(g.id, { watchStage: stage });
+  redraw();
+}
+
 function bindWatch(g) {
-  // Watching changes the page layout, so starting or stopping redraws it.
-  const setStage = (stage) => {
-    g.watchStage = stage;
-    queueSave(g.id, { watchStage: stage });
-    renderScorer(g.id);
-  };
-  view.querySelector("#watch-start")?.addEventListener("click", () => setStage(STAGES[0].key));
-  view.querySelector("#watch-stop")?.addEventListener("click", () => setStage(null));
+  const redraw = () => renderScorer(g.id);
+  view.querySelector("#watch-start")?.addEventListener("click", () => setStage(g, STAGES[0].key, redraw));
+  view.querySelector("#watch-stop")?.addEventListener("click", () => setStage(g, null, redraw));
   view.querySelectorAll("[data-watch]").forEach((el) => {
     const key = el.dataset.watch;
     el.addEventListener("change", () => {
@@ -491,8 +493,6 @@ function bindWatch(g) {
       if (v === "") v = null;
       if (key === "watchStage" && !v) return;
       const patch = { [key]: v };
-      // A price without a currency is in USD.
-      if (key === "targetPrice" && v != null && !g.targetCurrency) patch.targetCurrency = "USD";
       Object.assign(g, patch);
       queueSave(g.id, patch);
       if (key === "campaignUrl") renderScorer(g.id);
@@ -507,7 +507,7 @@ const todayIso = () => new Date().toLocaleDateString("en-CA"); // local YYYY-MM-
 
 function priceLabel(g) {
   if (g.targetPrice == null) return "";
-  const currency = g.targetCurrency || "USD";
+  const currency = targetCurrency(g);
   try {
     return new Intl.NumberFormat(undefined, { style: "currency", currency }).format(g.targetPrice);
   } catch {
@@ -517,8 +517,8 @@ function priceLabel(g) {
 
 function renderWatchlist() {
   const list = sortWatchlist(state.games);
-  const active = list.filter((g) => !STAGES.find((s) => s.key === g.watchStage).decided);
-  const decided = list.filter((g) => !active.includes(g));
+  const active = list.filter((g) => !isDecided(g));
+  const decided = list.filter(isDecided);
   const today = todayIso();
   view.innerHTML = `
     <h1>Watchlist</h1>
@@ -529,20 +529,13 @@ function renderWatchlist() {
   view.querySelector(".decided")?.addEventListener("toggle", (e) => (decidedOpen = e.target.open));
 
   // Same saves as the game page: a stage change re-sorts the list, a price doesn't.
-  const setStage = (g, stage) => {
-    g.watchStage = stage;
-    queueSave(g.id, { watchStage: stage });
-    renderWatchlist();
-  };
   view.querySelectorAll(".watch-row").forEach((row) => {
     const g = byId(Number(row.dataset.id));
-    row.querySelector("[data-w=stage]").addEventListener("change", (e) => setStage(g, e.target.value));
-    row.querySelector("[data-act=awaiting]")?.addEventListener("click", () => setStage(g, "awaiting"));
+    row.querySelector("[data-w=stage]").addEventListener("change", (e) => setStage(g, e.target.value, renderWatchlist));
+    row.querySelector("[data-act=awaiting]")?.addEventListener("click", () => setStage(g, "awaiting", renderWatchlist));
     row.querySelector("[data-w=price]").addEventListener("change", (e) => {
       const v = e.target.value.trim() === "" ? null : Number(e.target.value);
       const patch = { targetPrice: v };
-      // A price without a currency is in USD.
-      if (v != null && !g.targetCurrency) patch.targetCurrency = "USD";
       Object.assign(g, patch);
       queueSave(g.id, patch);
       row.querySelector(".details").textContent = watchDetails(g);
@@ -557,16 +550,13 @@ function watchDetails(g) {
 }
 
 function watchRowHtml(g, today) {
-  const thumb = g.thumbnail
-    ? `<img class="thumb" src="${esc(g.thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer">`
-    : `<div class="thumb" aria-hidden="true"></div>`;
-  const meta = `<span class="status">${esc(STAGE_LABELS[g.watchStage])}</span><span class="details">${esc(watchDetails(g))}</span>`;
+  const meta = `<span class="stage">${esc(STAGE_LABELS[g.watchStage])}</span><span class="details">${esc(watchDetails(g))}</span>`;
   const badge = g.predictedScore != null
-    ? `<div class="num">${fmt(g.predictedScore)}</div><div class="lbl">predicted</div>`
+    ? `<div class="num">${formatNumber(g.predictedScore)}</div><div class="lbl">predicted</div>`
     : `<div class="num old">—</div><div class="lbl">predicted</div>`;
   return `<li class="watch-row" data-id="${g.id}">
     <a class="game-row" href="#/g/${g.id}">
-      ${thumb}
+      ${thumbHtml(g)}
       <div class="info"><div class="name">${esc(g.name)}</div><div class="meta">${meta}</div></div>
       <div class="score-badge predicted">${badge}</div>
     </a>
@@ -574,7 +564,7 @@ function watchRowHtml(g, today) {
       <select data-w="stage" aria-label="Watch stage for ${esc(g.name)}">${STAGES.map((s) =>
         `<option value="${s.key}" ${g.watchStage === s.key ? "selected" : ""}>${esc(s.label)}</option>`).join("")}</select>
       <label class="price"><input type="number" data-w="price" min="0" step="0.01" inputmode="decimal" placeholder="Target"
-        aria-label="Target price for ${esc(g.name)}" value="${g.targetPrice ?? ""}"><span>${esc(g.targetCurrency || "USD")}</span></label>
+        aria-label="Target price for ${esc(g.name)}" value="${g.targetPrice ?? ""}"><span>${esc(targetCurrency(g))}</span></label>
     </div>
     ${awaitingHint(g, today) ? `<div class="notice"><span>Campaign ended ${esc(g.campaignEnd)}.</span>
       <button class="btn" type="button" data-act="awaiting">Move to Awaiting delivery?</button></div>` : ""}
@@ -632,7 +622,7 @@ function renderAdd() {
       try {
         const rows = await api.get(`/api/bgg/search?q=${encodeURIComponent(q)}`);
         if (mine !== seq) return;
-        const shown = rows.filter((r) => !isHiddenType(r.type));
+        const shown = rows.filter((r) => !isHiddenType(r.type, state.settings));
         results.innerHTML = shown.length
           ? shown.map((r) => `<li><div class="game-row">
               <div class="info"><div class="name">${esc(r.name)}${r.type === "Expansion" ? '<span class="tag">Exp</span>' : ""}</div>
@@ -671,9 +661,9 @@ function renderSummary() {
   const pct = (x) => (x == null ? "—" : `${Math.round(x * 100)}%`);
   const rows = [
     ["Games", o.n, n.n, ""],
-    ["Mean", fmt(o.mean, 2), fmt(n.mean, 2), "~7.0"],
-    ["Median", fmt(o.median, 2), fmt(n.median, 2), "~7.0"],
-    ["Std. dev.", fmt(o.sd, 2), fmt(n.sd, 2), "wider than old"],
+    ["Mean", formatNumber(o.mean, 2), formatNumber(n.mean, 2), "~7.0"],
+    ["Median", formatNumber(o.median, 2), formatNumber(n.median, 2), "~7.0"],
+    ["Std. dev.", formatNumber(o.sd, 2), formatNumber(n.sd, 2), "wider than old"],
     ["9.0 or above", pct(o.pct9), pct(n.pct9), "~5%"],
     ["8.0–8.9", pct(o.pct8), pct(n.pct8), "well under old"],
     ["Below 6.0", pct(o.pctBelow6), pct(n.pctBelow6), "real use of 4–6"],
@@ -706,7 +696,7 @@ function renderSummary() {
     <div class="hist" role="img" aria-label="Count of games at each rounded score, old ratings versus new scores">${hist}</div>
     ${changes.length ? `<h2>Biggest changes vs old</h2>
       <table><tbody>${changes.map(({ g, d }) => `<tr><td><a href="#/g/${g.id}">${esc(g.name)}</a></td>
-        <td class="num">${fmt(g.oldRating)} → ${fmt(final(g))}</td><td class="num">${d > 0 ? "+" : ""}${fmt(d)}</td></tr>`).join("")}</tbody></table>` : ""}`;
+        <td class="num">${formatNumber(g.oldRating)} → ${formatNumber(final(g))}</td><td class="num">${d > 0 ? "+" : ""}${formatNumber(d)}</td></tr>`).join("")}</tbody></table>` : ""}`;
 }
 
 // ---------- settings ----------

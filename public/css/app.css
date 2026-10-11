@@ -119,7 +119,7 @@ label.field > span { display: block; font-size: 0.85rem; color: var(--ink-2); ma
 .game-row .info { flex: 1; min-width: 0; }
 .game-row .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .game-row .meta { display: flex; align-items: center; gap: 4px; font-size: 0.82rem; color: var(--muted); white-space: nowrap; overflow: hidden; }
-.game-row .meta .status, .game-row .meta .tags { flex: none; display: flex; gap: 4px; }
+.game-row .meta .status, .game-row .meta .stage, .game-row .meta .tags { flex: none; display: flex; gap: 4px; }
 .game-row .meta .tags .tag { margin-left: 0; vertical-align: baseline; }
 .game-row .meta .details { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .avoid .name, .avoid-name { color: var(--danger); }

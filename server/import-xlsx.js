@@ -3,25 +3,16 @@
 // Games already in the database are skipped unless --overwrite is given, in which
 // case their scores, flags, notes and old rating are replaced from the sheet.
 import ExcelJS from "exceljs";
-import { statSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { openDb } from "./db.js";
+import { checkFile } from "./files.js";
 import { CRITERIA } from "../public/js/rubric.js";
 
 const WEIGHT_KEYS = { Desire: "desire", Table: "table", Depth: "depth", Interaction: "interaction", Replay: "replay", Art: "art", Theme: "theme" };
 
 export async function readWorkbook(file) {
-  let st;
-  try {
-    st = statSync(file);
-  } catch {
-    throw new Error(`No file at ${file}`);
-  }
-  if (st.isDirectory()) {
-    // What Docker hands you when a -v source path doesn't exist on the host.
-    throw new Error(`${file} is a folder, not a spreadsheet. If you mounted it with docker -v, the host path was wrong.`);
-  }
+  checkFile(file, "a spreadsheet");
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.readFile(file);
 

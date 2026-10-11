@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CRITERIA, DEFAULT_SETTINGS } from "../public/js/rubric.js";
-import { awaitingHint, claudeExport, monthLabel, sortWatchlist, summaryStats, visibleGames } from "../public/js/watchlist.js";
+import { awaitingHint, claudeExport, monthLabel, sortWatchlist, summaryStats, targetCurrency, visibleGames } from "../public/js/watchlist.js";
 
-const base = { type: "Base Game", scores: {}, plays: 0, status: "", avoidTheme: false, bggRating: null };
+const base = { type: "Base", scores: {}, plays: 0, status: "", avoidTheme: false, bggRating: null };
 const game = (name, extra = {}) => ({ ...base, name, ...extra });
 const vec = (xs) => Object.fromEntries(CRITERIA.map((c, i) => [c.key, xs[i]]));
 
@@ -127,13 +127,19 @@ test("the Awaiting delivery hint shows only for a Campaign live game whose end d
   assert.equal(hint(null, "2026-10-20"), false);
 });
 
+test("a target price with no currency is in USD", () => {
+  assert.equal(targetCurrency(game("Bookwyrm", { targetPrice: 45, targetCurrency: null })), "USD");
+  assert.equal(targetCurrency(game("Bookwyrm", { targetPrice: 45 })), "USD");
+  assert.equal(targetCurrency(game("Bookwyrm", { targetPrice: 45, targetCurrency: "EUR" })), "EUR");
+});
+
 test("estimated delivery reads as a short month and year", () => {
   assert.equal(monthLabel("2027-10"), "Oct 2027");
   assert.equal(monthLabel("2028-01"), "Jan 2028");
   assert.equal(monthLabel(null), "");
 });
 
-test("Claude export lists watched games in a separate predicted section when includeWatching is on", () => {
+test("Claude export lists watched games in a separate predicted section when includeWatching is on, with any real score labelled beside the prediction", () => {
   const watched = [
     game("Excursions", { watchStage: "reviews", predictedScore: 7.9, scores: vec([9, 9, 9, 9, 9, 9, 9]), bggRating: 8 }),
     game("Bookwyrm", { watchStage: "campaign", predictedScore: 7.3 }),
@@ -151,7 +157,7 @@ test("Claude export lists watched games in a separate predicted section when inc
     "- Ark Nova: 7.5 (Wishlist)",
     "",
     "Watching (predicted): crowdfunded games I haven't played; scores are my predictions from reviews, not real scores (predicted score | watch stage):",
-    "- Excursions: 7.9 predicted | Reviews out",
+    "- Excursions: 7.9 predicted (scored 10.0) | Reviews out",
     "- Bookwyrm: 7.3 predicted | Campaign live",
     "- No guess yet: — predicted | Awaiting delivery",
   ].join("\n"));

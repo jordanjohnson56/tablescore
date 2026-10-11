@@ -5,10 +5,8 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { openDb } from "./db.js";
-import { STAGES, sortWatchlist } from "../public/js/watchlist.js";
-
-const DECIDED = new Set(STAGES.filter((s) => s.decided).map((s) => s.key));
+import { WATCH_FIELDS, openDb } from "./db.js";
+import { isDecided, sortWatchlist, targetCurrency } from "../public/js/watchlist.js";
 
 export function watchlistExport(store, now = new Date()) {
   const { weights, stretch } = store.getSettings();
@@ -18,15 +16,9 @@ export function watchlistExport(store, now = new Date()) {
     games: sortWatchlist(store.listGames()).map((g) => ({
       name: g.name,
       bggId: g.bggId,
-      watchStage: g.watchStage,
-      decided: DECIDED.has(g.watchStage),
-      campaignUrl: g.campaignUrl,
-      platform: g.platform,
-      campaignEnd: g.campaignEnd,
-      deliveryEst: g.deliveryEst,
-      predictedScore: g.predictedScore,
-      targetPrice: g.targetPrice,
-      targetCurrency: g.targetCurrency || "USD",
+      ...Object.fromEntries(Object.keys(WATCH_FIELDS).map((k) => [k, g[k]])),
+      decided: isDecided(g),
+      targetCurrency: targetCurrency(g),
       notes: g.notes,
     })),
   };
