@@ -5,14 +5,35 @@ import { CRITERIA, finalScore } from "./rubric.js";
 
 const fmt = (n) => (n == null ? "—" : Number(n).toFixed(1));
 
+/** Watch stages in Watchlist order. Buy and Pass are the Decided stages. */
+export const STAGES = [
+  { key: "campaign", label: "Campaign live" },
+  { key: "awaiting", label: "Awaiting delivery" },
+  { key: "delivered", label: "Delivered" },
+  { key: "reviews", label: "Reviews out" },
+  { key: "buy", label: "Buy", decided: true },
+  { key: "pass", label: "Pass", decided: true },
+];
+export const STAGE_KEYS = STAGES.map((s) => s.key);
+export const STAGE_LABELS = Object.fromEntries(STAGES.map((s) => [s.key, s.label]));
+
+export const PLATFORMS = [
+  { key: "kickstarter", label: "Kickstarter" },
+  { key: "gamefound", label: "Gamefound" },
+  { key: "other", label: "Other" },
+];
+
+/** A game is Watching when it has a watch stage. */
+export const isWatching = (game) => Boolean(game.watchStage);
+
 /** True for a BGG type that Settings hides (expansions, when hideExpansions is on). */
 export function isHiddenType(type, settings) {
   return Boolean(settings.hideExpansions) && type === "Expansion";
 }
 
-/** Games the list, Summary and exports show; Settings can hide expansions. */
+/** Games the list, Summary and exports show: never watched games; Settings can hide expansions. */
 export function visibleGames(games, settings) {
-  return games.filter((g) => !isHiddenType(g.type, settings));
+  return games.filter((g) => !isWatching(g) && !isHiddenType(g.type, settings));
 }
 
 /**

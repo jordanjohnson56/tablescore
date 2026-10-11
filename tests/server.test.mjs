@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import ExcelJS from "exceljs";
 import { openDb } from "../server/db.js";
 import { BggClient } from "../server/bgg.js";
@@ -94,8 +95,8 @@ const defaultRoutes = () => {
   };
 };
 
-async function startApp({ withBgg = true } = {}) {
-  const store = openDb(":memory:");
+async function startApp({ withBgg = true, file = ":memory:" } = {}) {
+  const store = openDb(file);
   const { client, calls } = fakeBgg(defaultRoutes());
   const bgg = withBgg ? client : new BggClient({});
   const app = createApp({ store, bgg, bggUsername: "tester" });
@@ -112,7 +113,7 @@ async function startApp({ withBgg = true } = {}) {
     const text = await res.text();
     return { status: res.status, body: text ? JSON.parse(text) : null };
   };
-  return { store, calls, call, close: () => server.close() };
+  return { store, calls, call, close: () => (server.close(), store.db.close()) };
 }
 
 // ---------- BGG client ----------
@@ -347,6 +348,145 @@ test("hideExpansions setting persists and is validated", async () => {
     assert.equal(r.body.stretch, 1.25);
     assert.equal((await t.call("PUT", "/api/settings", { hideExpansions: "yes" })).status, 400);
     assert.equal((await t.call("PUT", "/api/settings", { stretch: 1.5 })).body.hideExpansions, true);
+  } finally {
+    t.close();
+  }
+});
+
+// ---------- watchlist ----------
+
+const pick = (obj, like) => Object.fromEntries(Object.keys(like).map((k) => [k, obj[k]]));
+
+const WATCH_NULLS = {
+  watchStage: null, campaignUrl: null, platform: null, campaignEnd: null,
+  deliveryEst: null, predictedScore: null, targetPrice: null, targetCurrency: null,
+};
+
+// The games table as it was before the watchlist, holding one scored game.
+function writeOldDb(file) {
+  const db = new DatabaseSync(file);
+  db.exec(`
+    CREATE TABLE games (
+      id INTEGER PRIMARY KEY, bgg_id INTEGER UNIQUE, name TEXT NOT NULL,
+      type TEXT NOT NULL DEFAULT 'Base', status TEXT NOT NULL DEFAULT '', plays INTEGER NOT NULL DEFAULT 0,
+      old_rating REAL, bgg_rating REAL, bgg_avg REAL,
+      calibration INTEGER NOT NULL DEFAULT 0, avoid_theme INTEGER NOT NULL DEFAULT 0, notes TEXT NOT NULL DEFAULT '',
+      year INTEGER, min_players INTEGER, max_players INTEGER, best_players TEXT NOT NULL DEFAULT '',
+      play_time INTEGER, bgg_weight REAL, image TEXT, thumbnail TEXT,
+      s_desire REAL, s_table REAL, s_depth REAL, s_interaction REAL, s_replay REAL, s_art REAL, s_theme REAL,
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
+    CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    INSERT INTO games (bgg_id, name, status, plays, notes, s_desire, s_table, s_theme)
+      VALUES (13, 'Catan', 'Owned', 9, 'classic', 8, 6.5, 5);
+  `);
+  db.close();
+}
+
+test("an old database opens with its games intact and the watch fields present and null, twice", async () => {
+  const file = join(mkdtempSync(join(tmpdir(), "ts-mig-")), "old.db");
+  writeOldDb(file);
+  for (let open = 1; open <= 2; open++) {
+    const t = await startApp({ file });
+    try {
+      const { body } = await t.call("GET", "/api/state");
+      assert.equal(body.games.length, 1);
+      const [g] = body.games;
+      assert.equal(g.name, "Catan");
+      assert.equal(g.notes, "classic");
+      assert.equal(g.plays, 9);
+      assert.deepEqual(g.scores, { desire: 8, table: 6.5, depth: null, interaction: null, replay: null, art: null, theme: 5 });
+      assert.deepEqual(pick(g, WATCH_NULLS), WATCH_NULLS);
+    } finally {
+      t.close();
+    }
+  }
+});
+
+const WATCHED = {
+  watchStage: "campaign", campaignUrl: "https://www.kickstarter.com/projects/x/bookwyrm", platform: "kickstarter",
+  campaignEnd: "2026-10-15", deliveryEst: "2027-09", predictedScore: 7.3, targetPrice: 45.5, targetCurrency: "EUR",
+};
+
+test("PATCH saves watch fields, and stopping watching clears only the stage", async () => {
+  const t = await startApp();
+  try {
+    const { body: g } = await t.call("POST", "/api/games", { name: "Bookwyrm" });
+    assert.deepEqual(pick(g, WATCH_NULLS), WATCH_NULLS);
+    const r = await t.call("PATCH", `/api/games/${g.id}`, WATCHED);
+    assert.equal(r.status, 200);
+    assert.deepEqual(pick(r.body, WATCHED), WATCHED);
+    const stopped = await t.call("PATCH", `/api/games/${g.id}`, { watchStage: null });
+    assert.equal(stopped.body.watchStage, null);
+    assert.equal(stopped.body.predictedScore, 7.3);
+    assert.equal(stopped.body.campaignEnd, "2026-10-15");
+  } finally {
+    t.close();
+  }
+});
+
+test("PATCH rejects each kind of bad watch value with a 400 and a clear message", async () => {
+  const t = await startApp();
+  try {
+    const { body: g } = await t.call("POST", "/api/games", { name: "Bookwyrm" });
+    const bad = [
+      [{ watchStage: "watching" }, /watchStage/],
+      [{ predictedScore: 10.5 }, /predictedScore/],
+      [{ predictedScore: -1 }, /predictedScore/],
+      [{ deliveryEst: "2027-13" }, /deliveryEst/],
+      [{ deliveryEst: "Sept 2027" }, /deliveryEst/],
+      [{ campaignEnd: "2026-02-30" }, /campaignEnd/],
+      [{ campaignEnd: "30/10/2026" }, /campaignEnd/],
+      [{ platform: "indiegogo" }, /platform/],
+      [{ targetPrice: -5 }, /targetPrice/],
+      [{ targetPrice: "40" }, /targetPrice/],
+      [{ targetCurrency: "usd" }, /targetCurrency/],
+      [{ targetCurrency: "EURO" }, /targetCurrency/],
+      [{ campaignUrl: "javascript:alert(1)" }, /campaignUrl/],
+    ];
+    for (const [patch, msg] of bad) {
+      const r = await t.call("PATCH", `/api/games/${g.id}`, { ...patch, notes: "should not save" });
+      assert.equal(r.status, 400, JSON.stringify(patch));
+      assert.match(r.body.error, msg);
+    }
+    assert.equal(t.store.getGame(g.id).notes, "");
+  } finally {
+    t.close();
+  }
+});
+
+test("sync over a watched game on the BGG wishlist updates its status and leaves its watch fields alone", async () => {
+  const t = await startApp();
+  try {
+    const g = t.store.createGame({ name: "The Test Game", bggId: 999, status: "" });
+    await t.call("PATCH", `/api/games/${g.id}`, WATCHED);
+    await t.call("POST", "/api/bgg/sync", {});
+    let job;
+    for (let i = 0; i < 50; i++) {
+      job = (await t.call("GET", "/api/bgg/sync")).body;
+      if (!job.running) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.equal(job.error, null);
+    const after = (await t.call("GET", "/api/state")).body.games.find((x) => x.bggId === 999);
+    assert.equal(after.status, "Wishlist");
+    assert.deepEqual(pick(after, WATCHED), WATCHED);
+  } finally {
+    t.close();
+  }
+});
+
+test("the full JSON export and backups include the watch fields", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ts-wbk-"));
+  const t = await startApp();
+  try {
+    const { body: g } = await t.call("POST", "/api/games", { name: "Bookwyrm" });
+    await t.call("PATCH", `/api/games/${g.id}`, WATCHED);
+    const [exported] = (await t.call("GET", "/api/export")).body.games;
+    assert.deepEqual(pick(exported, WATCHED), WATCHED);
+    const copy = openDb(t.store.backup(dir));
+    const [backedUp] = copy.listGames();
+    assert.deepEqual(pick(backedUp, WATCHED), WATCHED);
   } finally {
     t.close();
   }
