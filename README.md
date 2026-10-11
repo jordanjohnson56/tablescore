@@ -54,6 +54,26 @@ BGG's XML API needs a registered application token, sent as `Authorization: Bear
 - **Settings → Sync from BGG** pulls your collection (status, plays, your BGG rating, images, player counts), then fetches weight and best player counts in batches of 20. Requests are spaced 5 s apart. A sync never changes your rubric scores, notes or flags, or a name you've edited.
 - BGG's API is read-only, so ratings can't be pushed back. When your score differs from your BGG rating, the game is tagged **BGG** and its page shows the number to enter. **Copy & open BGG** copies the score and opens the game on BGG. **I've rated it** records that rating locally so the tag clears without a sync, and the next sync replaces it with whatever BGG actually has. From the **Update BGG** filter, **I've rated it** moves on to the next game that needs rating.
 
+## Watchlist
+
+The **Watchlist** tab follows crowdfunded games you aren't backing, so you can wait for delivery and reviews before buying a used copy. Mark a game as Watching with **Watch instead of score** on Add, or from the Watch section of any game's page. Each watched game has a campaign URL, platform, campaign end date, estimated delivery month, a **predicted score** (kept apart from real rubric scores) and a **target price**.
+
+A watched game moves through these **watch stages**, only when you change them: Campaign live → Awaiting delivery → Delivered → Reviews out → Buy or Pass. Buy and Pass are **Decided** and sit in a collapsed section. The watch stage is separate from status, so a BGG sync never touches it.
+
+Watched games stay out of the main list, Summary and Claude export. **Settings → Include watched games in the list and Claude export** shows them in the list and the export, labeled *predicted*. Summary statistics never use predicted scores.
+
+### Export to the private repo
+
+A monthly cloud routine checks on watched games. It can't reach this server, so it reads a JSON export you commit to a separate private repo (see `docs/adr/0001-watchlist-routine-reads-a-private-repo.md`). The export holds every watched game, Decided ones flagged with `decided: true`, in Watchlist order, plus your weights and stretch factor and an `exportedAt` timestamp. Get it from **Settings → Export watchlist**, from `GET /api/watchlist`, or write it straight into a clone of the private repo:
+
+```sh
+npm run export-watchlist -- ~/watchlist-repo/watchlist.json
+# With Docker, write it to data/ and copy it over:
+#   docker compose run --rm tablescore node server/export-watchlist.js /data/watchlist.json
+#   cp data/watchlist.json ~/watchlist-repo/
+cd ~/watchlist-repo && git add watchlist.json && git commit -m "Watchlist $(date +%F)" && git push
+```
+
 ## Data and backups
 
 Everything lives in `data/tablescore.db`. On start and every 24 h, the server writes `data/backups/tablescore-YYYY-MM-DD.db` and keeps the newest `BACKUP_KEEP` (default 14). Copying `data/` somewhere else is your off-box backup. **Settings → Export JSON** downloads everything, and **Copy scores for Claude** puts a plain-text summary on the clipboard for asking about recommendations.
@@ -66,4 +86,4 @@ npm test                     # rubric math, BGG parsing (fixtures), API, import,
 DATA_DIR=./data PORT=8080 npm start
 ```
 
-Layout: `server/` (Express API, SQLite store, BGG client, sync, xlsx import) and `public/` (static app; `public/js/rubric.js` holds the criteria text and score math).
+Layout: `server/` (Express API, SQLite store, BGG client, sync, xlsx import, watchlist export) and `public/` (static app; `public/js/rubric.js` holds the criteria text and score math).

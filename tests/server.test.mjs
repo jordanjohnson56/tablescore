@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -9,6 +9,7 @@ import { openDb } from "../server/db.js";
 import { BggClient } from "../server/bgg.js";
 import { createApp } from "../server/app.js";
 import { readWorkbook, importInto } from "../server/import-xlsx.js";
+import { writeWatchlist } from "../server/export-watchlist.js";
 
 // ---------- synthetic BGG responses (shapes copied from the XML API2 docs) ----------
 
@@ -553,6 +554,76 @@ test("adding from BGG with a watch stage creates a watched game with BGG details
     assert.equal(again.body.id, plain.body.id);
     assert.equal(again.body.watchStage, null);
     assert.equal(t.store.getGame(plain.body.id).watchStage, null);
+  } finally {
+    t.close();
+  }
+});
+
+test("GET /api/watchlist returns only watched games in Watchlist order, with decided flags, weights, stretch and a timestamp", async () => {
+  const t = await startApp();
+  try {
+    t.store.createGame({ name: "Catan", bggId: 13, status: "Owned" });
+    t.store.createGame({ name: "Excursions", watchStage: "pass", notes: "too long" });
+    t.store.createGame({ name: "Bookwyrm", ...WATCHED, watchStage: "awaiting", deliveryEst: "2027-09" });
+    t.store.createGame({ name: "King's Gambit", bggId: 4242, watchStage: "awaiting", deliveryEst: "2027-03", predictedScore: 8.8, targetPrice: 60 });
+    t.store.createGame({ name: "Infamous Traffic", watchStage: "campaign" });
+    const weights = { desire: 30, table: 20, depth: 10, interaction: 10, replay: 10, art: 10, theme: 10 };
+    await t.call("PUT", "/api/settings", { weights, stretch: 1.5 });
+
+    const before = Date.now();
+    const r = await t.call("GET", "/api/watchlist");
+    assert.equal(r.status, 200);
+    assert.deepEqual(Object.keys(r.body).sort(), ["exportedAt", "games", "settings"]);
+    assert.ok(Date.parse(r.body.exportedAt) >= before - 1000);
+    assert.deepEqual(r.body.settings, { weights, stretch: 1.5 });
+    assert.deepEqual(r.body.games.map((g) => [g.name, g.decided]), [
+      ["Infamous Traffic", false],
+      ["King's Gambit", false],
+      ["Bookwyrm", false],
+      ["Excursions", true],
+    ]);
+    assert.deepEqual(r.body.games[1], {
+      name: "King's Gambit", bggId: 4242, watchStage: "awaiting", decided: false,
+      campaignUrl: null, platform: null, campaignEnd: null, deliveryEst: "2027-03",
+      predictedScore: 8.8, targetPrice: 60, targetCurrency: "USD", notes: "",
+    });
+    assert.deepEqual(r.body.games[2], { name: "Bookwyrm", bggId: null, ...WATCHED, watchStage: "awaiting", decided: false, notes: "" });
+    assert.equal(r.body.games[3].notes, "too long");
+  } finally {
+    t.close();
+  }
+});
+
+test("the watchlist endpoint is GET only and writes nothing", async () => {
+  const t = await startApp();
+  try {
+    t.store.createGame({ name: "Bookwyrm", watchStage: "campaign" });
+    const state = (await t.call("GET", "/api/state")).body;
+    for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+      const r = await t.call(method, "/api/watchlist", { games: [] });
+      assert.equal(r.status, 404, method);
+    }
+    await t.call("GET", "/api/watchlist");
+    assert.deepEqual((await t.call("GET", "/api/state")).body, state);
+  } finally {
+    t.close();
+  }
+});
+
+test("the export-watchlist CLI's function writes the same JSON as the endpoint", async () => {
+  const file = join(mkdtempSync(join(tmpdir(), "ts-wexp-")), "watchlist.json");
+  const t = await startApp();
+  try {
+    t.store.createGame({ name: "Catan", bggId: 13 });
+    t.store.createGame({ name: "Bookwyrm", ...WATCHED });
+    t.store.createGame({ name: "Excursions", watchStage: "buy" });
+    const returned = writeWatchlist(t.store, file);
+    const written = JSON.parse(readFileSync(file, "utf8"));
+    assert.deepEqual(written, returned);
+    const { body: served } = await t.call("GET", "/api/watchlist");
+    assert.ok(!Number.isNaN(Date.parse(written.exportedAt)));
+    assert.deepEqual({ ...written, exportedAt: null }, { ...served, exportedAt: null });
+    assert.deepEqual(written.games.map((g) => g.name), ["Bookwyrm", "Excursions"]);
   } finally {
     t.close();
   }

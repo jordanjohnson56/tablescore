@@ -749,6 +749,7 @@ function renderSettings() {
       <p class="small muted">Everything lives in one database on your server, with a daily backup copy kept there.</p>
       <div class="btn-row">
         <a class="btn" href="/api/export" download>Export JSON</a>
+        <a class="btn" href="/api/watchlist" download="tablescore-watchlist.json">Export watchlist</a>
         <button class="btn" id="copy">Copy scores for Claude</button>
       </div>
     </section>`;

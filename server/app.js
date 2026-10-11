@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { HttpError, checkWatchFields } from "./db.js";
 import { BggError } from "./bgg.js";
 import { syncCollection, addFromBgg } from "./sync.js";
+import { watchlistExport } from "./export-watchlist.js";
 import { CRITERIA } from "../public/js/rubric.js";
 
 const PUBLIC_DIR = fileURLToPath(new URL("../public", import.meta.url));
@@ -116,6 +117,9 @@ export function createApp({ store, bgg, bggUsername }) {
     res.attachment(`tablescore-${stamp}.json`);
     res.json({ exportedAt: new Date().toISOString(), settings: store.getSettings(), games: store.listGames() });
   });
+
+  // Read-only, for the monthly watchlist routine (ADR 0001) and local scripts.
+  app.get("/api/watchlist", (req, res) => res.json(watchlistExport(store)));
 
   app.use("/api", (req, res) => res.status(404).json({ error: "not found" }));
   app.use(express.static(PUBLIC_DIR, { extensions: ["html"] }));
