@@ -9,7 +9,8 @@ import { openDb } from "../server/db.js";
 import { BggClient } from "../server/bgg.js";
 import { createApp } from "../server/app.js";
 import { readWorkbook, importInto } from "../server/import-xlsx.js";
-import { writeWatchlist } from "../server/export-watchlist.js";
+import { watchlistExport, writeWatchlist } from "../server/export-watchlist.js";
+import { importWatchlist, readWatchlistFile } from "../server/import-watchlist.js";
 
 // ---------- synthetic BGG responses (shapes copied from the XML API2 docs) ----------
 
@@ -624,6 +625,119 @@ test("the export-watchlist CLI's function writes the same JSON as the endpoint",
     assert.ok(!Number.isNaN(Date.parse(written.exportedAt)));
     assert.deepEqual({ ...written, exportedAt: null }, { ...served, exportedAt: null });
     assert.deepEqual(written.games.map((g) => g.name), ["Bookwyrm", "Excursions"]);
+  } finally {
+    t.close();
+  }
+});
+
+test("importing watched games creates each one with every watch field and its notes, and reports it added", async () => {
+  const t = await startApp();
+  try {
+    const result = importWatchlist(t.store, [
+      { name: "Bookwyrm", bggId: 777, ...WATCHED, decided: false, notes: "art looks great" },
+      { name: "Infamous Traffic", watchStage: "reviews" },
+    ]);
+    assert.deepEqual(result, { added: ["Bookwyrm", "Infamous Traffic"], skipped: [] });
+    const { body } = await t.call("GET", "/api/state");
+    const book = body.games.find((g) => g.name === "Bookwyrm");
+    assert.deepEqual(pick(book, WATCHED), WATCHED);
+    assert.equal(book.bggId, 777);
+    assert.equal(book.notes, "art looks great");
+    const traffic = body.games.find((g) => g.name === "Infamous Traffic");
+    assert.deepEqual(pick(traffic, WATCH_NULLS), { ...WATCH_NULLS, watchStage: "reviews" });
+  } finally {
+    t.close();
+  }
+});
+
+test("importing skips games already present, by BGG ID or by name ignoring case, and never overwrites them", async () => {
+  const t = await startApp();
+  try {
+    t.store.createGame({ name: "Catan", bggId: 13, status: "Owned", notes: "classic" });
+    t.store.createGame({ name: "Bookwyrm", watchStage: "awaiting", targetPrice: 40 });
+    const result = importWatchlist(t.store, [
+      { name: "Catan Renamed", bggId: 13, watchStage: "campaign" },
+      { name: "BOOKWYRM", watchStage: "buy", targetPrice: 99 },
+      { name: "King's Gambit", bggId: 4242, watchStage: "campaign" },
+      { name: "king's gambit", watchStage: "reviews" },
+      { name: "Excursions", watchStage: "delivered" },
+      { name: "Excursions", bggId: 4242, watchStage: "delivered" },
+    ]);
+    assert.deepEqual(result, {
+      added: ["King's Gambit", "Excursions"],
+      skipped: ["Catan Renamed", "BOOKWYRM", "king's gambit", "Excursions"],
+    });
+    const games = t.store.listGames();
+    assert.equal(games.length, 4);
+    const catan = t.store.getByBggId(13);
+    assert.deepEqual([catan.name, catan.watchStage, catan.notes], ["Catan", null, "classic"]);
+    const book = games.find((g) => g.name === "Bookwyrm");
+    assert.deepEqual([book.watchStage, book.targetPrice], ["awaiting", 40]);
+  } finally {
+    t.close();
+  }
+});
+
+test("exporting the watchlist and importing it into an empty database reproduces the watched games", async () => {
+  const from = await startApp();
+  const to = await startApp();
+  try {
+    from.store.createGame({ name: "Catan", bggId: 13, status: "Owned" });
+    from.store.createGame({ name: "Bookwyrm", bggId: 777, ...WATCHED, notes: "art looks great" });
+    from.store.createGame({ name: "King's Gambit", watchStage: "awaiting", deliveryEst: "2027-03", targetPrice: 60 });
+    from.store.createGame({ name: "Excursions", watchStage: "pass", notes: "too long" });
+    const exported = watchlistExport(from.store);
+    assert.deepEqual(importWatchlist(to.store, exported.games).added, ["Bookwyrm", "King's Gambit", "Excursions"]);
+    assert.deepEqual(watchlistExport(to.store, new Date(exported.exportedAt)).games, exported.games);
+  } finally {
+    from.close();
+    to.close();
+  }
+});
+
+test("importing bad input fails with a clear message and writes nothing", async () => {
+  const t = await startApp();
+  try {
+    t.store.createGame({ name: "Catan", bggId: 13 });
+    const good = { name: "Bookwyrm", watchStage: "campaign" };
+    const cases = [
+      [{ games: "nope" }, /array/],
+      ["Bookwyrm", /array/],
+      [[good, "Infamous Traffic"], /game 2 .*object/],
+      [[good, { watchStage: "campaign" }], /game 2 .*name/],
+      [[good, { name: "  ", watchStage: "campaign" }], /game 2 .*name/],
+      [[good, { name: "Infamous Traffic", watchStage: "maybe" }], /Infamous Traffic.*watchStage must be one of/],
+      [[good, { name: "Infamous Traffic" }], /Infamous Traffic.*watchStage/],
+      [[good, { name: "Infamous Traffic", watchStage: "campaign", targetPrice: -3 }], /Infamous Traffic.*targetPrice/],
+      [[good, { name: "Infamous Traffic", bggId: "abc", watchStage: "campaign" }], /Infamous Traffic.*bggId/],
+    ];
+    for (const [input, message] of cases) {
+      assert.throws(() => importWatchlist(t.store, input), message, JSON.stringify(input));
+    }
+    assert.deepEqual(t.store.listGames().map((g) => g.name), ["Catan"]);
+  } finally {
+    t.close();
+  }
+});
+
+test("the import-watchlist CLI reads an array or an export file, and explains a missing file or bad JSON", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ts-wimp-"));
+  const t = await startApp();
+  try {
+    t.store.createGame({ name: "Bookwyrm", ...WATCHED });
+    const exportFile = join(dir, "export.json");
+    writeWatchlist(t.store, exportFile);
+    assert.deepEqual(readWatchlistFile(exportFile).map((g) => g.name), ["Bookwyrm"]);
+
+    const arrayFile = join(dir, "seed.json");
+    writeFileSync(arrayFile, JSON.stringify([{ name: "Excursions", watchStage: "campaign" }]));
+    assert.deepEqual(readWatchlistFile(arrayFile), [{ name: "Excursions", watchStage: "campaign" }]);
+
+    const broken = join(dir, "broken.json");
+    writeFileSync(broken, "[{ name: ");
+    assert.throws(() => readWatchlistFile(broken), /broken\.json is not valid JSON/);
+    assert.throws(() => readWatchlistFile(join(dir, "nope.json")), /No file at .*nope\.json/);
+    assert.throws(() => readWatchlistFile(dir), /is a folder/);
   } finally {
     t.close();
   }
