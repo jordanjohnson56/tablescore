@@ -450,6 +450,7 @@ test("PATCH rejects each kind of bad watch value with a 400 and a clear message"
       [{ watchStage: "watching" }, /watchStage/],
       [{ predictedScore: 10.5 }, /predictedScore/],
       [{ predictedScore: -1 }, /predictedScore/],
+      [{ predictedScore: 7.25 }, /predictedScore.*one decimal/],
       [{ deliveryEst: "2027-13" }, /deliveryEst/],
       [{ deliveryEst: "Sept 2027" }, /deliveryEst/],
       [{ campaignEnd: "2026-02-30" }, /campaignEnd/],
@@ -504,6 +505,19 @@ test("the full JSON export and backups include the watch fields", async () => {
     const copy = openDb(t.store.backup(dir));
     const [backedUp] = copy.listGames();
     assert.deepEqual(pick(backedUp, WATCHED), WATCHED);
+  } finally {
+    t.close();
+  }
+});
+
+test("a predicted score keeps at most one decimal, on create as well as PATCH", async () => {
+  const t = await startApp();
+  try {
+    assert.throws(() => t.store.createGame({ name: "Bookwyrm", watchStage: "campaign", predictedScore: 7.25 }), (e) => e.status === 400 && /predictedScore/.test(e.message));
+    assert.equal(t.store.listGames().length, 0);
+    for (const score of [7, 7.3, 0.1, 9.9, 10]) {
+      assert.equal(t.store.createGame({ name: `Game ${score}`, watchStage: "campaign", predictedScore: score }).predictedScore, score);
+    }
   } finally {
     t.close();
   }
@@ -709,6 +723,7 @@ test("importing bad input fails with a clear message and writes nothing", async 
       [[good, { name: "Infamous Traffic", watchStage: "maybe" }], /Infamous Traffic.*watchStage must be one of/],
       [[good, { name: "Infamous Traffic" }], /Infamous Traffic.*watchStage/],
       [[good, { name: "Infamous Traffic", watchStage: "campaign", targetPrice: -3 }], /Infamous Traffic.*targetPrice/],
+      [[good, { name: "Infamous Traffic", watchStage: "campaign", predictedScore: 7.25 }], /Infamous Traffic.*predictedScore/],
       [[good, { name: "Infamous Traffic", bggId: "abc", watchStage: "campaign" }], /Infamous Traffic.*bggId/],
     ];
     for (const [input, message] of cases) {
