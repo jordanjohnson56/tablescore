@@ -130,6 +130,7 @@ label.field > span { display: block; font-size: 0.85rem; color: var(--ink-2); ma
 .score-badge { flex: none; width: 56px; text-align: right; }
 .score-badge .num { font-size: 1.35rem; font-weight: 700; font-variant-numeric: tabular-nums; }
 .score-badge .num.old { color: var(--muted); font-weight: 500; font-size: 1.05rem; }
+.score-badge .num.predicted { color: var(--accent); font-style: italic; font-weight: 500; font-size: 1.05rem; }
 .score-badge .lbl { font-size: 0.7rem; color: var(--muted); }
 .empty { padding: 32px 0; text-align: center; color: var(--muted); }
 

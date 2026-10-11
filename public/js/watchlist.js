@@ -1,7 +1,7 @@
 // Which games the main list, Summary and exports show, and the "Copy scores for
 // Claude" text. Pure module: no DOM, so the browser, server and tests share it.
 
-import { CRITERIA, finalScore } from "./rubric.js";
+import { CRITERIA, finalScore, spread } from "./rubric.js";
 
 const fmt = (n) => (n == null ? "—" : Number(n).toFixed(1));
 
@@ -31,19 +31,40 @@ export function isHiddenType(type, settings) {
   return Boolean(settings.hideExpansions) && type === "Expansion";
 }
 
-/** Games the list, Summary and exports show: never watched games; Settings can hide expansions. */
+/**
+ * Games the list, Summary and exports show: watched games only when
+ * includeWatching is on; Settings can hide expansions.
+ */
 export function visibleGames(games, settings) {
-  return games.filter((g) => !isWatching(g) && !isHiddenType(g.type, settings));
+  return games.filter((g) => (settings.includeWatching || !isWatching(g)) && !isHiddenType(g.type, settings));
+}
+
+/**
+ * The Summary view's numbers: old ratings against new rubric scores for the
+ * games the list shows. Only real rubric scores count, never predicted scores.
+ */
+export function summaryStats(games, settings) {
+  const shown = visibleGames(games, settings);
+  const final = (g) => finalScore(g.scores, settings);
+  const scored = shown.filter((g) => final(g) != null);
+  return {
+    games: shown,
+    scored,
+    old: spread(shown.map((g) => g.oldRating).filter((x) => x != null)),
+    new: spread(scored.map(final)),
+  };
 }
 
 /**
  * The "Copy scores for Claude" text: scored games by final score, then games
- * without a full score that have a BGG rating. Counts are for the toast.
+ * without a full score that have a BGG rating. With includeWatching on, watched
+ * games follow in their own predicted section, never mixed with real scores.
+ * Counts are for the toast.
  */
 export function claudeExport(games, settings) {
   const w = settings.weights;
   const final = (g) => finalScore(g.scores, settings);
-  const shown = visibleGames(games, settings);
+  const shown = visibleGames(games, settings).filter((g) => !isWatching(g));
   const lines = [
     `My board game ratings from my Tablescore rubric (weights: ${CRITERIA.map((c) => `${c.name} ${w[c.key]}`).join(", ")}; stretch ${settings.stretch}).`,
     "Scored games (final score | criteria in that order | plays | status | avoid-theme):",
@@ -57,5 +78,12 @@ export function claudeExport(games, settings) {
     lines.push("", "Not yet rescored (old BGG rating):");
     for (const g of rest) lines.push(`- ${g.name}: ${fmt(g.bggRating)}${g.status ? ` (${g.status})` : ""}`);
   }
-  return { text: lines.join("\n"), scored: scored.length, rest: rest.length };
+  const watching = visibleGames(games, settings)
+    .filter(isWatching)
+    .sort((a, b) => (b.predictedScore ?? -1) - (a.predictedScore ?? -1));
+  if (watching.length) {
+    lines.push("", "Watching (predicted): crowdfunded games I haven't played; scores are my predictions from reviews, not real scores (predicted score | watch stage):");
+    for (const g of watching) lines.push(`- ${g.name}: ${fmt(g.predictedScore)} predicted | ${STAGE_LABELS[g.watchStage]}`);
+  }
+  return { text: lines.join("\n"), scored: scored.length, rest: rest.length, watching: watching.length };
 }

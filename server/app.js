@@ -32,7 +32,7 @@ export function createApp({ store, bgg, bggUsername }) {
   });
 
   app.put("/api/settings", (req, res) => {
-    const { weights, stretch, hideExpansions } = req.body;
+    const { weights, stretch, hideExpansions, includeWatching } = req.body;
     if (weights !== undefined) {
       const ok = CRITERIA.every((c) => typeof weights[c.key] === "number" && weights[c.key] >= 0);
       if (!ok) throw new HttpError(400, "weights needs a non-negative number for every criterion");
@@ -43,7 +43,10 @@ export function createApp({ store, bgg, bggUsername }) {
     if (hideExpansions !== undefined && typeof hideExpansions !== "boolean") {
       throw new HttpError(400, "hideExpansions must be true or false");
     }
-    res.json(store.setSettings({ weights, stretch, hideExpansions }));
+    if (includeWatching !== undefined && typeof includeWatching !== "boolean") {
+      throw new HttpError(400, "includeWatching must be true or false");
+    }
+    res.json(store.setSettings({ weights, stretch, hideExpansions, includeWatching }));
   });
 
   app.post("/api/games", (req, res) => {

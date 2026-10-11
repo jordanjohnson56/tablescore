@@ -339,6 +339,21 @@ test("import explains a folder or missing path instead of crashing", async () =>
   await assert.rejects(readWorkbook(join(dir, "nope.xlsx")), /No file at/);
 });
 
+test("includeWatching setting persists and is validated", async () => {
+  const t = await startApp();
+  try {
+    assert.equal((await t.call("GET", "/api/state")).body.settings.includeWatching, false);
+    const r = await t.call("PUT", "/api/settings", { includeWatching: true });
+    assert.equal(r.body.includeWatching, true);
+    assert.equal(r.body.stretch, 1.25);
+    assert.equal((await t.call("PUT", "/api/settings", { includeWatching: "yes" })).status, 400);
+    assert.equal((await t.call("PUT", "/api/settings", { includeWatching: 1 })).status, 400);
+    assert.equal((await t.call("PUT", "/api/settings", { stretch: 1.5 })).body.includeWatching, true);
+  } finally {
+    t.close();
+  }
+});
+
 test("hideExpansions setting persists and is validated", async () => {
   const t = await startApp();
   try {
