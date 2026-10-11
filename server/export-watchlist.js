@@ -6,9 +6,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { openDb } from "./db.js";
-import { STAGES, sortWatchlist, targetCurrency } from "../public/js/watchlist.js";
-
-const DECIDED = new Set(STAGES.filter((s) => s.decided).map((s) => s.key));
+import { isDecided, sortWatchlist, targetCurrency } from "../public/js/watchlist.js";
 
 export function watchlistExport(store, now = new Date()) {
   const { weights, stretch } = store.getSettings();
@@ -19,7 +17,7 @@ export function watchlistExport(store, now = new Date()) {
       name: g.name,
       bggId: g.bggId,
       watchStage: g.watchStage,
-      decided: DECIDED.has(g.watchStage),
+      decided: isDecided(g),
       campaignUrl: g.campaignUrl,
       platform: g.platform,
       campaignEnd: g.campaignEnd,

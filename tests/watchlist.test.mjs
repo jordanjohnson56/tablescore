@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { CRITERIA, DEFAULT_SETTINGS } from "../public/js/rubric.js";
 import { awaitingHint, claudeExport, monthLabel, sortWatchlist, summaryStats, targetCurrency, visibleGames } from "../public/js/watchlist.js";
 
-const base = { type: "Base Game", scores: {}, plays: 0, status: "", avoidTheme: false, bggRating: null };
+const base = { type: "Base", scores: {}, plays: 0, status: "", avoidTheme: false, bggRating: null };
 const game = (name, extra = {}) => ({ ...base, name, ...extra });
 const vec = (xs) => Object.fromEntries(CRITERIA.map((c, i) => [c.key, xs[i]]));
 
