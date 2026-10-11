@@ -1,7 +1,11 @@
 import {
-  CRITERIA, BAND_LABELS, bandIndex, finalScore, rawAverage, scaleEntry, scoredCount,
-  rescoreStatus, isProvisional, spread, weightTotal,
+  CRITERIA, BAND_LABELS, bandIndex, finalScore, formatNumber, rawAverage, scaleEntry, scoredCount,
+  rescoreStatus, isProvisional, weightTotal,
 } from "./rubric.js";
+import {
+  STAGES, STAGE_LABELS, PLATFORMS, DEFAULT_CURRENCY, targetCurrency, claudeExport, isDecided, isWatching, isHiddenType,
+  summaryStats, visibleGames, sortWatchlist, awaitingHint, monthLabel,
+} from "./watchlist.js";
 import { api } from "./api.js";
 
 const view = document.getElementById("view");
@@ -12,12 +16,9 @@ const prefs = loadPrefs();
 
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
-const fmt = (n, d = 1) => (n == null ? "—" : Number(n).toFixed(d));
 const final = (g) => finalScore(g.scores, state.settings);
 const byId = (id) => state.games.find((g) => g.id === id);
-const isHiddenType = (type) => state.settings.hideExpansions && type === "Expansion";
-/** Games the list, summary and exports show; Settings can hide expansions. */
-const visibleGames = () => state.games.filter((g) => !isHiddenType(g.type));
+const shownGames = () => visibleGames(state.games, state.settings);
 
 function loadPrefs() {
   try {
@@ -50,7 +51,7 @@ function players(g) {
 }
 
 function metaDetails(g) {
-  return [players(g), g.playTime ? `${g.playTime} min` : "", g.bggWeight ? `wt ${fmt(g.bggWeight, 1)}` : ""]
+  return [players(g), g.playTime ? `${g.playTime} min` : "", g.bggWeight ? `wt ${formatNumber(g.bggWeight, 1)}` : ""]
     .filter(Boolean)
     .join(" · ");
 }
@@ -110,19 +111,19 @@ window.addEventListener("pagehide", () => {
 
 // ---------- router ----------
 
+// Each tab's renderer, matched by hash prefix; anything else is the games list.
+const TABS = { watchlist: renderWatchlist, add: renderAdd, summary: renderSummary, settings: renderSettings, games: renderList };
+
 function route() {
   const hash = location.hash || "#/";
-  const tab = hash.startsWith("#/add") ? "add" : hash.startsWith("#/summary") ? "summary" : hash.startsWith("#/settings") ? "settings" : "games";
+  const tab = Object.keys(TABS).find((t) => hash.startsWith(`#/${t}`)) || "games";
   document.querySelectorAll(".tabs a").forEach((a) => {
     if (a.dataset.tab === tab) a.setAttribute("aria-current", "page");
     else a.removeAttribute("aria-current");
   });
   const m = hash.match(/^#\/g\/(\d+)/);
   if (m) return renderScorer(Number(m[1]));
-  if (tab === "add") return renderAdd();
-  if (tab === "summary") return renderSummary();
-  if (tab === "settings") return renderSettings();
-  return renderList();
+  return TABS[tab]();
 }
 window.addEventListener("hashchange", () => {
   route();
@@ -152,7 +153,7 @@ function filtered() {
     update: (g) => bggDrift(g) != null,
     avoid: (g) => g.avoidTheme,
   };
-  const list = visibleGames().filter((g) => (tests[prefs.filter] || tests.all)(g) && (!q || g.name.toLowerCase().includes(q)));
+  const list = shownGames().filter((g) => (tests[prefs.filter] || tests.all)(g) && (!q || g.name.toLowerCase().includes(q)));
   const sorters = {
     score: (a, b) => (final(b) ?? -1) - (final(a) ?? -1) || (b.bggRating ?? -1) - (a.bggRating ?? -1),
     name: (a, b) => a.name.localeCompare(b.name),
@@ -167,7 +168,7 @@ function renderList() {
   view.innerHTML = `
     <div class="toolbar">
       <div class="toolbar-row">
-        <input type="search" id="q" placeholder="Search ${visibleGames().length} games" value="${esc(prefs.q)}" aria-label="Search games">
+        <input type="search" id="q" placeholder="Search ${shownGames().length} games" value="${esc(prefs.q)}" aria-label="Search games">
         <select id="sort" aria-label="Sort">
           ${[["score", "Score"], ["name", "Name"], ["plays", "Plays"], ["recent", "Recent"]]
             .map(([v, l]) => `<option value="${v}" ${prefs.sort === v ? "selected" : ""}>${l}</option>`).join("")}
@@ -184,7 +185,7 @@ function renderList() {
     document.getElementById("count").textContent = `${list.length} ${list.length === 1 ? "game" : "games"}`;
     document.getElementById("games").innerHTML = list.length
       ? list.map(rowHtml).join("")
-      : `<li class="empty">${visibleGames().length ? "No games match." : state.games.length ? "Every game is an expansion, and expansions are hidden in Settings." : 'No games yet. Import your spreadsheet or use <a href="#/add">Add</a>.'}</li>`;
+      : `<li class="empty">${shownGames().length ? "No games match." : state.games.length ? "Every game is hidden: Settings can hide watched games and expansions from this list." : 'No games yet. Import your spreadsheet or use <a href="#/add">Add</a>.'}</li>`;
   };
   fill();
   view.querySelector("#q").addEventListener("input", (e) => {
@@ -217,10 +218,17 @@ function metaHtml(g, tags) {
   ].join("");
 }
 
+function thumbHtml(g) {
+  return g.thumbnail
+    ? `<img class="thumb" src="${esc(g.thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer">`
+    : `<div class="thumb" aria-hidden="true"></div>`;
+}
+
 function rowHtml(g) {
   const f = final(g);
   const n = scoredCount(g.scores);
   const tags = [
+    isWatching(g) ? `<span class="tag" title="Watching: ${esc(STAGE_LABELS[g.watchStage])}">Watch</span>` : "",
     g.type === "Expansion" ? `<span class="tag">Exp</span>` : "",
     f != null && isProvisional(g) ? `<span class="tag" title="Fewer than 3 plays">Prov</span>` : "",
     n > 0 && n < 7 ? `<span class="tag warn">${n}/7</span>` : "",
@@ -228,15 +236,14 @@ function rowHtml(g) {
     bggDrift(g) != null ? `<span class="tag warn" title="BGG rating differs">BGG</span>` : "",
   ].join("");
   const badge = f != null
-    ? `<div class="num">${fmt(f)}</div><div class="lbl">score</div>`
-    : g.bggRating != null
-      ? `<div class="num old">${fmt(g.bggRating)}</div><div class="lbl">old</div>`
-      : `<div class="num old">—</div>`;
-  const thumb = g.thumbnail
-    ? `<img class="thumb" src="${esc(g.thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer">`
-    : `<div class="thumb" aria-hidden="true"></div>`;
+    ? `<div class="num">${formatNumber(f)}</div><div class="lbl">score</div>`
+    : isWatching(g)
+      ? `<div class="num predicted">${formatNumber(g.predictedScore)}</div><div class="lbl">predicted</div>`
+      : g.bggRating != null
+        ? `<div class="num old">${formatNumber(g.bggRating)}</div><div class="lbl">old</div>`
+        : `<div class="num old">—</div>`;
   return `<li class="${g.avoidTheme ? "avoid" : ""}"><a class="game-row" href="#/g/${g.id}">
-    ${thumb}
+    ${thumbHtml(g)}
     <div class="info"><div class="name">${esc(g.name)}</div><div class="meta">${metaHtml(g, tags)}</div></div>
     <div class="score-badge">${badge}</div></a></li>`;
 }
@@ -250,9 +257,12 @@ function renderScorer(id) {
     return;
   }
   const w = state.settings.weights;
+  const watching = isWatching(g);
   view.innerHTML = `
     <header class="score-head">
-      <a class="back" href="#/" aria-label="Back to games">‹</a>
+      ${watching
+        ? `<a class="back" href="#/watchlist" aria-label="Back to the Watchlist">‹</a>`
+        : `<a class="back" href="#/" aria-label="Back to games">‹</a>`}
       <div class="title">
         <div class="name ${g.avoidTheme ? "avoid-name" : ""}">${esc(g.name)}</div>
         <div class="save-state">${esc(rescoreStatus(g.scores))}</div>
@@ -260,6 +270,8 @@ function renderScorer(id) {
       <div class="final" id="final"></div>
     </header>
     <div id="drift"></div>
+    ${watching ? watchHtml(g) : ""}
+    ${watching ? `<details class="score-it"><summary>Score it</summary>` : ""}
     ${CRITERIA.map((c) => `
       <section class="card crit" data-k="${c.key}">
         <div class="crit-top">
@@ -278,6 +290,7 @@ function renderScorer(id) {
           <ol>${c.bands.map((b, i) => `<li data-i="${i}"><b>${BAND_LABELS[i]}</b> ${esc(b)}</li>`).join("")}</ol>
         </details>
       </section>`).join("")}
+    ${watching ? "</details>" : watchHtml(g)}
     <section class="card">
       <h2 style="margin-top:0">Details</h2>
       <label class="field"><span>Logged plays</span>
@@ -295,13 +308,13 @@ function renderScorer(id) {
       <label class="toggle"><input type="checkbox" id="calib" ${g.calibration ? "checked" : ""}> Calibration game</label>
       <label class="field"><span>Notes</span><textarea id="notes">${esc(g.notes)}</textarea></label>
       <dl class="facts">
-        <div><dt>BGG rating</dt><dd>${fmt(g.bggRating)}</dd></div>
-        <div><dt>Old rating (sheet)</dt><dd>${fmt(g.oldRating)}</dd></div>
-        <div><dt>BGG average</dt><dd>${fmt(g.bggAvg, 2)}</dd></div>
+        <div><dt>BGG rating</dt><dd>${formatNumber(g.bggRating)}</dd></div>
+        <div><dt>Old rating (sheet)</dt><dd>${formatNumber(g.oldRating)}</dd></div>
+        <div><dt>BGG average</dt><dd>${formatNumber(g.bggAvg, 2)}</dd></div>
         <div><dt>Raw average</dt><dd id="raw">—</dd></div>
         <div><dt>Players</dt><dd>${esc(players(g) || "—")}</dd></div>
         <div><dt>Play time</dt><dd>${g.playTime ? `${g.playTime} min` : "—"}</dd></div>
-        <div><dt>Weight</dt><dd>${fmt(g.bggWeight, 2)}</dd></div>
+        <div><dt>Weight</dt><dd>${formatNumber(g.bggWeight, 2)}</dd></div>
         <div><dt>Year</dt><dd>${g.year ?? "—"}</dd></div>
       </dl>
       ${g.bggId ? `<p class="small"><a href="https://boardgamegeek.com/boardgame/${g.bggId}" target="_blank" rel="noopener">Open on BGG</a></p>` : ""}
@@ -313,16 +326,16 @@ function renderScorer(id) {
     const n = scoredCount(g.scores);
     const [, label] = f != null ? scaleEntry(f) : [];
     view.querySelector("#final").innerHTML = f != null
-      ? `<div class="num">${fmt(f)}</div><div class="lbl">${esc(label)}${isProvisional(g) ? " · prov." : ""}</div>`
+      ? `<div class="num">${formatNumber(f)}</div><div class="lbl">${esc(label)}${isProvisional(g) ? " · prov." : ""}</div>`
       : `<div class="num" style="color:var(--muted)">${n}/7</div><div class="lbl">criteria</div>`;
     const raw = rawAverage(g.scores, state.settings);
     view.querySelector("#raw").textContent = raw == null ? "—" : raw.toFixed(2);
     const d = bggDrift(g);
     view.querySelector("#drift").innerHTML = d != null
       ? `<div class="notice drift">
-          <p>Rate it <b>${fmt(d)}</b> on BGG${g.bggRating != null ? ` (it has ${fmt(g.bggRating)})` : ""}.</p>
+          <p>Rate it <b>${formatNumber(d)}</b> on BGG${g.bggRating != null ? ` (it has ${formatNumber(g.bggRating)})` : ""}.</p>
           <div class="btn-row">
-            <a class="btn primary" data-act="open" href="https://boardgamegeek.com/boardgame/${g.bggId}" target="_blank" rel="noopener">Copy ${fmt(d)} &amp; open BGG</a>
+            <a class="btn primary" data-act="open" href="https://boardgamegeek.com/boardgame/${g.bggId}" target="_blank" rel="noopener">Copy ${formatNumber(d)} &amp; open BGG</a>
             <button class="btn" type="button" data-act="done">I've rated it</button>
           </div>
         </div>`
@@ -334,7 +347,7 @@ function renderScorer(id) {
     const act = e.target.closest("[data-act]")?.dataset.act;
     const d = bggDrift(g);
     if (!act || d == null) return;
-    const rating = Number(fmt(d));
+    const rating = Number(formatNumber(d));
     if (act === "open") {
       copyText(String(rating)).then(() => toast(`Copied ${rating}`));
       return; // the link itself opens BGG
@@ -347,7 +360,7 @@ function renderScorer(id) {
         paintHead();
         toast("Marked as rated on BGG");
       } else if (next) {
-        const left = visibleGames().filter((x) => bggDrift(x) != null).length;
+        const left = shownGames().filter((x) => bggDrift(x) != null).length;
         location.hash = `#/g/${next.id}`;
         toast(`${left} left to rate on BGG`);
       } else {
@@ -364,7 +377,7 @@ function renderScorer(id) {
     const v = g.scores[c.key];
     const set = typeof v === "number";
     card.classList.toggle("unset", !set);
-    card.querySelector(".val").textContent = set ? fmt(v, v % 1 ? 1 : 0) : "—";
+    card.querySelector(".val").textContent = set ? formatNumber(v, v % 1 ? 1 : 0) : "—";
     const range = card.querySelector("input");
     if (document.activeElement !== range) range.value = set ? v : 5;
     const bi = set ? bandIndex(v) : -1;
@@ -408,6 +421,7 @@ function renderScorer(id) {
   });
   view.querySelector("#calib").addEventListener("change", (e) => queueSave(g.id, { calibration: (g.calibration = e.target.checked) }));
   view.querySelector("#notes").addEventListener("input", (e) => queueSave(g.id, { notes: (g.notes = e.target.value) }));
+  bindWatch(g);
   view.querySelector("#del").addEventListener("click", async () => {
     if (!confirm(`Delete ${g.name} and its scores? This can't be undone.`)) return;
     try {
@@ -422,12 +436,148 @@ function renderScorer(id) {
   });
 }
 
+// ---------- watch section ----------
+
+/** Start/stop watching and every watch field. Stopping keeps the fields. */
+function watchHtml(g) {
+  if (!isWatching(g)) {
+    return `<section class="card watch">
+      <h2 style="margin-top:0">Watch</h2>
+      <p class="small muted">Follow a crowdfunded game until backers have it and reviews are out. Watched games leave the main list, Summary and Claude export.</p>
+      <div class="btn-row"><button class="btn" type="button" id="watch-start">Start watching</button></div>
+    </section>`;
+  }
+  const opt = (list, cur, blank) =>
+    (blank ? `<option value="" ${cur ? "" : "selected"}>${blank}</option>` : "") +
+    list.map((o) => `<option value="${o.key}" ${cur === o.key ? "selected" : ""}>${esc(o.label)}</option>`).join("");
+  return `<section class="card watch">
+    <h2 style="margin-top:0">Watching</h2>
+    <label class="field"><span>Watch stage</span><select data-watch="watchStage">${opt(STAGES, g.watchStage)}</select></label>
+    <label class="field"><span>Predicted score (0–10)</span>
+      <input type="number" data-watch="predictedScore" min="0" max="10" step="0.1" inputmode="decimal" value="${g.predictedScore ?? ""}"></label>
+    <div class="pair">
+      <label class="field"><span>Target price</span>
+        <input type="number" data-watch="targetPrice" min="0" step="0.01" inputmode="decimal" value="${g.targetPrice ?? ""}"></label>
+      <label class="field currency"><span>Currency</span>
+        <input type="text" data-watch="targetCurrency" maxlength="3" autocapitalize="characters" placeholder="${DEFAULT_CURRENCY}" value="${esc(g.targetCurrency ?? "")}"></label>
+    </div>
+    <label class="field"><span>Platform</span><select data-watch="platform">${opt(PLATFORMS, g.platform, "Not set")}</select></label>
+    <label class="field"><span>Campaign URL</span>
+      <input type="url" data-watch="campaignUrl" inputmode="url" placeholder="https://" value="${esc(g.campaignUrl ?? "")}"></label>
+    ${/^https?:\/\//.test(g.campaignUrl ?? "") ? `<p class="small"><a href="${esc(g.campaignUrl)}" target="_blank" rel="noopener">Open campaign</a></p>` : ""}
+    <div class="pair">
+      <label class="field"><span>Campaign ends</span><input type="date" data-watch="campaignEnd" value="${esc(g.campaignEnd ?? "")}"></label>
+      <label class="field"><span>Estimated delivery</span><input type="month" data-watch="deliveryEst" placeholder="YYYY-MM" value="${esc(g.deliveryEst ?? "")}"></label>
+    </div>
+    <div class="btn-row"><button class="btn" type="button" id="watch-stop">Stop watching</button></div>
+  </section>`;
+}
+
+/** Save a watch stage, then redraw: it changes the game page's layout and the Watchlist's order. */
+function setStage(g, stage, redraw) {
+  g.watchStage = stage;
+  queueSave(g.id, { watchStage: stage });
+  redraw();
+}
+
+function bindWatch(g) {
+  const redraw = () => renderScorer(g.id);
+  view.querySelector("#watch-start")?.addEventListener("click", () => setStage(g, STAGES[0].key, redraw));
+  view.querySelector("#watch-stop")?.addEventListener("click", () => setStage(g, null, redraw));
+  view.querySelectorAll("[data-watch]").forEach((el) => {
+    const key = el.dataset.watch;
+    el.addEventListener("change", () => {
+      let v = el.value.trim();
+      if (key === "targetCurrency") v = el.value = v.toUpperCase();
+      if (el.type === "number") v = v === "" ? null : Number(v);
+      if (v === "") v = null;
+      if (key === "watchStage" && !v) return;
+      const patch = { [key]: v };
+      Object.assign(g, patch);
+      queueSave(g.id, patch);
+      if (key === "campaignUrl") renderScorer(g.id);
+    });
+  });
+}
+
+// ---------- watchlist ----------
+
+let decidedOpen = false;
+const todayIso = () => new Date().toLocaleDateString("en-CA"); // local YYYY-MM-DD
+
+function priceLabel(g) {
+  if (g.targetPrice == null) return "";
+  const currency = targetCurrency(g);
+  try {
+    return new Intl.NumberFormat(undefined, { style: "currency", currency }).format(g.targetPrice);
+  } catch {
+    return `${g.targetPrice} ${currency}`;
+  }
+}
+
+function renderWatchlist() {
+  const list = sortWatchlist(state.games);
+  const active = list.filter((g) => !isDecided(g));
+  const decided = list.filter(isDecided);
+  const today = todayIso();
+  view.innerHTML = `
+    <h1>Watchlist</h1>
+    ${list.length ? "" : `<p class="empty">No watched games. Open a game and choose Start watching.</p>`}
+    <ul class="list" id="watch-active">${active.map((g) => watchRowHtml(g, today)).join("")}</ul>
+    ${decided.length ? `<details class="decided" ${decidedOpen ? "open" : ""}><summary>Decided (${decided.length})</summary>
+      <ul class="list">${decided.map((g) => watchRowHtml(g, today)).join("")}</ul></details>` : ""}`;
+  view.querySelector(".decided")?.addEventListener("toggle", (e) => (decidedOpen = e.target.open));
+
+  // Same saves as the game page: a stage change re-sorts the list, a price doesn't.
+  view.querySelectorAll(".watch-row").forEach((row) => {
+    const g = byId(Number(row.dataset.id));
+    row.querySelector("[data-w=stage]").addEventListener("change", (e) => setStage(g, e.target.value, renderWatchlist));
+    row.querySelector("[data-act=awaiting]")?.addEventListener("click", () => setStage(g, "awaiting", renderWatchlist));
+    row.querySelector("[data-w=price]").addEventListener("change", (e) => {
+      const v = e.target.value.trim() === "" ? null : Number(e.target.value);
+      const patch = { targetPrice: v };
+      Object.assign(g, patch);
+      queueSave(g.id, patch);
+      row.querySelector(".details").textContent = watchDetails(g);
+    });
+  });
+}
+
+/** "· Oct 2027 · $45.00": the row details after the stage. */
+function watchDetails(g) {
+  const parts = [monthLabel(g.deliveryEst), priceLabel(g)].filter(Boolean);
+  return parts.length ? `· ${parts.join(" · ")}` : "";
+}
+
+function watchRowHtml(g, today) {
+  const meta = `<span class="stage">${esc(STAGE_LABELS[g.watchStage])}</span><span class="details">${esc(watchDetails(g))}</span>`;
+  const badge = g.predictedScore != null
+    ? `<div class="num">${formatNumber(g.predictedScore)}</div><div class="lbl">predicted</div>`
+    : `<div class="num old">—</div><div class="lbl">predicted</div>`;
+  return `<li class="watch-row" data-id="${g.id}">
+    <a class="game-row" href="#/g/${g.id}">
+      ${thumbHtml(g)}
+      <div class="info"><div class="name">${esc(g.name)}</div><div class="meta">${meta}</div></div>
+      <div class="score-badge predicted">${badge}</div>
+    </a>
+    <div class="watch-edit">
+      <select data-w="stage" aria-label="Watch stage for ${esc(g.name)}">${STAGES.map((s) =>
+        `<option value="${s.key}" ${g.watchStage === s.key ? "selected" : ""}>${esc(s.label)}</option>`).join("")}</select>
+      <label class="price"><input type="number" data-w="price" min="0" step="0.01" inputmode="decimal" placeholder="Target"
+        aria-label="Target price for ${esc(g.name)}" value="${g.targetPrice ?? ""}"><span>${esc(targetCurrency(g))}</span></label>
+    </div>
+    ${awaitingHint(g, today) ? `<div class="notice"><span>Campaign ended ${esc(g.campaignEnd)}.</span>
+      <button class="btn" type="button" data-act="awaiting">Move to Awaiting delivery?</button></div>` : ""}
+  </li>`;
+}
+
 // ---------- add ----------
 
 function renderAdd() {
   const bggOn = state.bgg.configured;
   view.innerHTML = `
     <h1>Add a game</h1>
+    <label class="toggle"><input type="checkbox" id="mwatch"> Watch instead of score</label>
     ${bggOn
       ? `<input type="search" id="bq" placeholder="Search BoardGameGeek" aria-label="Search BoardGameGeek" autofocus>
          <ul class="list" id="results"><li class="empty">Type at least 2 letters.</li></ul>`
@@ -439,12 +589,15 @@ function renderAdd() {
       <button class="btn primary" type="submit">Add game</button>
     </form>`;
 
+  // A watched game starts at the first stage, Campaign live.
+  const watch = () => (view.querySelector("#mwatch").checked ? { watchStage: STAGES[0].key } : {});
+
   view.querySelector("#manual").addEventListener("submit", async (e) => {
     e.preventDefault();
     const name = view.querySelector("#mname").value.trim();
     if (!name) return;
     try {
-      const g = await api.post("/api/games", { name, type: view.querySelector("#mtype").value });
+      const g = await api.post("/api/games", { name, type: view.querySelector("#mtype").value, ...watch() });
       state.games.push(g);
       location.hash = `#/g/${g.id}`;
     } catch (err) {
@@ -469,7 +622,7 @@ function renderAdd() {
       try {
         const rows = await api.get(`/api/bgg/search?q=${encodeURIComponent(q)}`);
         if (mine !== seq) return;
-        const shown = rows.filter((r) => !isHiddenType(r.type));
+        const shown = rows.filter((r) => !isHiddenType(r.type, state.settings));
         results.innerHTML = shown.length
           ? shown.map((r) => `<li><div class="game-row">
               <div class="info"><div class="name">${esc(r.name)}${r.type === "Expansion" ? '<span class="tag">Exp</span>' : ""}</div>
@@ -490,7 +643,7 @@ function renderAdd() {
     b.disabled = true;
     b.textContent = "Adding…";
     try {
-      const g = await api.post("/api/games/from-bgg", { bggId: Number(b.dataset.add) });
+      const g = await api.post("/api/games/from-bgg", { bggId: Number(b.dataset.add), ...watch() });
       if (!byId(g.id)) state.games.push(g);
       location.hash = `#/g/${g.id}`;
     } catch (err) {
@@ -504,17 +657,13 @@ function renderAdd() {
 // ---------- summary ----------
 
 function renderSummary() {
-  const games = visibleGames();
-  const scored = games.filter((g) => final(g) != null);
-  const olds = games.map((g) => g.oldRating).filter((x) => x != null);
-  const o = spread(olds);
-  const n = spread(scored.map(final));
+  const { games, scored, old: o, new: n } = summaryStats(state.games, state.settings);
   const pct = (x) => (x == null ? "—" : `${Math.round(x * 100)}%`);
   const rows = [
     ["Games", o.n, n.n, ""],
-    ["Mean", fmt(o.mean, 2), fmt(n.mean, 2), "~7.0"],
-    ["Median", fmt(o.median, 2), fmt(n.median, 2), "~7.0"],
-    ["Std. dev.", fmt(o.sd, 2), fmt(n.sd, 2), "wider than old"],
+    ["Mean", formatNumber(o.mean, 2), formatNumber(n.mean, 2), "~7.0"],
+    ["Median", formatNumber(o.median, 2), formatNumber(n.median, 2), "~7.0"],
+    ["Std. dev.", formatNumber(o.sd, 2), formatNumber(n.sd, 2), "wider than old"],
     ["9.0 or above", pct(o.pct9), pct(n.pct9), "~5%"],
     ["8.0–8.9", pct(o.pct8), pct(n.pct8), "well under old"],
     ["Below 6.0", pct(o.pctBelow6), pct(n.pctBelow6), "real use of 4–6"],
@@ -537,7 +686,7 @@ function renderSummary() {
 
   view.innerHTML = `
     <h1>Summary</h1>
-    <p class="muted small">Old ratings are the spreadsheet baseline. New scores count fully scored games only (${scored.length} of ${games.length})${state.settings.hideExpansions ? ". Expansions are hidden" : ""}.</p>
+    <p class="muted small">Old ratings are the spreadsheet baseline. New scores count fully scored games only (${scored.length} of ${games.length}); predicted scores never count${state.settings.hideExpansions ? ". Expansions are hidden" : ""}.</p>
     <table>
       <thead><tr><th>Metric</th><th class="num">Old</th><th class="num">New</th><th>Target</th></tr></thead>
       <tbody>${rows.map(([m, a, b, t]) => `<tr><td>${m}</td><td class="num">${a ?? "—"}</td><td class="num">${b ?? "—"}</td><td class="muted small">${t}</td></tr>`).join("")}</tbody>
@@ -547,7 +696,7 @@ function renderSummary() {
     <div class="hist" role="img" aria-label="Count of games at each rounded score, old ratings versus new scores">${hist}</div>
     ${changes.length ? `<h2>Biggest changes vs old</h2>
       <table><tbody>${changes.map(({ g, d }) => `<tr><td><a href="#/g/${g.id}">${esc(g.name)}</a></td>
-        <td class="num">${fmt(g.oldRating)} → ${fmt(final(g))}</td><td class="num">${d > 0 ? "+" : ""}${fmt(d)}</td></tr>`).join("")}</tbody></table>` : ""}`;
+        <td class="num">${formatNumber(g.oldRating)} → ${formatNumber(final(g))}</td><td class="num">${d > 0 ? "+" : ""}${formatNumber(d)}</td></tr>`).join("")}</tbody></table>` : ""}`;
 }
 
 // ---------- settings ----------
@@ -561,6 +710,8 @@ function renderSettings() {
       <h2 style="margin-top:0">Display</h2>
       <label class="toggle"><input type="checkbox" id="hideexp" ${s.hideExpansions ? "checked" : ""}> Hide expansions</label>
       <p class="small muted">Hides expansions from the game list, Summary, BGG search and the Claude export. Their scores are kept.</p>
+      <label class="toggle"><input type="checkbox" id="incwatch" ${s.includeWatching ? "checked" : ""}> Include watched games in the list and Claude export</label>
+      <p class="small muted">Watched games show their predicted score, labeled <i>predicted</i>. The Claude export lists them in their own section. Summary statistics never use predicted scores.</p>
     </section>
     <section class="card">
       <h2 style="margin-top:0">Weights</h2>
@@ -588,6 +739,7 @@ function renderSettings() {
       <p class="small muted">Everything lives in one database on your server, with a daily backup copy kept there.</p>
       <div class="btn-row">
         <a class="btn" href="/api/export" download>Export JSON</a>
+        <a class="btn" href="/api/watchlist" download="tablescore-watchlist.json">Export watchlist</a>
         <button class="btn" id="copy">Copy scores for Claude</button>
       </div>
     </section>`;
@@ -619,6 +771,16 @@ function renderSettings() {
     try {
       state.settings = await api.put("/api/settings", { hideExpansions: e.target.checked });
       toast(state.settings.hideExpansions ? "Expansions hidden" : "Expansions shown");
+    } catch (err) {
+      e.target.checked = !e.target.checked;
+      toast(`Couldn't save: ${err.message}`, 5000);
+    }
+  });
+
+  view.querySelector("#incwatch").addEventListener("change", async (e) => {
+    try {
+      state.settings = await api.put("/api/settings", { includeWatching: e.target.checked });
+      toast(state.settings.includeWatching ? "Watched games shown" : "Watched games hidden");
     } catch (err) {
       e.target.checked = !e.target.checked;
       toast(`Couldn't save: ${err.message}`, 5000);
@@ -659,22 +821,9 @@ function renderSettings() {
 }
 
 async function copyForClaude() {
-  const w = state.settings.weights;
-  const lines = [
-    `My board game ratings from my Tablescore rubric (weights: ${CRITERIA.map((c) => `${c.name} ${w[c.key]}`).join(", ")}; stretch ${state.settings.stretch}).`,
-    "Scored games (final score | criteria in that order | plays | status | avoid-theme):",
-  ];
-  const scored = visibleGames().filter((g) => final(g) != null).sort((a, b) => final(b) - final(a));
-  for (const g of scored) {
-    lines.push(`- ${g.name}: ${fmt(final(g))} | ${CRITERIA.map((c) => g.scores[c.key]).join("/")} | ${g.plays} plays | ${g.status || "-"}${g.avoidTheme ? " | AVOID THEME" : ""}`);
-  }
-  const rest = visibleGames().filter((g) => final(g) == null && g.bggRating != null).sort((a, b) => b.bggRating - a.bggRating);
-  if (rest.length) {
-    lines.push("", "Not yet rescored (old BGG rating):");
-    for (const g of rest) lines.push(`- ${g.name}: ${fmt(g.bggRating)}${g.status ? ` (${g.status})` : ""}`);
-  }
-  await copyText(lines.join("\n"));
-  toast(`Copied ${scored.length} scored and ${rest.length} other games`);
+  const { text, scored, rest, watching } = claudeExport(state.games, state.settings);
+  await copyText(text);
+  toast(`Copied ${scored} scored and ${rest} other games${watching ? `, plus ${watching} watched (predicted)` : ""}`);
 }
 
 async function copyText(text) {
