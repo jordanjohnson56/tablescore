@@ -2,7 +2,9 @@ import {
   CRITERIA, BAND_LABELS, bandIndex, finalScore, rawAverage, scaleEntry, scoredCount,
   rescoreStatus, isProvisional, spread, weightTotal,
 } from "./rubric.js";
-import { claudeExport, isHiddenType as hiddenType, visibleGames as shownGames } from "./watchlist.js";
+import {
+  STAGES, PLATFORMS, claudeExport, isWatching, isHiddenType as hiddenType, visibleGames as shownGames,
+} from "./watchlist.js";
 import { api } from "./api.js";
 
 const view = document.getElementById("view");
@@ -184,7 +186,7 @@ function renderList() {
     document.getElementById("count").textContent = `${list.length} ${list.length === 1 ? "game" : "games"}`;
     document.getElementById("games").innerHTML = list.length
       ? list.map(rowHtml).join("")
-      : `<li class="empty">${visibleGames().length ? "No games match." : state.games.length ? "Every game is an expansion, and expansions are hidden in Settings." : 'No games yet. Import your spreadsheet or use <a href="#/add">Add</a>.'}</li>`;
+      : `<li class="empty">${visibleGames().length ? "No games match." : state.games.length ? "Every game is hidden: watched games stay out of this list, and Settings may hide expansions." : 'No games yet. Import your spreadsheet or use <a href="#/add">Add</a>.'}</li>`;
   };
   fill();
   view.querySelector("#q").addEventListener("input", (e) => {
@@ -250,6 +252,7 @@ function renderScorer(id) {
     return;
   }
   const w = state.settings.weights;
+  const watching = isWatching(g);
   view.innerHTML = `
     <header class="score-head">
       <a class="back" href="#/" aria-label="Back to games">‹</a>
@@ -260,6 +263,8 @@ function renderScorer(id) {
       <div class="final" id="final"></div>
     </header>
     <div id="drift"></div>
+    ${watching ? watchHtml(g) : ""}
+    ${watching ? `<details class="score-it"><summary>Score it</summary>` : ""}
     ${CRITERIA.map((c) => `
       <section class="card crit" data-k="${c.key}">
         <div class="crit-top">
@@ -278,6 +283,7 @@ function renderScorer(id) {
           <ol>${c.bands.map((b, i) => `<li data-i="${i}"><b>${BAND_LABELS[i]}</b> ${esc(b)}</li>`).join("")}</ol>
         </details>
       </section>`).join("")}
+    ${watching ? "</details>" : watchHtml(g)}
     <section class="card">
       <h2 style="margin-top:0">Details</h2>
       <label class="field"><span>Logged plays</span>
@@ -408,6 +414,7 @@ function renderScorer(id) {
   });
   view.querySelector("#calib").addEventListener("change", (e) => queueSave(g.id, { calibration: (g.calibration = e.target.checked) }));
   view.querySelector("#notes").addEventListener("input", (e) => queueSave(g.id, { notes: (g.notes = e.target.value) }));
+  bindWatch(g);
   view.querySelector("#del").addEventListener("click", async () => {
     if (!confirm(`Delete ${g.name} and its scores? This can't be undone.`)) return;
     try {
@@ -419,6 +426,70 @@ function renderScorer(id) {
     } catch (e) {
       toast(`Couldn't delete: ${e.message}`, 5000);
     }
+  });
+}
+
+// ---------- watch section ----------
+
+/** Start/stop watching and every watch field. Stopping keeps the fields. */
+function watchHtml(g) {
+  if (!isWatching(g)) {
+    return `<section class="card watch">
+      <h2 style="margin-top:0">Watch</h2>
+      <p class="small muted">Follow a crowdfunded game until backers have it and reviews are out. Watched games leave the main list, Summary and Claude export.</p>
+      <div class="btn-row"><button class="btn" type="button" id="watch-start">Start watching</button></div>
+    </section>`;
+  }
+  const opt = (list, cur, blank) =>
+    (blank ? `<option value="" ${cur ? "" : "selected"}>${blank}</option>` : "") +
+    list.map((o) => `<option value="${o.key}" ${cur === o.key ? "selected" : ""}>${esc(o.label)}</option>`).join("");
+  return `<section class="card watch">
+    <h2 style="margin-top:0">Watching</h2>
+    <label class="field"><span>Watch stage</span><select data-watch="watchStage">${opt(STAGES, g.watchStage)}</select></label>
+    <label class="field"><span>Predicted score (0–10)</span>
+      <input type="number" data-watch="predictedScore" min="0" max="10" step="0.1" inputmode="decimal" value="${g.predictedScore ?? ""}"></label>
+    <div class="pair">
+      <label class="field"><span>Target price</span>
+        <input type="number" data-watch="targetPrice" min="0" step="0.01" inputmode="decimal" value="${g.targetPrice ?? ""}"></label>
+      <label class="field currency"><span>Currency</span>
+        <input type="text" data-watch="targetCurrency" maxlength="3" autocapitalize="characters" placeholder="USD" value="${esc(g.targetCurrency ?? "")}"></label>
+    </div>
+    <label class="field"><span>Platform</span><select data-watch="platform">${opt(PLATFORMS, g.platform, "Not set")}</select></label>
+    <label class="field"><span>Campaign URL</span>
+      <input type="url" data-watch="campaignUrl" inputmode="url" placeholder="https://" value="${esc(g.campaignUrl ?? "")}"></label>
+    ${/^https?:\/\//.test(g.campaignUrl ?? "") ? `<p class="small"><a href="${esc(g.campaignUrl)}" target="_blank" rel="noopener">Open campaign</a></p>` : ""}
+    <div class="pair">
+      <label class="field"><span>Campaign ends</span><input type="date" data-watch="campaignEnd" value="${esc(g.campaignEnd ?? "")}"></label>
+      <label class="field"><span>Estimated delivery</span><input type="month" data-watch="deliveryEst" placeholder="YYYY-MM" value="${esc(g.deliveryEst ?? "")}"></label>
+    </div>
+    <div class="btn-row"><button class="btn" type="button" id="watch-stop">Stop watching</button></div>
+  </section>`;
+}
+
+function bindWatch(g) {
+  // Watching changes the page layout, so starting or stopping redraws it.
+  const setStage = (stage) => {
+    g.watchStage = stage;
+    queueSave(g.id, { watchStage: stage });
+    renderScorer(g.id);
+  };
+  view.querySelector("#watch-start")?.addEventListener("click", () => setStage(STAGES[0].key));
+  view.querySelector("#watch-stop")?.addEventListener("click", () => setStage(null));
+  view.querySelectorAll("[data-watch]").forEach((el) => {
+    const key = el.dataset.watch;
+    el.addEventListener("change", () => {
+      let v = el.value.trim();
+      if (key === "targetCurrency") v = el.value = v.toUpperCase();
+      if (el.type === "number") v = v === "" ? null : Number(v);
+      if (v === "") v = null;
+      if (key === "watchStage" && !v) return;
+      const patch = { [key]: v };
+      // A price without a currency is in USD.
+      if (key === "targetPrice" && v != null && !g.targetCurrency) patch.targetCurrency = "USD";
+      Object.assign(g, patch);
+      queueSave(g.id, patch);
+      if (key === "campaignUrl") renderScorer(g.id);
+    });
   });
 }
 

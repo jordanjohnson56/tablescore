@@ -3,6 +3,7 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { CRITERIA, DEFAULT_SETTINGS } from "../public/js/rubric.js";
+import { PLATFORMS, STAGE_KEYS } from "../public/js/watchlist.js";
 
 const SCORE_COLS = CRITERIA.map((c) => `s_${c.key}`);
 
@@ -17,6 +18,49 @@ const USER_FIELDS = {
   notes: "notes",
   bestPlayers: "best_players",
 };
+
+// Watch fields, also user-editable, with their column types. Added to existing
+// databases by migrate(); BGG sync never writes them.
+const WATCH_FIELDS = {
+  watchStage: ["watch_stage", "TEXT"],
+  campaignUrl: ["campaign_url", "TEXT"],
+  platform: ["platform", "TEXT"],
+  campaignEnd: ["campaign_end", "TEXT"],
+  deliveryEst: ["delivery_est", "TEXT"],
+  predictedScore: ["predicted_score", "REAL"],
+  targetPrice: ["target_price", "REAL"],
+  targetCurrency: ["target_currency", "TEXT"],
+};
+
+// One check per watch field: true if the (non-null) value is allowed, plus the
+// message a 400 carries otherwise.
+const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v) && new Date(`${v}T00:00:00Z`).toISOString().startsWith(v);
+const WATCH_RULES = {
+  watchStage: [(v) => STAGE_KEYS.includes(v), `watchStage must be one of ${STAGE_KEYS.join(", ")} or null`],
+  campaignUrl: [(v) => typeof v === "string" && /^https?:\/\/\S+$/.test(v), "campaignUrl must be an http(s) URL or null"],
+  platform: [(v) => PLATFORMS.some((p) => p.key === v), `platform must be one of ${PLATFORMS.map((p) => p.key).join(", ")} or null`],
+  campaignEnd: [(v) => typeof v === "string" && isDate(v), "campaignEnd must be a date like 2026-10-30 or null"],
+  deliveryEst: [(v) => typeof v === "string" && /^\d{4}-(0[1-9]|1[0-2])$/.test(v), "deliveryEst must be a month like 2027-09 or null"],
+  predictedScore: [(v) => typeof v === "number" && v >= 0 && v <= 10, "predictedScore must be 0-10 or null"],
+  targetPrice: [(v) => typeof v === "number" && Number.isFinite(v) && v >= 0, "targetPrice must be a non-negative number or null"],
+  targetCurrency: [(v) => typeof v === "string" && /^[A-Z]{3}$/.test(v), "targetCurrency must be a three-letter code like USD or null"],
+};
+
+/**
+ * Validate watch fields in a patch or new game and return their normalized
+ * values (an empty string means null). Throws a 400 HttpError on a bad value.
+ * Keys that aren't watch fields are ignored.
+ */
+export function checkWatchFields(fields) {
+  const out = {};
+  for (const [k, [ok, msg]] of Object.entries(WATCH_RULES)) {
+    if (fields[k] === undefined) continue;
+    const v = fields[k] === "" ? null : fields[k];
+    if (v !== null && !ok(v)) throw new HttpError(400, msg);
+    out[k] = v;
+  }
+  return out;
+}
 
 const BGG_FIELDS = {
   bggId: "bgg_id",
@@ -67,7 +111,16 @@ export function openDb(file) {
     );
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   `);
+  migrate(db);
   return new Store(db);
+}
+
+/** Add any missing watch columns. Safe to repeat; existing rows get nulls. */
+function migrate(db) {
+  const have = new Set(db.prepare("PRAGMA table_info(games)").all().map((c) => c.name));
+  for (const [col, type] of Object.values(WATCH_FIELDS)) {
+    if (!have.has(col)) db.exec(`ALTER TABLE games ADD COLUMN ${col} ${type}`);
+  }
 }
 
 export class Store {
@@ -127,8 +180,12 @@ export class Store {
   updateGame(id, patch) {
     const sets = [];
     const vals = [];
+    const watch = checkWatchFields(patch);
     for (const [k, v] of Object.entries(patch)) {
-      if (k === "scores") {
+      if (k in watch) {
+        sets.push(`${WATCH_FIELDS[k][0]} = ?`);
+        vals.push(watch[k]);
+      } else if (k === "scores") {
         for (const [ck, cv] of Object.entries(v || {})) {
           if (!CRITERIA.some((c) => c.key === ck)) throw new HttpError(400, `unknown criterion ${ck}`);
           if (cv !== null && !(typeof cv === "number" && cv >= 0 && cv <= 10)) {
@@ -233,6 +290,7 @@ function toGame(r) {
     bggWeight: r.bgg_weight,
     image: r.image,
     thumbnail: r.thumbnail,
+    ...Object.fromEntries(Object.entries(WATCH_FIELDS).map(([k, [col]]) => [k, r[col]])),
     scores: Object.fromEntries(CRITERIA.map((c) => [c.key, r[`s_${c.key}`]])),
     updatedAt: r.updated_at,
   };

@@ -14,6 +14,16 @@ test("the main list shows expansions unless hideExpansions is on", () => {
   assert.deepEqual(names({ ...DEFAULT_SETTINGS, hideExpansions: true }), ["Brass"]);
 });
 
+test("the main list leaves out watched games", () => {
+  const games = [game("Brass"), game("Bookwyrm", { watchStage: "campaign" }), game("Passed", { watchStage: "pass" })];
+  assert.deepEqual(visibleGames(games, DEFAULT_SETTINGS).map((g) => g.name), ["Brass"]);
+});
+
+test("Claude export leaves out watched games", () => {
+  const watched = game("Excursions", { watchStage: "reviews", scores: vec([9, 9, 9, 9, 9, 9, 9]), bggRating: 8 });
+  assert.deepEqual(claudeExport([...COLLECTION, watched], DEFAULT_SETTINGS), claudeExport(COLLECTION, DEFAULT_SETTINGS));
+});
+
 // A small collection covering each kind of export line. Scores come from the
 // rubric tests' spreadsheet cases (9.1, 7.6 and 6.1).
 const COLLECTION = [
