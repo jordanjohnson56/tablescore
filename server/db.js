@@ -139,7 +139,7 @@ export class Store {
     const stmt = this.db.prepare(
       "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     );
-    for (const key of ["weights", "stretch", "hideExpansions"]) {
+    for (const key of ["weights", "stretch", "hideExpansions", "includeWatching"]) {
       if (patch[key] !== undefined) stmt.run(key, JSON.stringify(patch[key]));
     }
     return this.getSettings();
