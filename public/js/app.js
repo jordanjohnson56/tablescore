@@ -2,6 +2,7 @@ import {
   CRITERIA, BAND_LABELS, bandIndex, finalScore, rawAverage, scaleEntry, scoredCount,
   rescoreStatus, isProvisional, spread, weightTotal,
 } from "./rubric.js";
+import { claudeExport, isHiddenType as hiddenType, visibleGames as shownGames } from "./watchlist.js";
 import { api } from "./api.js";
 
 const view = document.getElementById("view");
@@ -15,9 +16,8 @@ const esc = (s) =>
 const fmt = (n, d = 1) => (n == null ? "—" : Number(n).toFixed(d));
 const final = (g) => finalScore(g.scores, state.settings);
 const byId = (id) => state.games.find((g) => g.id === id);
-const isHiddenType = (type) => state.settings.hideExpansions && type === "Expansion";
-/** Games the list, summary and exports show; Settings can hide expansions. */
-const visibleGames = () => state.games.filter((g) => !isHiddenType(g.type));
+const isHiddenType = (type) => hiddenType(type, state.settings);
+const visibleGames = () => shownGames(state.games, state.settings);
 
 function loadPrefs() {
   try {
@@ -659,22 +659,9 @@ function renderSettings() {
 }
 
 async function copyForClaude() {
-  const w = state.settings.weights;
-  const lines = [
-    `My board game ratings from my Tablescore rubric (weights: ${CRITERIA.map((c) => `${c.name} ${w[c.key]}`).join(", ")}; stretch ${state.settings.stretch}).`,
-    "Scored games (final score | criteria in that order | plays | status | avoid-theme):",
-  ];
-  const scored = visibleGames().filter((g) => final(g) != null).sort((a, b) => final(b) - final(a));
-  for (const g of scored) {
-    lines.push(`- ${g.name}: ${fmt(final(g))} | ${CRITERIA.map((c) => g.scores[c.key]).join("/")} | ${g.plays} plays | ${g.status || "-"}${g.avoidTheme ? " | AVOID THEME" : ""}`);
-  }
-  const rest = visibleGames().filter((g) => final(g) == null && g.bggRating != null).sort((a, b) => b.bggRating - a.bggRating);
-  if (rest.length) {
-    lines.push("", "Not yet rescored (old BGG rating):");
-    for (const g of rest) lines.push(`- ${g.name}: ${fmt(g.bggRating)}${g.status ? ` (${g.status})` : ""}`);
-  }
-  await copyText(lines.join("\n"));
-  toast(`Copied ${scored.length} scored and ${rest.length} other games`);
+  const { text, scored, rest } = claudeExport(state.games, state.settings);
+  await copyText(text);
+  toast(`Copied ${scored} scored and ${rest} other games`);
 }
 
 async function copyText(text) {
