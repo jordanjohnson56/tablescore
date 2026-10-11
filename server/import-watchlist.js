@@ -2,23 +2,17 @@
 // Usage: npm run import-watchlist -- /path/to/watchlist.json
 // The file holds an array of games, or is a whole watchlist export. Games already
 // in the database (same BGG ID, or same name ignoring case) are skipped.
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { checkWatchFields, openDb } from "./db.js";
+import { WATCH_FIELDS, checkWatchFields, openDb } from "./db.js";
+import { checkFile } from "./files.js";
 
-const FIELDS = ["name", "bggId", "notes", "watchStage", "campaignUrl", "platform", "campaignEnd", "deliveryEst", "predictedScore", "targetPrice", "targetCurrency"];
+const FIELDS = ["name", "bggId", "notes", ...Object.keys(WATCH_FIELDS)];
 
 /** Read a JSON file: an array of games, or a watchlist export's games. */
 export function readWatchlistFile(file) {
-  let st;
-  try {
-    st = statSync(file);
-  } catch {
-    throw new Error(`No file at ${file}`);
-  }
-  // What Docker hands you when a -v source path doesn't exist on the host.
-  if (st.isDirectory()) throw new Error(`${file} is a folder, not a JSON file. If you mounted it with docker -v, the host path was wrong.`);
+  checkFile(file, "a JSON file");
   let data;
   try {
     data = JSON.parse(readFileSync(file, "utf8"));

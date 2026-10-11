@@ -21,7 +21,7 @@ const USER_FIELDS = {
 
 // Watch fields, also user-editable, with their column types. Added to existing
 // databases by migrate(); BGG sync never writes them.
-const WATCH_FIELDS = {
+export const WATCH_FIELDS = {
   watchStage: ["watch_stage", "TEXT"],
   campaignUrl: ["campaign_url", "TEXT"],
   platform: ["platform", "TEXT"],

@@ -1,6 +1,6 @@
 import express from "express";
 import { fileURLToPath } from "node:url";
-import { HttpError, checkWatchFields } from "./db.js";
+import { HttpError } from "./db.js";
 import { BggError } from "./bgg.js";
 import { syncCollection, addFromBgg } from "./sync.js";
 import { watchlistExport } from "./export-watchlist.js";
@@ -60,8 +60,8 @@ export function createApp({ store, bgg, bggUsername }) {
   app.post("/api/games/from-bgg", async (req, res) => {
     const bggId = Number(req.body.bggId);
     if (!Number.isInteger(bggId) || bggId <= 0) throw new HttpError(400, "bggId must be a positive integer");
-    const watch = checkWatchFields({ watchStage: req.body.watchStage });
-    const { game, existed } = await addFromBgg(store, bgg, bggId, watch);
+    // createGame validates the watch stage, so a bad one is a 400 that adds nothing.
+    const { game, existed } = await addFromBgg(store, bgg, bggId, { watchStage: req.body.watchStage });
     if (!game) throw new HttpError(404, "BGG has no game with that id");
     res.status(existed ? 200 : 201).json(game);
   });
