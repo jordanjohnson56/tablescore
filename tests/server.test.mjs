@@ -339,6 +339,21 @@ test("import explains a folder or missing path instead of crashing", async () =>
   await assert.rejects(readWorkbook(join(dir, "nope.xlsx")), /No file at/);
 });
 
+test("includeWatching setting persists and is validated", async () => {
+  const t = await startApp();
+  try {
+    assert.equal((await t.call("GET", "/api/state")).body.settings.includeWatching, false);
+    const r = await t.call("PUT", "/api/settings", { includeWatching: true });
+    assert.equal(r.body.includeWatching, true);
+    assert.equal(r.body.stretch, 1.25);
+    assert.equal((await t.call("PUT", "/api/settings", { includeWatching: "yes" })).status, 400);
+    assert.equal((await t.call("PUT", "/api/settings", { includeWatching: 1 })).status, 400);
+    assert.equal((await t.call("PUT", "/api/settings", { stretch: 1.5 })).body.includeWatching, true);
+  } finally {
+    t.close();
+  }
+});
+
 test("hideExpansions setting persists and is validated", async () => {
   const t = await startApp();
   try {
@@ -487,6 +502,57 @@ test("the full JSON export and backups include the watch fields", async () => {
     const copy = openDb(t.store.backup(dir));
     const [backedUp] = copy.listGames();
     assert.deepEqual(pick(backedUp, WATCHED), WATCHED);
+  } finally {
+    t.close();
+  }
+});
+
+test("adding a game with a watch stage creates it Watching at that stage", async () => {
+  const t = await startApp();
+  try {
+    const r = await t.call("POST", "/api/games", { name: "Bookwyrm", watchStage: "campaign" });
+    assert.equal(r.status, 201);
+    assert.equal(r.body.watchStage, "campaign");
+    const [g] = (await t.call("GET", "/api/state")).body.games;
+    assert.equal(g.watchStage, "campaign");
+  } finally {
+    t.close();
+  }
+});
+
+test("adding a game with an invalid watch stage is a 400 and adds nothing", async () => {
+  const t = await startApp();
+  try {
+    for (const [path, body] of [
+      ["/api/games", { name: "Bookwyrm", watchStage: "watching" }],
+      ["/api/games/from-bgg", { bggId: 266192, watchStage: "watching" }],
+    ]) {
+      const r = await t.call("POST", path, body);
+      assert.equal(r.status, 400, path);
+      assert.match(r.body.error, /watchStage/);
+    }
+    assert.equal(t.store.listGames().length, 0);
+  } finally {
+    t.close();
+  }
+});
+
+test("adding from BGG with a watch stage creates a watched game with BGG details, but leaves one already in the list alone", async () => {
+  const t = await startApp();
+  try {
+    const a = await t.call("POST", "/api/games/from-bgg", { bggId: 266192, watchStage: "campaign" });
+    assert.equal(a.status, 201);
+    assert.equal(a.body.watchStage, "campaign");
+    assert.equal(a.body.name, "Game 266192");
+    assert.equal(a.body.bggWeight, 2.35);
+    assert.equal(a.body.bestPlayers, "3");
+
+    const plain = await t.call("POST", "/api/games/from-bgg", { bggId: 13 });
+    const again = await t.call("POST", "/api/games/from-bgg", { bggId: 13, watchStage: "campaign" });
+    assert.equal(again.status, 200);
+    assert.equal(again.body.id, plain.body.id);
+    assert.equal(again.body.watchStage, null);
+    assert.equal(t.store.getGame(plain.body.id).watchStage, null);
   } finally {
     t.close();
   }

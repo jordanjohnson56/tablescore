@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CRITERIA, DEFAULT_SETTINGS } from "../public/js/rubric.js";
-import { awaitingHint, claudeExport, monthLabel, sortWatchlist, visibleGames } from "../public/js/watchlist.js";
+import { awaitingHint, claudeExport, monthLabel, sortWatchlist, summaryStats, visibleGames } from "../public/js/watchlist.js";
 
 const base = { type: "Base Game", scores: {}, plays: 0, status: "", avoidTheme: false, bggRating: null };
 const game = (name, extra = {}) => ({ ...base, name, ...extra });
@@ -17,6 +17,13 @@ test("the main list shows expansions unless hideExpansions is on", () => {
 test("the main list leaves out watched games", () => {
   const games = [game("Brass"), game("Bookwyrm", { watchStage: "campaign" }), game("Passed", { watchStage: "pass" })];
   assert.deepEqual(visibleGames(games, DEFAULT_SETTINGS).map((g) => g.name), ["Brass"]);
+});
+
+test("the main list shows watched games when includeWatching is on", () => {
+  const games = [game("Brass"), game("Bookwyrm", { watchStage: "campaign" }), game("Watched exp", { type: "Expansion", watchStage: "awaiting" })];
+  const names = (settings) => visibleGames(games, settings).map((g) => g.name);
+  assert.deepEqual(names({ ...DEFAULT_SETTINGS, includeWatching: true }), ["Brass", "Bookwyrm", "Watched exp"]);
+  assert.deepEqual(names({ ...DEFAULT_SETTINGS, includeWatching: true, hideExpansions: true }), ["Brass", "Bookwyrm"]);
 });
 
 test("Claude export leaves out watched games", () => {
@@ -124,4 +131,49 @@ test("estimated delivery reads as a short month and year", () => {
   assert.equal(monthLabel("2027-10"), "Oct 2027");
   assert.equal(monthLabel("2028-01"), "Jan 2028");
   assert.equal(monthLabel(null), "");
+});
+
+test("Claude export lists watched games in a separate predicted section when includeWatching is on", () => {
+  const watched = [
+    game("Excursions", { watchStage: "reviews", predictedScore: 7.9, scores: vec([9, 9, 9, 9, 9, 9, 9]), bggRating: 8 }),
+    game("Bookwyrm", { watchStage: "campaign", predictedScore: 7.3 }),
+    game("No guess yet", { watchStage: "awaiting" }),
+  ];
+  const out = claudeExport([...COLLECTION, ...watched], { ...DEFAULT_SETTINGS, includeWatching: true });
+  assert.equal(out.text, [
+    ...HEADER,
+    "- Brass: Birmingham: 9.1 | 9/4/9/10/9/9/8 | 12 plays | Owned",
+    "- Pax Pamir: 7.6 | 7/8/7/4/7/10/6 | 2 plays | Owned | AVOID THEME",
+    "- Brass: Iron Clays: 6.1 | 5/5/7/6/8/7/7 | 1 plays | -",
+    "",
+    "Not yet rescored (old BGG rating):",
+    "- Azul: 8.0",
+    "- Ark Nova: 7.5 (Wishlist)",
+    "",
+    "Watching (predicted): crowdfunded games I haven't played; scores are my predictions from reviews, not real scores (predicted score | watch stage):",
+    "- Excursions: 7.9 predicted | Reviews out",
+    "- Bookwyrm: 7.3 predicted | Campaign live",
+    "- No guess yet: — predicted | Awaiting delivery",
+  ].join("\n"));
+  assert.equal(out.scored, 3);
+  assert.equal(out.rest, 2);
+  assert.equal(out.watching, 3);
+});
+
+test("Claude export has no predicted section when includeWatching is on but nothing is watched", () => {
+  const on = claudeExport(COLLECTION, { ...DEFAULT_SETTINGS, includeWatching: true });
+  assert.equal(on.text, claudeExport(COLLECTION, DEFAULT_SETTINGS).text);
+  assert.equal(on.watching, 0);
+});
+
+test("Summary statistics never use predicted scores", () => {
+  const watched = [game("Excursions", { watchStage: "reviews", predictedScore: 10 }), game("Bookwyrm", { watchStage: "campaign", predictedScore: 2 })];
+  for (const includeWatching of [false, true]) {
+    const s = summaryStats([...COLLECTION, ...watched], { ...DEFAULT_SETTINGS, includeWatching });
+    assert.deepEqual(s.scored.map((g) => g.name), ["Pax Pamir", "Brass: Birmingham", "Brass: Iron Clays"]);
+    assert.equal(s.new.n, 3);
+    assert.equal(s.new.mean.toFixed(2), "7.60");
+    assert.deepEqual(s.new.histogram[0], [10, 0]); // the predicted 10 never lands in the histogram
+    assert.equal(s.games.length, includeWatching ? 8 : 6);
+  }
 });

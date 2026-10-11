@@ -1,6 +1,6 @@
 import express from "express";
 import { fileURLToPath } from "node:url";
-import { HttpError } from "./db.js";
+import { HttpError, checkWatchFields } from "./db.js";
 import { BggError } from "./bgg.js";
 import { syncCollection, addFromBgg } from "./sync.js";
 import { CRITERIA } from "../public/js/rubric.js";
@@ -32,7 +32,7 @@ export function createApp({ store, bgg, bggUsername }) {
   });
 
   app.put("/api/settings", (req, res) => {
-    const { weights, stretch, hideExpansions } = req.body;
+    const { weights, stretch, hideExpansions, includeWatching } = req.body;
     if (weights !== undefined) {
       const ok = CRITERIA.every((c) => typeof weights[c.key] === "number" && weights[c.key] >= 0);
       if (!ok) throw new HttpError(400, "weights needs a non-negative number for every criterion");
@@ -43,20 +43,24 @@ export function createApp({ store, bgg, bggUsername }) {
     if (hideExpansions !== undefined && typeof hideExpansions !== "boolean") {
       throw new HttpError(400, "hideExpansions must be true or false");
     }
-    res.json(store.setSettings({ weights, stretch, hideExpansions }));
+    if (includeWatching !== undefined && typeof includeWatching !== "boolean") {
+      throw new HttpError(400, "includeWatching must be true or false");
+    }
+    res.json(store.setSettings({ weights, stretch, hideExpansions, includeWatching }));
   });
 
   app.post("/api/games", (req, res) => {
-    const { name, bggId, type = "Base", status = "" } = req.body;
+    const { name, bggId, type = "Base", status = "", watchStage } = req.body;
     if (!name?.trim()) throw new HttpError(400, "name is required");
     if (bggId && store.getByBggId(bggId)) throw new HttpError(409, "that BGG game is already in your list");
-    res.status(201).json(store.createGame({ name: name.trim(), bggId: bggId || null, type, status }));
+    res.status(201).json(store.createGame({ name: name.trim(), bggId: bggId || null, type, status, watchStage }));
   });
 
   app.post("/api/games/from-bgg", async (req, res) => {
     const bggId = Number(req.body.bggId);
     if (!Number.isInteger(bggId) || bggId <= 0) throw new HttpError(400, "bggId must be a positive integer");
-    const { game, existed } = await addFromBgg(store, bgg, bggId);
+    const watch = checkWatchFields({ watchStage: req.body.watchStage });
+    const { game, existed } = await addFromBgg(store, bgg, bggId, watch);
     if (!game) throw new HttpError(404, "BGG has no game with that id");
     res.status(existed ? 200 : 201).json(game);
   });

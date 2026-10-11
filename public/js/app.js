@@ -1,10 +1,10 @@
 import {
   CRITERIA, BAND_LABELS, bandIndex, finalScore, rawAverage, scaleEntry, scoredCount,
-  rescoreStatus, isProvisional, spread, weightTotal,
+  rescoreStatus, isProvisional, weightTotal,
 } from "./rubric.js";
 import {
-  STAGES, STAGE_LABELS, PLATFORMS, claudeExport, isWatching, isHiddenType as hiddenType, visibleGames as shownGames,
-  sortWatchlist, awaitingHint, monthLabel,
+  STAGES, STAGE_LABELS, PLATFORMS, claudeExport, isWatching, isHiddenType as hiddenType, summaryStats,
+  visibleGames as shownGames, sortWatchlist, awaitingHint, monthLabel,
 } from "./watchlist.js";
 import { api } from "./api.js";
 
@@ -188,7 +188,7 @@ function renderList() {
     document.getElementById("count").textContent = `${list.length} ${list.length === 1 ? "game" : "games"}`;
     document.getElementById("games").innerHTML = list.length
       ? list.map(rowHtml).join("")
-      : `<li class="empty">${visibleGames().length ? "No games match." : state.games.length ? "Every game is hidden: watched games stay out of this list, and Settings may hide expansions." : 'No games yet. Import your spreadsheet or use <a href="#/add">Add</a>.'}</li>`;
+      : `<li class="empty">${visibleGames().length ? "No games match." : state.games.length ? "Every game is hidden: Settings can hide watched games and expansions from this list." : 'No games yet. Import your spreadsheet or use <a href="#/add">Add</a>.'}</li>`;
   };
   fill();
   view.querySelector("#q").addEventListener("input", (e) => {
@@ -225,6 +225,7 @@ function rowHtml(g) {
   const f = final(g);
   const n = scoredCount(g.scores);
   const tags = [
+    isWatching(g) ? `<span class="tag" title="Watching: ${esc(STAGE_LABELS[g.watchStage])}">Watch</span>` : "",
     g.type === "Expansion" ? `<span class="tag">Exp</span>` : "",
     f != null && isProvisional(g) ? `<span class="tag" title="Fewer than 3 plays">Prov</span>` : "",
     n > 0 && n < 7 ? `<span class="tag warn">${n}/7</span>` : "",
@@ -233,9 +234,11 @@ function rowHtml(g) {
   ].join("");
   const badge = f != null
     ? `<div class="num">${fmt(f)}</div><div class="lbl">score</div>`
-    : g.bggRating != null
-      ? `<div class="num old">${fmt(g.bggRating)}</div><div class="lbl">old</div>`
-      : `<div class="num old">—</div>`;
+    : isWatching(g)
+      ? `<div class="num predicted">${fmt(g.predictedScore)}</div><div class="lbl">predicted</div>`
+      : g.bggRating != null
+        ? `<div class="num old">${fmt(g.bggRating)}</div><div class="lbl">old</div>`
+        : `<div class="num old">—</div>`;
   const thumb = g.thumbnail
     ? `<img class="thumb" src="${esc(g.thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer">`
     : `<div class="thumb" aria-hidden="true"></div>`;
@@ -584,6 +587,7 @@ function renderAdd() {
   const bggOn = state.bgg.configured;
   view.innerHTML = `
     <h1>Add a game</h1>
+    <label class="toggle"><input type="checkbox" id="mwatch"> Watch instead of score</label>
     ${bggOn
       ? `<input type="search" id="bq" placeholder="Search BoardGameGeek" aria-label="Search BoardGameGeek" autofocus>
          <ul class="list" id="results"><li class="empty">Type at least 2 letters.</li></ul>`
@@ -595,12 +599,15 @@ function renderAdd() {
       <button class="btn primary" type="submit">Add game</button>
     </form>`;
 
+  // A watched game starts at the first stage, Campaign live.
+  const watch = () => (view.querySelector("#mwatch").checked ? { watchStage: STAGES[0].key } : {});
+
   view.querySelector("#manual").addEventListener("submit", async (e) => {
     e.preventDefault();
     const name = view.querySelector("#mname").value.trim();
     if (!name) return;
     try {
-      const g = await api.post("/api/games", { name, type: view.querySelector("#mtype").value });
+      const g = await api.post("/api/games", { name, type: view.querySelector("#mtype").value, ...watch() });
       state.games.push(g);
       location.hash = `#/g/${g.id}`;
     } catch (err) {
@@ -646,7 +653,7 @@ function renderAdd() {
     b.disabled = true;
     b.textContent = "Adding…";
     try {
-      const g = await api.post("/api/games/from-bgg", { bggId: Number(b.dataset.add) });
+      const g = await api.post("/api/games/from-bgg", { bggId: Number(b.dataset.add), ...watch() });
       if (!byId(g.id)) state.games.push(g);
       location.hash = `#/g/${g.id}`;
     } catch (err) {
@@ -660,11 +667,7 @@ function renderAdd() {
 // ---------- summary ----------
 
 function renderSummary() {
-  const games = visibleGames();
-  const scored = games.filter((g) => final(g) != null);
-  const olds = games.map((g) => g.oldRating).filter((x) => x != null);
-  const o = spread(olds);
-  const n = spread(scored.map(final));
+  const { games, scored, old: o, new: n } = summaryStats(state.games, state.settings);
   const pct = (x) => (x == null ? "—" : `${Math.round(x * 100)}%`);
   const rows = [
     ["Games", o.n, n.n, ""],
@@ -693,7 +696,7 @@ function renderSummary() {
 
   view.innerHTML = `
     <h1>Summary</h1>
-    <p class="muted small">Old ratings are the spreadsheet baseline. New scores count fully scored games only (${scored.length} of ${games.length})${state.settings.hideExpansions ? ". Expansions are hidden" : ""}.</p>
+    <p class="muted small">Old ratings are the spreadsheet baseline. New scores count fully scored games only (${scored.length} of ${games.length}); predicted scores never count${state.settings.hideExpansions ? ". Expansions are hidden" : ""}.</p>
     <table>
       <thead><tr><th>Metric</th><th class="num">Old</th><th class="num">New</th><th>Target</th></tr></thead>
       <tbody>${rows.map(([m, a, b, t]) => `<tr><td>${m}</td><td class="num">${a ?? "—"}</td><td class="num">${b ?? "—"}</td><td class="muted small">${t}</td></tr>`).join("")}</tbody>
@@ -717,6 +720,8 @@ function renderSettings() {
       <h2 style="margin-top:0">Display</h2>
       <label class="toggle"><input type="checkbox" id="hideexp" ${s.hideExpansions ? "checked" : ""}> Hide expansions</label>
       <p class="small muted">Hides expansions from the game list, Summary, BGG search and the Claude export. Their scores are kept.</p>
+      <label class="toggle"><input type="checkbox" id="incwatch" ${s.includeWatching ? "checked" : ""}> Include watched games in the list and Claude export</label>
+      <p class="small muted">Watched games show their predicted score, labeled <i>predicted</i>. The Claude export lists them in their own section. Summary statistics never use predicted scores.</p>
     </section>
     <section class="card">
       <h2 style="margin-top:0">Weights</h2>
@@ -781,6 +786,16 @@ function renderSettings() {
     }
   });
 
+  view.querySelector("#incwatch").addEventListener("change", async (e) => {
+    try {
+      state.settings = await api.put("/api/settings", { includeWatching: e.target.checked });
+      toast(state.settings.includeWatching ? "Watched games shown" : "Watched games hidden");
+    } catch (err) {
+      e.target.checked = !e.target.checked;
+      toast(`Couldn't save: ${err.message}`, 5000);
+    }
+  });
+
   const syncBtn = view.querySelector("#sync");
   if (!syncBtn) return;
   const paint = (job) => {
@@ -815,9 +830,9 @@ function renderSettings() {
 }
 
 async function copyForClaude() {
-  const { text, scored, rest } = claudeExport(state.games, state.settings);
+  const { text, scored, rest, watching } = claudeExport(state.games, state.settings);
   await copyText(text);
-  toast(`Copied ${scored} scored and ${rest} other games`);
+  toast(`Copied ${scored} scored and ${rest} other games${watching ? `, plus ${watching} watched (predicted)` : ""}`);
 }
 
 async function copyText(text) {
