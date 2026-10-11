@@ -491,3 +491,54 @@ test("the full JSON export and backups include the watch fields", async () => {
     t.close();
   }
 });
+
+test("adding a game with a watch stage creates it Watching at that stage", async () => {
+  const t = await startApp();
+  try {
+    const r = await t.call("POST", "/api/games", { name: "Bookwyrm", watchStage: "campaign" });
+    assert.equal(r.status, 201);
+    assert.equal(r.body.watchStage, "campaign");
+    const [g] = (await t.call("GET", "/api/state")).body.games;
+    assert.equal(g.watchStage, "campaign");
+  } finally {
+    t.close();
+  }
+});
+
+test("adding a game with an invalid watch stage is a 400 and adds nothing", async () => {
+  const t = await startApp();
+  try {
+    for (const [path, body] of [
+      ["/api/games", { name: "Bookwyrm", watchStage: "watching" }],
+      ["/api/games/from-bgg", { bggId: 266192, watchStage: "watching" }],
+    ]) {
+      const r = await t.call("POST", path, body);
+      assert.equal(r.status, 400, path);
+      assert.match(r.body.error, /watchStage/);
+    }
+    assert.equal(t.store.listGames().length, 0);
+  } finally {
+    t.close();
+  }
+});
+
+test("adding from BGG with a watch stage creates a watched game with BGG details, but leaves one already in the list alone", async () => {
+  const t = await startApp();
+  try {
+    const a = await t.call("POST", "/api/games/from-bgg", { bggId: 266192, watchStage: "campaign" });
+    assert.equal(a.status, 201);
+    assert.equal(a.body.watchStage, "campaign");
+    assert.equal(a.body.name, "Game 266192");
+    assert.equal(a.body.bggWeight, 2.35);
+    assert.equal(a.body.bestPlayers, "3");
+
+    const plain = await t.call("POST", "/api/games/from-bgg", { bggId: 13 });
+    const again = await t.call("POST", "/api/games/from-bgg", { bggId: 13, watchStage: "campaign" });
+    assert.equal(again.status, 200);
+    assert.equal(again.body.id, plain.body.id);
+    assert.equal(again.body.watchStage, null);
+    assert.equal(t.store.getGame(plain.body.id).watchStage, null);
+  } finally {
+    t.close();
+  }
+});
