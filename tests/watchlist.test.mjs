@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CRITERIA, DEFAULT_SETTINGS } from "../public/js/rubric.js";
-import { awaitingHint, claudeExport, monthLabel, sortWatchlist, summaryStats, visibleGames } from "../public/js/watchlist.js";
+import { awaitingHint, claudeExport, monthLabel, sortWatchlist, summaryStats, targetCurrency, visibleGames } from "../public/js/watchlist.js";
 
 const base = { type: "Base Game", scores: {}, plays: 0, status: "", avoidTheme: false, bggRating: null };
 const game = (name, extra = {}) => ({ ...base, name, ...extra });
@@ -125,6 +125,12 @@ test("the Awaiting delivery hint shows only for a Campaign live game whose end d
   assert.equal(hint("awaiting", "2026-10-20"), false);
   assert.equal(hint("pass", "2026-10-20"), false);
   assert.equal(hint(null, "2026-10-20"), false);
+});
+
+test("a target price with no currency is in USD", () => {
+  assert.equal(targetCurrency(game("Bookwyrm", { targetPrice: 45, targetCurrency: null })), "USD");
+  assert.equal(targetCurrency(game("Bookwyrm", { targetPrice: 45 })), "USD");
+  assert.equal(targetCurrency(game("Bookwyrm", { targetPrice: 45, targetCurrency: "EUR" })), "EUR");
 });
 
 test("estimated delivery reads as a short month and year", () => {

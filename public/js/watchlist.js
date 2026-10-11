@@ -23,6 +23,12 @@ export const PLATFORMS = [
   { key: "other", label: "Other" },
 ];
 
+/** The currency of a target price that has none. The stored currency stays null. */
+export const DEFAULT_CURRENCY = "USD";
+
+/** The currency of a game's target price. */
+export const targetCurrency = (game) => game.targetCurrency || DEFAULT_CURRENCY;
+
 /** A game is Watching when it has a watch stage. */
 export const isWatching = (game) => Boolean(game.watchStage);
 

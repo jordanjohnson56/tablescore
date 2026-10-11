@@ -3,7 +3,7 @@ import {
   rescoreStatus, isProvisional, weightTotal,
 } from "./rubric.js";
 import {
-  STAGES, STAGE_LABELS, PLATFORMS, claudeExport, isWatching, isHiddenType as hiddenType, summaryStats,
+  STAGES, STAGE_LABELS, PLATFORMS, DEFAULT_CURRENCY, targetCurrency, claudeExport, isWatching, isHiddenType as hiddenType, summaryStats,
   visibleGames as shownGames, sortWatchlist, awaitingHint, monthLabel,
 } from "./watchlist.js";
 import { api } from "./api.js";
@@ -459,7 +459,7 @@ function watchHtml(g) {
       <label class="field"><span>Target price</span>
         <input type="number" data-watch="targetPrice" min="0" step="0.01" inputmode="decimal" value="${g.targetPrice ?? ""}"></label>
       <label class="field currency"><span>Currency</span>
-        <input type="text" data-watch="targetCurrency" maxlength="3" autocapitalize="characters" placeholder="USD" value="${esc(g.targetCurrency ?? "")}"></label>
+        <input type="text" data-watch="targetCurrency" maxlength="3" autocapitalize="characters" placeholder="${DEFAULT_CURRENCY}" value="${esc(g.targetCurrency ?? "")}"></label>
     </div>
     <label class="field"><span>Platform</span><select data-watch="platform">${opt(PLATFORMS, g.platform, "Not set")}</select></label>
     <label class="field"><span>Campaign URL</span>
@@ -491,8 +491,6 @@ function bindWatch(g) {
       if (v === "") v = null;
       if (key === "watchStage" && !v) return;
       const patch = { [key]: v };
-      // A price without a currency is in USD.
-      if (key === "targetPrice" && v != null && !g.targetCurrency) patch.targetCurrency = "USD";
       Object.assign(g, patch);
       queueSave(g.id, patch);
       if (key === "campaignUrl") renderScorer(g.id);
@@ -507,7 +505,7 @@ const todayIso = () => new Date().toLocaleDateString("en-CA"); // local YYYY-MM-
 
 function priceLabel(g) {
   if (g.targetPrice == null) return "";
-  const currency = g.targetCurrency || "USD";
+  const currency = targetCurrency(g);
   try {
     return new Intl.NumberFormat(undefined, { style: "currency", currency }).format(g.targetPrice);
   } catch {
@@ -541,8 +539,6 @@ function renderWatchlist() {
     row.querySelector("[data-w=price]").addEventListener("change", (e) => {
       const v = e.target.value.trim() === "" ? null : Number(e.target.value);
       const patch = { targetPrice: v };
-      // A price without a currency is in USD.
-      if (v != null && !g.targetCurrency) patch.targetCurrency = "USD";
       Object.assign(g, patch);
       queueSave(g.id, patch);
       row.querySelector(".details").textContent = watchDetails(g);
@@ -574,7 +570,7 @@ function watchRowHtml(g, today) {
       <select data-w="stage" aria-label="Watch stage for ${esc(g.name)}">${STAGES.map((s) =>
         `<option value="${s.key}" ${g.watchStage === s.key ? "selected" : ""}>${esc(s.label)}</option>`).join("")}</select>
       <label class="price"><input type="number" data-w="price" min="0" step="0.01" inputmode="decimal" placeholder="Target"
-        aria-label="Target price for ${esc(g.name)}" value="${g.targetPrice ?? ""}"><span>${esc(g.targetCurrency || "USD")}</span></label>
+        aria-label="Target price for ${esc(g.name)}" value="${g.targetPrice ?? ""}"><span>${esc(targetCurrency(g))}</span></label>
     </div>
     ${awaitingHint(g, today) ? `<div class="notice"><span>Campaign ended ${esc(g.campaignEnd)}.</span>
       <button class="btn" type="button" data-act="awaiting">Move to Awaiting delivery?</button></div>` : ""}

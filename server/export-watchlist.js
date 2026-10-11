@@ -6,7 +6,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { openDb } from "./db.js";
-import { STAGES, sortWatchlist } from "../public/js/watchlist.js";
+import { STAGES, sortWatchlist, targetCurrency } from "../public/js/watchlist.js";
 
 const DECIDED = new Set(STAGES.filter((s) => s.decided).map((s) => s.key));
 
@@ -26,7 +26,7 @@ export function watchlistExport(store, now = new Date()) {
       deliveryEst: g.deliveryEst,
       predictedScore: g.predictedScore,
       targetPrice: g.targetPrice,
-      targetCurrency: g.targetCurrency || "USD",
+      targetCurrency: targetCurrency(g),
       notes: g.notes,
     })),
   };
