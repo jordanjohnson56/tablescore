@@ -139,7 +139,7 @@ test("estimated delivery reads as a short month and year", () => {
   assert.equal(monthLabel(null), "");
 });
 
-test("Claude export lists watched games in a separate predicted section when includeWatching is on", () => {
+test("Claude export lists watched games in a separate predicted section when includeWatching is on, with any real score labelled beside the prediction", () => {
   const watched = [
     game("Excursions", { watchStage: "reviews", predictedScore: 7.9, scores: vec([9, 9, 9, 9, 9, 9, 9]), bggRating: 8 }),
     game("Bookwyrm", { watchStage: "campaign", predictedScore: 7.3 }),
@@ -157,7 +157,7 @@ test("Claude export lists watched games in a separate predicted section when inc
     "- Ark Nova: 7.5 (Wishlist)",
     "",
     "Watching (predicted): crowdfunded games I haven't played; scores are my predictions from reviews, not real scores (predicted score | watch stage):",
-    "- Excursions: 7.9 predicted | Reviews out",
+    "- Excursions: 7.9 predicted (scored 10.0) | Reviews out",
     "- Bookwyrm: 7.3 predicted | Campaign live",
     "- No guess yet: — predicted | Awaiting delivery",
   ].join("\n"));

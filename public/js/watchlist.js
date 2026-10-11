@@ -97,7 +97,8 @@ export function summaryStats(games, settings) {
 /**
  * The "Copy scores for Claude" text: scored games by final score, then games
  * without a full score that have a BGG rating. With includeWatching on, watched
- * games follow in their own predicted section, never mixed with real scores.
+ * games follow in their own predicted section, never in the scored section; a
+ * watched game with a real score shows it there beside its prediction.
  * Counts are for the toast.
  */
 export function claudeExport(games, settings) {
@@ -122,7 +123,10 @@ export function claudeExport(games, settings) {
     .sort((a, b) => (b.predictedScore ?? -1) - (a.predictedScore ?? -1));
   if (watching.length) {
     lines.push("", "Watching (predicted): crowdfunded games I haven't played; scores are my predictions from reviews, not real scores (predicted score | watch stage):");
-    for (const g of watching) lines.push(`- ${g.name}: ${fmt(g.predictedScore)} predicted | ${STAGE_LABELS[g.watchStage]}`);
+    for (const g of watching) {
+      const real = final(g);
+      lines.push(`- ${g.name}: ${fmt(g.predictedScore)} predicted${real != null ? ` (scored ${fmt(real)})` : ""} | ${STAGE_LABELS[g.watchStage]}`);
+    }
   }
   return { text: lines.join("\n"), scored: scored.length, rest: rest.length, watching: watching.length };
 }
