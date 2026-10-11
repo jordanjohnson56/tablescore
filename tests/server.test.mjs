@@ -186,6 +186,25 @@ test("API rejects bad scores, BGG-owned fields and non-JSON writes", async () =>
   }
 });
 
+test("marking a game rated on BGG records the rating and nothing else", async () => {
+  const t = await startApp();
+  try {
+    const g = t.store.createGame({ name: "Catan", bggId: 13, bggRating: 6, scores: { desire: 8 }, notes: "keep" });
+    const r = await t.call("POST", `/api/games/${g.id}/bgg-rated`, { rating: 7.4 });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.bggRating, 7.4);
+    assert.equal(r.body.scores.desire, 8);
+    assert.equal(r.body.notes, "keep");
+    assert.equal((await t.call("POST", `/api/games/${g.id}/bgg-rated`, { rating: 11 })).status, 400);
+    assert.equal((await t.call("POST", `/api/games/${g.id}/bgg-rated`, { rating: "7" })).status, 400);
+    assert.equal((await t.call("POST", "/api/games/9999/bgg-rated", { rating: 7 })).status, 404);
+    const { body: local } = await t.call("POST", "/api/games", { name: "No BGG" });
+    assert.equal((await t.call("POST", `/api/games/${local.id}/bgg-rated`, { rating: 7 })).status, 400);
+  } finally {
+    t.close();
+  }
+});
+
 test("writes without a JSON content type are refused", async () => {
   const t = await startApp();
   try {

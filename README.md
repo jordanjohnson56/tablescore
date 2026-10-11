@@ -52,7 +52,7 @@ BGG's XML API needs a registered application token, sent as `Authorization: Bear
 
 - **Add → search** finds a game on BGG and adds it with its details.
 - **Settings → Sync from BGG** pulls your collection (status, plays, your BGG rating, images, player counts), then fetches weight and best player counts in batches of 20. Requests are spaced 5 s apart. A sync never changes your rubric scores, notes or flags, or a name you've edited.
-- BGG's API is read-only, so ratings can't be pushed back. When your score differs from your BGG rating, the game is tagged **BGG** and shows the number to enter. Sync again afterwards to clear the tag.
+- BGG's API is read-only, so ratings can't be pushed back. When your score differs from your BGG rating, the game is tagged **BGG** and its page shows the number to enter. **Copy & open BGG** copies the score and opens the game on BGG. **I've rated it** records that rating locally so the tag clears without a sync, and the next sync replaces it with whatever BGG actually has. From the **Update BGG** filter, **I've rated it** moves on to the next game that needs rating.
 
 ## Data and backups
 

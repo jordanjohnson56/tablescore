@@ -65,6 +65,20 @@ export function createApp({ store, bgg, bggUsername }) {
     res.json(store.updateGame(Number(req.params.id), req.body));
   });
 
+  // BGG's API is read-only, so the user rates on BGG by hand and reports it here.
+  // This only echoes what BGG should now hold; the next sync overwrites it.
+  app.post("/api/games/:id/bgg-rated", (req, res) => {
+    const id = Number(req.params.id);
+    const { rating } = req.body;
+    if (!(typeof rating === "number" && rating >= 1 && rating <= 10)) {
+      throw new HttpError(400, "rating must be a number from 1 to 10");
+    }
+    const g = store.getGame(id);
+    if (!g) throw new HttpError(404, "game not found");
+    if (!g.bggId) throw new HttpError(400, "that game isn't linked to BGG");
+    res.json(store.applyBgg(id, { bggRating: rating }));
+  });
+
   app.delete("/api/games/:id", (req, res) => {
     store.deleteGame(Number(req.params.id));
     res.status(204).end();

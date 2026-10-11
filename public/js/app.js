@@ -63,6 +63,14 @@ function bggDrift(g) {
   return f;
 }
 
+/** The game after g in the current list order that still needs a BGG rating. */
+function nextDrift(g) {
+  const list = filtered();
+  const i = list.findIndex((x) => x.id === g.id);
+  const order = [...list.slice(i + 1), ...list.slice(0, Math.max(i, 0))];
+  return order.find((x) => x.id !== g.id && bggDrift(x) != null) || null;
+}
+
 // ---------- save queue: debounced PATCH per game ----------
 
 const pending = new Map();
@@ -311,9 +319,45 @@ function renderScorer(id) {
     view.querySelector("#raw").textContent = raw == null ? "—" : raw.toFixed(2);
     const d = bggDrift(g);
     view.querySelector("#drift").innerHTML = d != null
-      ? `<p class="notice">Rate it <b>${fmt(d)}</b> on BGG${g.bggRating != null ? ` (it has ${fmt(g.bggRating)})` : ""}. Sync from BGG afterwards to clear this.</p>`
+      ? `<div class="notice drift">
+          <p>Rate it <b>${fmt(d)}</b> on BGG${g.bggRating != null ? ` (it has ${fmt(g.bggRating)})` : ""}.</p>
+          <div class="btn-row">
+            <a class="btn primary" data-act="open" href="https://boardgamegeek.com/boardgame/${g.bggId}" target="_blank" rel="noopener">Copy ${fmt(d)} &amp; open BGG</a>
+            <button class="btn" type="button" data-act="done">I've rated it</button>
+          </div>
+        </div>`
       : "";
   };
+
+  // The notice repaints on every score change, so its buttons are handled here.
+  view.querySelector("#drift").addEventListener("click", async (e) => {
+    const act = e.target.closest("[data-act]")?.dataset.act;
+    const d = bggDrift(g);
+    if (!act || d == null) return;
+    const rating = Number(fmt(d));
+    if (act === "open") {
+      copyText(String(rating)).then(() => toast(`Copied ${rating}`));
+      return; // the link itself opens BGG
+    }
+    try {
+      const next = prefs.filter === "update" ? nextDrift(g) : null;
+      const saved = await api.post(`/api/games/${g.id}/bgg-rated`, { rating });
+      g.bggRating = saved.bggRating;
+      if (prefs.filter !== "update") {
+        paintHead();
+        toast("Marked as rated on BGG");
+      } else if (next) {
+        const left = visibleGames().filter((x) => bggDrift(x) != null).length;
+        location.hash = `#/g/${next.id}`;
+        toast(`${left} left to rate on BGG`);
+      } else {
+        location.hash = "#/";
+        toast("All BGG ratings are up to date");
+      }
+    } catch (err) {
+      toast(`Couldn't save: ${err.message}`, 5000);
+    }
+  });
 
   const paintCrit = (card) => {
     const c = CRITERIA.find((x) => x.key === card.dataset.k);
@@ -629,17 +673,19 @@ async function copyForClaude() {
     lines.push("", "Not yet rescored (old BGG rating):");
     for (const g of rest) lines.push(`- ${g.name}: ${fmt(g.bggRating)}${g.status ? ` (${g.status})` : ""}`);
   }
-  const text = lines.join("\n");
+  await copyText(lines.join("\n"));
+  toast(`Copied ${scored.length} scored and ${rest.length} other games`);
+}
+
+async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
-    toast(`Copied ${scored.length} scored and ${rest.length} other games`);
   } catch {
     const ta = Object.assign(document.createElement("textarea"), { value: text });
     document.body.append(ta);
     ta.select();
     document.execCommand("copy");
     ta.remove();
-    toast("Copied");
   }
 }
 
