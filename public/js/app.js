@@ -4,7 +4,7 @@ import {
 } from "./rubric.js";
 import {
   STAGES, STAGE_LABELS, PLATFORMS, claudeExport, isWatching, isHiddenType as hiddenType, summaryStats,
-  visibleGames as shownGames,
+  visibleGames as shownGames, sortWatchlist, awaitingHint, monthLabel,
 } from "./watchlist.js";
 import { api } from "./api.js";
 
@@ -115,13 +115,14 @@ window.addEventListener("pagehide", () => {
 
 function route() {
   const hash = location.hash || "#/";
-  const tab = hash.startsWith("#/add") ? "add" : hash.startsWith("#/summary") ? "summary" : hash.startsWith("#/settings") ? "settings" : "games";
+  const tab = hash.startsWith("#/watchlist") ? "watchlist" : hash.startsWith("#/add") ? "add" : hash.startsWith("#/summary") ? "summary" : hash.startsWith("#/settings") ? "settings" : "games";
   document.querySelectorAll(".tabs a").forEach((a) => {
     if (a.dataset.tab === tab) a.setAttribute("aria-current", "page");
     else a.removeAttribute("aria-current");
   });
   const m = hash.match(/^#\/g\/(\d+)/);
   if (m) return renderScorer(Number(m[1]));
+  if (tab === "watchlist") return renderWatchlist();
   if (tab === "add") return renderAdd();
   if (tab === "summary") return renderSummary();
   if (tab === "settings") return renderSettings();
@@ -259,7 +260,9 @@ function renderScorer(id) {
   const watching = isWatching(g);
   view.innerHTML = `
     <header class="score-head">
-      <a class="back" href="#/" aria-label="Back to games">‹</a>
+      ${watching
+        ? `<a class="back" href="#/watchlist" aria-label="Back to the Watchlist">‹</a>`
+        : `<a class="back" href="#/" aria-label="Back to games">‹</a>`}
       <div class="title">
         <div class="name ${g.avoidTheme ? "avoid-name" : ""}">${esc(g.name)}</div>
         <div class="save-state">${esc(rescoreStatus(g.scores))}</div>
@@ -495,6 +498,87 @@ function bindWatch(g) {
       if (key === "campaignUrl") renderScorer(g.id);
     });
   });
+}
+
+// ---------- watchlist ----------
+
+let decidedOpen = false;
+const todayIso = () => new Date().toLocaleDateString("en-CA"); // local YYYY-MM-DD
+
+function priceLabel(g) {
+  if (g.targetPrice == null) return "";
+  const currency = g.targetCurrency || "USD";
+  try {
+    return new Intl.NumberFormat(undefined, { style: "currency", currency }).format(g.targetPrice);
+  } catch {
+    return `${g.targetPrice} ${currency}`;
+  }
+}
+
+function renderWatchlist() {
+  const list = sortWatchlist(state.games);
+  const active = list.filter((g) => !STAGES.find((s) => s.key === g.watchStage).decided);
+  const decided = list.filter((g) => !active.includes(g));
+  const today = todayIso();
+  view.innerHTML = `
+    <h1>Watchlist</h1>
+    ${list.length ? "" : `<p class="empty">No watched games. Open a game and choose Start watching.</p>`}
+    <ul class="list" id="watch-active">${active.map((g) => watchRowHtml(g, today)).join("")}</ul>
+    ${decided.length ? `<details class="decided" ${decidedOpen ? "open" : ""}><summary>Decided (${decided.length})</summary>
+      <ul class="list">${decided.map((g) => watchRowHtml(g, today)).join("")}</ul></details>` : ""}`;
+  view.querySelector(".decided")?.addEventListener("toggle", (e) => (decidedOpen = e.target.open));
+
+  // Same saves as the game page: a stage change re-sorts the list, a price doesn't.
+  const setStage = (g, stage) => {
+    g.watchStage = stage;
+    queueSave(g.id, { watchStage: stage });
+    renderWatchlist();
+  };
+  view.querySelectorAll(".watch-row").forEach((row) => {
+    const g = byId(Number(row.dataset.id));
+    row.querySelector("[data-w=stage]").addEventListener("change", (e) => setStage(g, e.target.value));
+    row.querySelector("[data-act=awaiting]")?.addEventListener("click", () => setStage(g, "awaiting"));
+    row.querySelector("[data-w=price]").addEventListener("change", (e) => {
+      const v = e.target.value.trim() === "" ? null : Number(e.target.value);
+      const patch = { targetPrice: v };
+      // A price without a currency is in USD.
+      if (v != null && !g.targetCurrency) patch.targetCurrency = "USD";
+      Object.assign(g, patch);
+      queueSave(g.id, patch);
+      row.querySelector(".details").textContent = watchDetails(g);
+    });
+  });
+}
+
+/** "· Oct 2027 · $45.00": the row details after the stage. */
+function watchDetails(g) {
+  const parts = [monthLabel(g.deliveryEst), priceLabel(g)].filter(Boolean);
+  return parts.length ? `· ${parts.join(" · ")}` : "";
+}
+
+function watchRowHtml(g, today) {
+  const thumb = g.thumbnail
+    ? `<img class="thumb" src="${esc(g.thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer">`
+    : `<div class="thumb" aria-hidden="true"></div>`;
+  const meta = `<span class="status">${esc(STAGE_LABELS[g.watchStage])}</span><span class="details">${esc(watchDetails(g))}</span>`;
+  const badge = g.predictedScore != null
+    ? `<div class="num">${fmt(g.predictedScore)}</div><div class="lbl">predicted</div>`
+    : `<div class="num old">—</div><div class="lbl">predicted</div>`;
+  return `<li class="watch-row" data-id="${g.id}">
+    <a class="game-row" href="#/g/${g.id}">
+      ${thumb}
+      <div class="info"><div class="name">${esc(g.name)}</div><div class="meta">${meta}</div></div>
+      <div class="score-badge predicted">${badge}</div>
+    </a>
+    <div class="watch-edit">
+      <select data-w="stage" aria-label="Watch stage for ${esc(g.name)}">${STAGES.map((s) =>
+        `<option value="${s.key}" ${g.watchStage === s.key ? "selected" : ""}>${esc(s.label)}</option>`).join("")}</select>
+      <label class="price"><input type="number" data-w="price" min="0" step="0.01" inputmode="decimal" placeholder="Target"
+        aria-label="Target price for ${esc(g.name)}" value="${g.targetPrice ?? ""}"><span>${esc(g.targetCurrency || "USD")}</span></label>
+    </div>
+    ${awaitingHint(g, today) ? `<div class="notice"><span>Campaign ended ${esc(g.campaignEnd)}.</span>
+      <button class="btn" type="button" data-act="awaiting">Move to Awaiting delivery?</button></div>` : ""}
+  </li>`;
 }
 
 // ---------- add ----------

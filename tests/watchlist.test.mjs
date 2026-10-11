@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CRITERIA, DEFAULT_SETTINGS } from "../public/js/rubric.js";
-import { claudeExport, summaryStats, visibleGames } from "../public/js/watchlist.js";
+import { awaitingHint, claudeExport, monthLabel, sortWatchlist, summaryStats, visibleGames } from "../public/js/watchlist.js";
 
 const base = { type: "Base Game", scores: {}, plays: 0, status: "", avoidTheme: false, bggRating: null };
 const game = (name, extra = {}) => ({ ...base, name, ...extra });
@@ -80,6 +80,57 @@ test("Claude export has no unscored section when no unscored game has a BGG rati
   const out = claudeExport([COLLECTION[1], COLLECTION[4]], DEFAULT_SETTINGS);
   assert.equal(out.text, [...HEADER, "- Brass: Birmingham: 9.1 | 9/4/9/10/9/9/8 | 12 plays | Owned"].join("\n"));
   assert.equal(out.rest, 0);
+});
+
+// ---------- Watchlist order ----------
+
+const watched = (name, watchStage, deliveryEst = null) => game(name, { watchStage, deliveryEst });
+const order = (games) => sortWatchlist(games).map((g) => g.name);
+
+test("the Watchlist lists watched games by stage, with Decided stages after the active ones", () => {
+  const games = [
+    watched("Passed", "pass"),
+    watched("Reviewed", "reviews"),
+    watched("Bought", "buy"),
+    game("Brass"),
+    watched("Delivered", "delivered"),
+    watched("Live", "campaign"),
+    watched("Shipping", "awaiting"),
+  ];
+  assert.deepEqual(order(games), ["Live", "Shipping", "Delivered", "Reviewed", "Bought", "Passed"]);
+});
+
+test("within a stage, the Watchlist goes by estimated delivery month, games without one last, then by name", () => {
+  const games = [
+    watched("Zebra", "awaiting"),
+    watched("Later", "awaiting", "2028-01"),
+    watched("Apple", "awaiting"),
+    watched("Bravo", "awaiting", "2027-10"),
+    watched("Alpha", "awaiting", "2027-10"),
+    watched("Soon", "awaiting", "2027-03"),
+    watched("Live", "campaign"),
+  ];
+  assert.deepEqual(order(games), ["Live", "Soon", "Alpha", "Bravo", "Later", "Apple", "Zebra"]);
+});
+
+// ---------- "Move to Awaiting delivery?" hint ----------
+
+test("the Awaiting delivery hint shows only for a Campaign live game whose end date has passed", () => {
+  const today = "2026-10-21";
+  const hint = (watchStage, campaignEnd) => awaitingHint(game("Kings Gambit", { watchStage, campaignEnd }), today);
+  assert.equal(hint("campaign", "2026-10-20"), true);
+  assert.equal(hint("campaign", "2026-10-21"), false, "the campaign is still live on its end date");
+  assert.equal(hint("campaign", "2026-10-30"), false);
+  assert.equal(hint("campaign", null), false);
+  assert.equal(hint("awaiting", "2026-10-20"), false);
+  assert.equal(hint("pass", "2026-10-20"), false);
+  assert.equal(hint(null, "2026-10-20"), false);
+});
+
+test("estimated delivery reads as a short month and year", () => {
+  assert.equal(monthLabel("2027-10"), "Oct 2027");
+  assert.equal(monthLabel("2028-01"), "Jan 2028");
+  assert.equal(monthLabel(null), "");
 });
 
 test("Claude export lists watched games in a separate predicted section when includeWatching is on", () => {

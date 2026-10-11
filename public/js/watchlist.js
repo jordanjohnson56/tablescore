@@ -26,6 +26,39 @@ export const PLATFORMS = [
 /** A game is Watching when it has a watch stage. */
 export const isWatching = (game) => Boolean(game.watchStage);
 
+const stageRank = (game) => STAGE_KEYS.indexOf(game.watchStage);
+
+// "YYYY-MM" strings sort as text; a game without one goes last.
+const byDelivery = (a, b) => (a.deliveryEst ? (b.deliveryEst ? a.deliveryEst.localeCompare(b.deliveryEst) : -1) : b.deliveryEst ? 1 : 0);
+
+/**
+ * Watched games only, in Watchlist order: by watch stage (Decided last), then
+ * by estimated delivery month (none last), then by name. Returns a new array.
+ */
+export function sortWatchlist(games) {
+  return games
+    .filter(isWatching)
+    .sort((a, b) => stageRank(a) - stageRank(b) || byDelivery(a, b) || a.name.localeCompare(b.name));
+}
+
+/**
+ * True when a Campaign live game's end date has passed, so the Watchlist offers
+ * "Move to Awaiting delivery?". today is "YYYY-MM-DD"; the end date itself is
+ * still live. Nothing changes a stage automatically.
+ */
+export function awaitingHint(game, today) {
+  return game.watchStage === "campaign" && Boolean(game.campaignEnd) && game.campaignEnd < today;
+}
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** "2027-10" -> "Oct 2027"; empty when there's no month. */
+export function monthLabel(ym) {
+  if (!ym) return "";
+  const [y, m] = ym.split("-");
+  return `${MONTHS[Number(m) - 1]} ${y}`;
+}
+
 /** True for a BGG type that Settings hides (expansions, when hideExpansions is on). */
 export function isHiddenType(type, settings) {
   return Boolean(settings.hideExpansions) && type === "Expansion";
