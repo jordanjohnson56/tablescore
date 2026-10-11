@@ -1,7 +1,7 @@
 // Seed watched games from JSON, in the game shape the watchlist export writes.
 // Usage: npm run import-watchlist -- /path/to/watchlist.json
 // The file holds an array of games, or is a whole watchlist export. Games already
-// in the database (same BGG ID, or same name when there's no BGG ID) are skipped.
+// in the database (same BGG ID, or same name ignoring case) are skipped.
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -29,8 +29,8 @@ export function readWatchlistFile(file) {
 }
 
 /**
- * Create each watched game that isn't already in the store, matched by BGG ID,
- * or by name ignoring case when it has no BGG ID. Matches are skipped, never
+ * Create each watched game that isn't already in the store, matched by BGG ID
+ * or by name ignoring case. Matches are skipped, never
  * overwritten. Every game is checked first, so bad input throws and writes nothing.
  */
 export function importWatchlist(store, games) {
@@ -72,11 +72,11 @@ function check(games) {
   });
 }
 
-// The same game by BGG ID, or by name ignoring case when the import has no BGG ID.
+// The same game: equal BGG IDs, or the same name ignoring case (so a game added
+// by hand without a BGG ID isn't duplicated by an import that carries one).
 function findExisting(store, g) {
-  if (g.bggId) return store.getByBggId(g.bggId);
   const name = g.name.trim().toLowerCase();
-  return store.listGames().find((e) => e.name.trim().toLowerCase() === name);
+  return (g.bggId && store.getByBggId(g.bggId)) || store.listGames().find((e) => e.name.trim().toLowerCase() === name);
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {

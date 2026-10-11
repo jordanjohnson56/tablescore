@@ -664,7 +664,7 @@ test("importing watched games creates each one with every watch field and its no
   }
 });
 
-test("importing skips games already present, by BGG ID or by name ignoring case, and never overwrites them", async () => {
+test("importing skips games already present, by equal BGG ID or by name ignoring case, and never overwrites them", async () => {
   const t = await startApp();
   try {
     t.store.createGame({ name: "Catan", bggId: 13, status: "Owned", notes: "classic" });
@@ -687,6 +687,19 @@ test("importing skips games already present, by BGG ID or by name ignoring case,
     assert.deepEqual([catan.name, catan.watchStage, catan.notes], ["Catan", null, "classic"]);
     const book = games.find((g) => g.name === "Bookwyrm");
     assert.deepEqual([book.watchStage, book.targetPrice], ["awaiting", 40]);
+  } finally {
+    t.close();
+  }
+});
+
+test("importing matches a hand-added game without a BGG ID by name, even when the import has a BGG ID", async () => {
+  const t = await startApp();
+  try {
+    t.store.createGame({ name: "Bookwyrm", watchStage: "awaiting", targetPrice: 40 });
+    const result = importWatchlist(t.store, [{ name: "bookwyrm", bggId: 777, watchStage: "buy" }]);
+    assert.deepEqual(result, { added: [], skipped: ["bookwyrm"] });
+    const [book] = t.store.listGames();
+    assert.deepEqual([book.name, book.bggId, book.watchStage, book.targetPrice], ["Bookwyrm", null, "awaiting", 40]);
   } finally {
     t.close();
   }
