@@ -159,12 +159,13 @@ export class Store {
     return row ? toGame(row) : null;
   }
 
-  /** Insert a game. Accepts user fields, BGG fields, oldRating and scores. */
+  /** Insert a game. Accepts user fields, BGG fields, oldRating, scores and watch fields. */
   createGame(game) {
     const cols = {};
     for (const [k, col] of Object.entries({ ...USER_FIELDS, ...BGG_FIELDS, oldRating: "old_rating" })) {
       if (game[k] !== undefined) cols[col] = toSql(game[k]);
     }
+    for (const [k, v] of Object.entries(checkWatchFields(game))) cols[WATCH_FIELDS[k][0]] = v;
     for (const c of CRITERIA) {
       if (game.scores?.[c.key] !== undefined) cols[`s_${c.key}`] = game.scores[c.key];
     }

@@ -503,6 +503,7 @@ function renderAdd() {
   const bggOn = state.bgg.configured;
   view.innerHTML = `
     <h1>Add a game</h1>
+    <label class="toggle"><input type="checkbox" id="mwatch"> Watch instead of score</label>
     ${bggOn
       ? `<input type="search" id="bq" placeholder="Search BoardGameGeek" aria-label="Search BoardGameGeek" autofocus>
          <ul class="list" id="results"><li class="empty">Type at least 2 letters.</li></ul>`
@@ -514,12 +515,15 @@ function renderAdd() {
       <button class="btn primary" type="submit">Add game</button>
     </form>`;
 
+  // A watched game starts at the first stage, Campaign live.
+  const watch = () => (view.querySelector("#mwatch").checked ? { watchStage: STAGES[0].key } : {});
+
   view.querySelector("#manual").addEventListener("submit", async (e) => {
     e.preventDefault();
     const name = view.querySelector("#mname").value.trim();
     if (!name) return;
     try {
-      const g = await api.post("/api/games", { name, type: view.querySelector("#mtype").value });
+      const g = await api.post("/api/games", { name, type: view.querySelector("#mtype").value, ...watch() });
       state.games.push(g);
       location.hash = `#/g/${g.id}`;
     } catch (err) {
@@ -565,7 +569,7 @@ function renderAdd() {
     b.disabled = true;
     b.textContent = "Adding…";
     try {
-      const g = await api.post("/api/games/from-bgg", { bggId: Number(b.dataset.add) });
+      const g = await api.post("/api/games/from-bgg", { bggId: Number(b.dataset.add), ...watch() });
       if (!byId(g.id)) state.games.push(g);
       location.hash = `#/g/${g.id}`;
     } catch (err) {
