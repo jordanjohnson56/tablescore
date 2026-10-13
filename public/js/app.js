@@ -276,7 +276,7 @@ function renderScorer(id) {
     <div id="drift"></div>
     ${watching ? watchHtml(g) + linkHtml : ""}
     ${watching ? `<details class="score-it"><summary>Score it</summary>` : ""}
-    ${CRITERIA.map((c) => `
+    <div class="crit-grid">${CRITERIA.map((c) => `
       <section class="card crit" data-k="${c.key}">
         <div class="crit-top">
           <span class="cname">${esc(c.name)}</span>
@@ -293,7 +293,7 @@ function renderScorer(id) {
           <p>${esc(c.purpose)}</p>
           <ol>${c.bands.map((b, i) => `<li data-i="${i}"><b>${BAND_LABELS[i]}</b> ${esc(b)}</li>`).join("")}</ol>
         </details>
-      </section>`).join("")}
+      </section>`).join("")}</div>
     ${watching ? "</details>" : watchHtml(g)}
     <section class="card">
       <h2 style="margin-top:0">Details</h2>
