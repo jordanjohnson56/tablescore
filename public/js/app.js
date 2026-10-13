@@ -258,6 +258,10 @@ function renderScorer(id) {
   }
   const w = state.settings.weights;
   const watching = isWatching(g);
+  // A game with no BGG ID has no photo or BGG details; a watched one gets this up top, past the long scorer.
+  const linkHtml = !g.bggId && state.bgg.configured
+    ? `<div id="link" class="card"><div class="btn-row"><button class="btn" id="link-open" type="button">Link to BGG for photo &amp; details</button></div></div>`
+    : "";
   view.innerHTML = `
     <header class="score-head">
       ${watching
@@ -270,7 +274,7 @@ function renderScorer(id) {
       <div class="final" id="final"></div>
     </header>
     <div id="drift"></div>
-    ${watching ? watchHtml(g) : ""}
+    ${watching ? watchHtml(g) + linkHtml : ""}
     ${watching ? `<details class="score-it"><summary>Score it</summary>` : ""}
     ${CRITERIA.map((c) => `
       <section class="card crit" data-k="${c.key}">
@@ -318,9 +322,7 @@ function renderScorer(id) {
         <div><dt>Year</dt><dd>${g.year ?? "—"}</dd></div>
       </dl>
       ${g.bggId ? `<p class="small"><a href="https://boardgamegeek.com/boardgame/${g.bggId}" target="_blank" rel="noopener">Open on BGG</a></p>` : ""}
-      ${!g.bggId && state.bgg.configured
-        ? `<div id="link"><div class="btn-row"><button class="btn" id="link-open" type="button">Link to BGG</button></div></div>`
-        : ""}
+      ${watching ? "" : linkHtml}
       <div class="btn-row"><button class="btn danger" id="del" type="button">Delete game</button></div>
     </section>`;
 
