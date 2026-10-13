@@ -22,6 +22,8 @@ export async function syncCollection(store, bgg, username, progress = () => {}) 
     }
   });
 
+  const linked = await linkWatchedByName(store, bgg, progress);
+
   // /thing also carries the images, so watched games outside the collection get theirs here.
   const needDetails = store.listGames().filter((g) => g.bggId && (g.bggWeight == null || !g.bestPlayers || !g.thumbnail));
   let enriched = 0;
@@ -40,7 +42,33 @@ export async function syncCollection(store, bgg, username, progress = () => {}) 
       }
     });
   }
-  return { collection: items.length, added, updated, enriched };
+  return { collection: items.length, added, updated, linked, enriched };
+}
+
+/**
+ * Give each watched game that has no BGG ID one, when BGG has exactly one game
+ * (base or expansion) with the same name ignoring case. Anything less certain is
+ * left unlinked. Returns how many were linked.
+ */
+async function linkWatchedByName(store, bgg, progress) {
+  const unlinked = store.listGames().filter((g) => g.watchStage && !g.bggId);
+  let linked = 0;
+  for (const [i, g] of unlinked.entries()) {
+    progress({ phase: "Matching watched games to BGG", done: i, total: unlinked.length });
+    const name = g.name.trim().toLowerCase();
+    let results;
+    try {
+      results = await bgg.search(g.name.trim());
+    } catch {
+      continue; // one failed search shouldn't sink the whole sync; this game is retried next time
+    }
+    const found = results.filter((r) => r.name.trim().toLowerCase() === name);
+    const matches = [...new Map(found.map((r) => [r.bggId, r])).values()]; // BGG can list one game as both base and expansion
+    if (matches.length !== 1 || store.getByBggId(matches[0].bggId)) continue;
+    store.applyBgg(g.id, { bggId: matches[0].bggId });
+    linked++;
+  }
+  return linked;
 }
 
 /**
@@ -53,4 +81,13 @@ export async function addFromBgg(store, bgg, bggId, watch = {}) {
   const [details] = await bgg.things([bggId]);
   if (!details) return { game: null };
   return { game: store.createGame({ ...details, ...watch }), existed: false };
+}
+
+/**
+ * Point an existing game at BGG's details for it, keeping the game's own name,
+ * type and everything the user entered.
+ */
+export function linkToBgg(store, id, details) {
+  const { name, type, ...rest } = details;
+  return store.applyBgg(id, rest);
 }
