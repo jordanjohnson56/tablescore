@@ -8,6 +8,7 @@ import ExcelJS from "exceljs";
 import { openDb } from "../server/db.js";
 import { BggClient } from "../server/bgg.js";
 import { createApp } from "../server/app.js";
+import { syncCollection } from "../server/sync.js";
 import { readWorkbook, importInto } from "../server/import-xlsx.js";
 import { watchlistExport, writeWatchlist } from "../server/export-watchlist.js";
 import { importWatchlist, readWatchlistFile } from "../server/import-watchlist.js";
@@ -233,7 +234,7 @@ test("sync adds new games, updates existing ones and leaves scores alone", async
       await new Promise((r) => setTimeout(r, 10));
     }
     assert.equal(job.error, null);
-    assert.deepEqual(job.result, { collection: 2, added: 1, updated: 1, enriched: 2 });
+    assert.deepEqual(job.result, { collection: 2, added: 1, updated: 1, linked: 0, enriched: 2 });
     const catan = t.store.getByBggId(13);
     assert.equal(catan.name, "Catan (my name)");
     assert.equal(catan.plays, 9);
@@ -243,6 +244,88 @@ test("sync adds new games, updates existing ones and leaves scores alone", async
     assert.equal(catan.bggWeight, 2.35);
     assert.equal(catan.bestPlayers, "3");
     assert.equal(t.store.getByBggId(999).status, "Wishlist");
+  } finally {
+    t.close();
+  }
+});
+
+test("sync fetches a thumbnail for a watched game outside the collection", async () => {
+  const store = openDb(":memory:");
+  const watched = store.createGame({ name: "Kickstarter Game", bggId: 555, bggWeight: 2.5, bestPlayers: "3", watchStage: "campaign" });
+  const asked = [];
+  const bgg = {
+    collection: async () => [],
+    things: async (ids) => {
+      asked.push(...ids);
+      return [{ bggId: 555, name: "x", type: "Base", bggWeight: 2.5, bestPlayers: "3", thumbnail: "https://img/t.jpg", image: "https://img/i.jpg" }];
+    },
+  };
+  await syncCollection(store, bgg, "me");
+  assert.deepEqual(asked, [555]);
+  assert.equal(store.getGame(watched.id).thumbnail, "https://img/t.jpg");
+  assert.equal(store.getGame(watched.id).name, "Kickstarter Game");
+});
+
+test("sync links a watched game with no BGG ID by exact name, then fetches its thumbnail", async () => {
+  const store = openDb(":memory:");
+  const ok = store.createGame({ name: "Brass: Pittsburgh", watchStage: "campaign" });
+  const twice = store.createGame({ name: "Excursions", watchStage: "campaign" });
+  const none = store.createGame({ name: "Nothing Matches", watchStage: "campaign" });
+  const unwatched = store.createGame({ name: "Brass: Pittsburgh Copy" });
+  const broken = store.createGame({ name: "Search Fails", watchStage: "campaign" });
+  const results = {
+    "Brass: Pittsburgh": [
+      { bggId: 1, name: "Brass: Pittsburgh", type: "Base" },
+      { bggId: 1, name: "Brass: Pittsburgh", type: "Expansion" }, // BGG lists some games under both types
+      { bggId: 2, name: "Brass: Pittsburgh Expansion", type: "Expansion" },
+    ],
+    Excursions: [
+      { bggId: 3, name: "Excursions", type: "Base" },
+      { bggId: 4, name: "excursions", type: "Base" },
+    ],
+    "Nothing Matches": [{ bggId: 5, name: "Something Else", type: "Base" }],
+  };
+  const searched = [];
+  const bgg = {
+    collection: async () => [],
+    search: async (q) => {
+      searched.push(q);
+      if (q === "Search Fails") throw new Error("BGG timed out");
+      return results[q] || [];
+    },
+    things: async (ids) => ids.map((bggId) => ({ bggId, name: "x", type: "Base", bggWeight: 3, bestPlayers: "2", thumbnail: `https://img/${bggId}.jpg` })),
+  };
+  const out = await syncCollection(store, bgg, "me");
+  assert.equal(out.linked, 1);
+  assert.deepEqual(searched.sort(), ["Excursions", "Nothing Matches", "Brass: Pittsburgh", "Search Fails"].sort());
+  assert.equal(store.getGame(ok.id).bggId, 1);
+  assert.equal(store.getGame(ok.id).thumbnail, "https://img/1.jpg");
+  assert.equal(store.getGame(ok.id).name, "Brass: Pittsburgh");
+  assert.equal(store.getGame(twice.id).bggId, null);
+  assert.equal(store.getGame(none.id).bggId, null);
+  assert.equal(store.getGame(broken.id).bggId, null);
+  assert.equal(store.getGame(unwatched.id).bggId, null);
+});
+
+test("linking a game to a BGG id fills in its details and keeps its name", async () => {
+  const t = await startApp();
+  try {
+    const g = t.store.createGame({ name: "Excursions", watchStage: "campaign", notes: "keep" });
+    const r = await t.call("POST", `/api/games/${g.id}/link-bgg`, { bggId: 266192 });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.name, "Excursions");
+    assert.equal(r.body.notes, "keep");
+    assert.equal(r.body.watchStage, "campaign");
+    assert.equal(r.body.bggId, 266192);
+    assert.equal(r.body.bggWeight, 2.35);
+    assert.ok(r.body.thumbnail);
+
+    assert.equal((await t.call("POST", `/api/games/${g.id}/link-bgg`, { bggId: 1 })).status, 400); // already linked
+    const other = t.store.createGame({ name: "Other" });
+    assert.equal((await t.call("POST", `/api/games/${other.id}/link-bgg`, { bggId: 266192 })).status, 409);
+    assert.equal((await t.call("POST", `/api/games/${other.id}/link-bgg`, { bggId: "x" })).status, 400);
+    assert.equal((await t.call("POST", "/api/games/9999/link-bgg", { bggId: 5 })).status, 404);
+    assert.equal(t.store.getGame(other.id).bggId, null);
   } finally {
     t.close();
   }

@@ -258,6 +258,10 @@ function renderScorer(id) {
   }
   const w = state.settings.weights;
   const watching = isWatching(g);
+  // A game with no BGG ID has no photo or BGG details; a watched one gets this up top, past the long scorer.
+  const linkHtml = !g.bggId && state.bgg.configured
+    ? `<div id="link" class="card"><div class="btn-row"><button class="btn" id="link-open" type="button">Link to BGG for photo &amp; details</button></div></div>`
+    : "";
   view.innerHTML = `
     <header class="score-head">
       ${watching
@@ -270,9 +274,9 @@ function renderScorer(id) {
       <div class="final" id="final"></div>
     </header>
     <div id="drift"></div>
-    ${watching ? watchHtml(g) : ""}
+    ${watching ? watchHtml(g) + linkHtml : ""}
     ${watching ? `<details class="score-it"><summary>Score it</summary>` : ""}
-    ${CRITERIA.map((c) => `
+    <div class="crit-grid">${CRITERIA.map((c) => `
       <section class="card crit" data-k="${c.key}">
         <div class="crit-top">
           <span class="cname">${esc(c.name)}</span>
@@ -289,7 +293,7 @@ function renderScorer(id) {
           <p>${esc(c.purpose)}</p>
           <ol>${c.bands.map((b, i) => `<li data-i="${i}"><b>${BAND_LABELS[i]}</b> ${esc(b)}</li>`).join("")}</ol>
         </details>
-      </section>`).join("")}
+      </section>`).join("")}</div>
     ${watching ? "</details>" : watchHtml(g)}
     <section class="card">
       <h2 style="margin-top:0">Details</h2>
@@ -318,6 +322,7 @@ function renderScorer(id) {
         <div><dt>Year</dt><dd>${g.year ?? "—"}</dd></div>
       </dl>
       ${g.bggId ? `<p class="small"><a href="https://boardgamegeek.com/boardgame/${g.bggId}" target="_blank" rel="noopener">Open on BGG</a></p>` : ""}
+      ${watching ? "" : linkHtml}
       <div class="btn-row"><button class="btn danger" id="del" type="button">Delete game</button></div>
     </section>`;
 
@@ -422,6 +427,39 @@ function renderScorer(id) {
   view.querySelector("#calib").addEventListener("change", (e) => queueSave(g.id, { calibration: (g.calibration = e.target.checked) }));
   view.querySelector("#notes").addEventListener("input", (e) => queueSave(g.id, { notes: (g.notes = e.target.value) }));
   bindWatch(g);
+  view.querySelector("#link-open")?.addEventListener("click", async () => {
+    const box = view.querySelector("#link");
+    box.innerHTML = `<p class="small">Pick the BGG entry for this game. That fetches its photo and details.</p>
+      <ul class="list" id="link-results"><li class="empty">Searching…</li></ul>`;
+    const results = box.querySelector("#link-results");
+    try {
+      const rows = (await api.get(`/api/bgg/search?q=${encodeURIComponent(g.name)}`))
+        .filter((r, i, all) => all.findIndex((x) => x.bggId === r.bggId) === i);
+      results.innerHTML = rows.length
+        ? rows.map((r) => `<li><div class="game-row">
+            <div class="info"><div class="name">${esc(r.name)}</div><div class="meta">${r.year ?? ""}</div></div>
+            ${r.inList ? `<span class="tag">In list</span>` : `<button class="btn primary" data-link="${r.bggId}">Link</button>`}
+          </div></li>`).join("")
+        : `<li class="empty">No matches on BGG.</li>`;
+    } catch (err) {
+      results.innerHTML = `<li class="empty">${esc(err.message)}</li>`;
+    }
+    results.addEventListener("click", async (e) => {
+      const b = e.target.closest("[data-link]");
+      if (!b) return;
+      b.disabled = true;
+      b.textContent = "Linking…";
+      try {
+        Object.assign(g, await api.post(`/api/games/${g.id}/link-bgg`, { bggId: Number(b.dataset.link) }));
+        renderScorer(g.id);
+      } catch (err) {
+        b.disabled = false;
+        b.textContent = "Link";
+        toast(err.message, 5000);
+      }
+    });
+  });
+
   view.querySelector("#del").addEventListener("click", async () => {
     if (!confirm(`Delete ${g.name} and its scores? This can't be undone.`)) return;
     try {
@@ -795,7 +833,7 @@ function renderSettings() {
     syncBtn.disabled = job.running || !state.bgg.username;
     if (job.running) el.textContent = `${job.phase}${job.total ? ` (${job.done}/${job.total})` : ""}…`;
     else if (job.error) el.innerHTML = `<span class="tag warn">Sync failed</span> ${esc(job.error)}`;
-    else if (job.result) el.textContent = `Last sync: ${job.result.collection} items, ${job.result.added} new, ${job.result.updated} updated, ${job.result.enriched} detailed.`;
+    else if (job.result) el.textContent = `Last sync: ${job.result.collection} items, ${job.result.added} new, ${job.result.updated} updated, ${job.result.linked} linked, ${job.result.enriched} detailed.`;
     else el.textContent = "";
   };
   const poll = async () => {

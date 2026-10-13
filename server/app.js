@@ -2,7 +2,7 @@ import express from "express";
 import { fileURLToPath } from "node:url";
 import { HttpError } from "./db.js";
 import { BggError } from "./bgg.js";
-import { syncCollection, addFromBgg } from "./sync.js";
+import { syncCollection, addFromBgg, linkToBgg } from "./sync.js";
 import { watchlistExport } from "./export-watchlist.js";
 import { CRITERIA } from "../public/js/rubric.js";
 
@@ -64,6 +64,25 @@ export function createApp({ store, bgg, bggUsername }) {
     const { game, existed } = await addFromBgg(store, bgg, bggId, { watchStage: req.body.watchStage });
     if (!game) throw new HttpError(404, "BGG has no game with that id");
     res.status(existed ? 200 : 201).json(game);
+  });
+
+  // Attach a game that has no BGG ID (a watched game, say) to its BGG entry.
+  app.post("/api/games/:id/link-bgg", async (req, res) => {
+    const id = Number(req.params.id);
+    const bggId = Number(req.body.bggId);
+    if (!Number.isInteger(bggId) || bggId <= 0) throw new HttpError(400, "bggId must be a positive integer");
+    const taken = () => {
+      const owner = store.getByBggId(bggId);
+      if (owner && owner.id !== id) throw new HttpError(409, "that BGG game is already in your list");
+    };
+    const current = store.getGame(id);
+    if (!current) throw new HttpError(404, "game not found");
+    if (current.bggId) throw new HttpError(400, "that game is already linked to BGG");
+    taken();
+    const details = await bgg.things([bggId]);
+    if (!details.length) throw new HttpError(404, "BGG has no game with that id");
+    taken(); // another request may have claimed it while BGG was answering
+    res.json(linkToBgg(store, id, details[0]));
   });
 
   app.patch("/api/games/:id", (req, res) => {
