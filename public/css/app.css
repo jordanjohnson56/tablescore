@@ -57,6 +57,10 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .muted { color: var(--muted); }
 .small { font-size: 0.85rem; }
 
+/* "Powered by BGG" attribution, required by BGG's XML API terms */
+.attribution { max-width: 680px; margin: 0 auto; padding: 8px 16px 24px; text-align: center; }
+.attribution img { display: inline-block; width: 171px; height: auto; }
+
 /* Bottom tab bar */
 .tabs {
   position: fixed; inset: auto 0 0 0;
