@@ -22,7 +22,8 @@ export async function syncCollection(store, bgg, username, progress = () => {}) 
     }
   });
 
-  const needDetails = store.listGames().filter((g) => g.bggId && (g.bggWeight == null || !g.bestPlayers));
+  // /thing also carries the images, so watched games outside the collection get theirs here.
+  const needDetails = store.listGames().filter((g) => g.bggId && (g.bggWeight == null || !g.bestPlayers || !g.thumbnail));
   let enriched = 0;
   for (let i = 0; i < needDetails.length; i += 20) {
     progress({ phase: "Fetching game details", done: i, total: needDetails.length });

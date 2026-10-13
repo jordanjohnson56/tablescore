@@ -8,6 +8,7 @@ import ExcelJS from "exceljs";
 import { openDb } from "../server/db.js";
 import { BggClient } from "../server/bgg.js";
 import { createApp } from "../server/app.js";
+import { syncCollection } from "../server/sync.js";
 import { readWorkbook, importInto } from "../server/import-xlsx.js";
 import { watchlistExport, writeWatchlist } from "../server/export-watchlist.js";
 import { importWatchlist, readWatchlistFile } from "../server/import-watchlist.js";
@@ -246,6 +247,23 @@ test("sync adds new games, updates existing ones and leaves scores alone", async
   } finally {
     t.close();
   }
+});
+
+test("sync fetches a thumbnail for a watched game outside the collection", async () => {
+  const store = openDb(":memory:");
+  const watched = store.createGame({ name: "Kickstarter Game", bggId: 555, bggWeight: 2.5, bestPlayers: "3", watchStage: "campaign" });
+  const asked = [];
+  const bgg = {
+    collection: async () => [],
+    things: async (ids) => {
+      asked.push(...ids);
+      return [{ bggId: 555, name: "x", type: "Base", bggWeight: 2.5, bestPlayers: "3", thumbnail: "https://img/t.jpg", image: "https://img/i.jpg" }];
+    },
+  };
+  await syncCollection(store, bgg, "me");
+  assert.deepEqual(asked, [555]);
+  assert.equal(store.getGame(watched.id).thumbnail, "https://img/t.jpg");
+  assert.equal(store.getGame(watched.id).name, "Kickstarter Game");
 });
 
 test("add from BGG fills in details and is idempotent", async () => {
