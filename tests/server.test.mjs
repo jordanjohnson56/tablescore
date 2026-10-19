@@ -168,6 +168,9 @@ test("score a game through the API and read it back", async () => {
     assert.equal(r.body.scores.desire, 9);
     assert.equal(r.body.scores.theme, null);
     assert.equal(r.body.avoidTheme, true);
+    assert.equal(r.body.wontScore, false);
+    const marked = await t.call("PATCH", `/api/games/${g.id}`, { wontScore: true });
+    assert.equal(marked.body.wontScore, true);
     const { body: state } = await t.call("GET", "/api/state");
     assert.equal(state.games.length, 1);
     assert.equal(state.settings.stretch, 1.25);
@@ -497,6 +500,7 @@ test("an old database opens with its games intact and the watch fields present a
       assert.equal(g.plays, 9);
       assert.deepEqual(g.scores, { desire: 8, table: 6.5, depth: null, interaction: null, replay: null, art: null, theme: 5 });
       assert.deepEqual(pick(g, WATCH_NULLS), WATCH_NULLS);
+      assert.equal(g.wontScore, false);
     } finally {
       t.close();
     }

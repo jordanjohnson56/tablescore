@@ -14,6 +14,7 @@ const USER_FIELDS = {
   status: "status",
   plays: "plays",
   avoidTheme: "avoid_theme",
+  wontScore: "wont_score",
   calibration: "calibration",
   notes: "notes",
   bestPlayers: "best_players",
@@ -99,6 +100,7 @@ export function openDb(file) {
       bgg_avg REAL,
       calibration INTEGER NOT NULL DEFAULT 0,
       avoid_theme INTEGER NOT NULL DEFAULT 0,
+      wont_score INTEGER NOT NULL DEFAULT 0,
       notes TEXT NOT NULL DEFAULT '',
       year INTEGER,
       min_players INTEGER,
@@ -117,12 +119,13 @@ export function openDb(file) {
   return new Store(db);
 }
 
-/** Add any missing watch columns. Safe to repeat; existing rows get nulls. */
+/** Add any missing columns. Safe to repeat; existing rows get nulls (watch fields) or 0 (wont_score). */
 function migrate(db) {
   const have = new Set(db.prepare("PRAGMA table_info(games)").all().map((c) => c.name));
   for (const [col, type] of Object.values(WATCH_FIELDS)) {
     if (!have.has(col)) db.exec(`ALTER TABLE games ADD COLUMN ${col} ${type}`);
   }
+  if (!have.has("wont_score")) db.exec("ALTER TABLE games ADD COLUMN wont_score INTEGER NOT NULL DEFAULT 0");
 }
 
 export class Store {
@@ -284,6 +287,7 @@ function toGame(r) {
     bggAvg: r.bgg_avg,
     calibration: !!r.calibration,
     avoidTheme: !!r.avoid_theme,
+    wontScore: !!r.wont_score,
     notes: r.notes,
     year: r.year,
     minPlayers: r.min_players,
