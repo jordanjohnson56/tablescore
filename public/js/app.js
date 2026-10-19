@@ -146,7 +146,8 @@ function filtered() {
   const q = prefs.q.trim().toLowerCase();
   const tests = {
     all: () => true,
-    todo: (g) => final(g) == null,
+    // Nothing to score until the game has been played at least once.
+    todo: (g) => final(g) == null && g.plays > 0,
     scored: (g) => final(g) != null,
     owned: (g) => g.status === "Owned",
     wishlist: (g) => g.status === "Wishlist" || g.status === "Want" || g.status === "Want to play",
