@@ -146,8 +146,8 @@ function filtered() {
   const q = prefs.q.trim().toLowerCase();
   const tests = {
     all: () => true,
-    // Nothing to score until the game has been played at least once.
-    todo: (g) => final(g) == null && g.plays > 0,
+    // Nothing to score until the game has been played at least once, and never if marked Won't score.
+    todo: (g) => final(g) == null && g.plays > 0 && !g.wontScore,
     scored: (g) => final(g) != null,
     owned: (g) => g.status === "Owned",
     wishlist: (g) => g.status === "Wishlist" || g.status === "Want" || g.status === "Want to play",
@@ -310,6 +310,7 @@ function renderScorer(id) {
           .map((s) => `<option value="${esc(s)}" ${g.status === s ? "selected" : ""}>${s || "Not in collection"}</option>`).join("")}</select>
       </label>
       <label class="toggle"><input type="checkbox" id="avoid" ${g.avoidTheme ? "checked" : ""}> Avoid theme (demons, spirits, horror)</label>
+      <label class="toggle"><input type="checkbox" id="wont" ${g.wontScore ? "checked" : ""}> Won't score</label>
       <label class="toggle"><input type="checkbox" id="calib" ${g.calibration ? "checked" : ""}> Calibration game</label>
       <label class="field"><span>Notes</span><textarea id="notes">${esc(g.notes)}</textarea></label>
       <dl class="facts">
@@ -425,6 +426,7 @@ function renderScorer(id) {
     view.querySelector(".score-head .name").classList.toggle("avoid-name", g.avoidTheme);
     queueSave(g.id, { avoidTheme: g.avoidTheme });
   });
+  view.querySelector("#wont").addEventListener("change", (e) => queueSave(g.id, { wontScore: (g.wontScore = e.target.checked) }));
   view.querySelector("#calib").addEventListener("change", (e) => queueSave(g.id, { calibration: (g.calibration = e.target.checked) }));
   view.querySelector("#notes").addEventListener("input", (e) => queueSave(g.id, { notes: (g.notes = e.target.value) }));
   bindWatch(g);
