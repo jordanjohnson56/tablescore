@@ -9,7 +9,7 @@ import {
 import { api } from "./api.js";
 
 const view = document.getElementById("view");
-let state = { settings: null, games: [], bgg: { configured: false } };
+let state = { settings: null, games: [], bgg: { configured: false }, claude: { configured: false } };
 const prefs = loadPrefs();
 
 // ---------- helpers ----------
@@ -123,6 +123,8 @@ function route() {
   });
   const m = hash.match(/^#\/g\/(\d+)/);
   if (m) return renderScorer(Number(m[1]));
+  const p = hash.match(/^#\/predict\/(bgg|game)\/(\d+)(?:\?name=(.*))?/);
+  if (p) return renderPrediction(p[1], Number(p[2]), p[3] ? decodeURIComponent(p[3]) : "");
   return TABS[tab]();
 }
 window.addEventListener("hashchange", () => {
@@ -275,6 +277,7 @@ function renderScorer(id) {
       <div class="final" id="final"></div>
     </header>
     <div id="drift"></div>
+    <div id="prediction"></div>
     ${watching ? watchHtml(g) + linkHtml : ""}
     ${watching ? `<details class="score-it"><summary>Score it</summary>` : ""}
     <div class="crit-grid">${CRITERIA.map((c) => `
@@ -430,6 +433,7 @@ function renderScorer(id) {
   view.querySelector("#calib").addEventListener("change", (e) => queueSave(g.id, { calibration: (g.calibration = e.target.checked) }));
   view.querySelector("#notes").addEventListener("input", (e) => queueSave(g.id, { notes: (g.notes = e.target.value) }));
   bindWatch(g);
+  paintGamePrediction(g);
   view.querySelector("#link-open")?.addEventListener("click", async () => {
     const box = view.querySelector("#link");
     box.innerHTML = `<p class="small">Pick the BGG entry for this game. That fetches its photo and details.</p>
@@ -668,6 +672,7 @@ function renderAdd() {
           ? shown.map((r) => `<li><div class="game-row">
               <div class="info"><div class="name">${esc(r.name)}${r.type === "Expansion" ? '<span class="tag">Exp</span>' : ""}</div>
               <div class="meta">${r.year ?? ""}</div></div>
+              ${predictLinkHtml(r)}
               ${r.inList
                 ? `<a class="btn" href="#/g/${state.games.find((g) => g.bggId === r.bggId)?.id}">Open</a>`
                 : `<button class="btn primary" data-add="${r.bggId}">Add</button>`}
@@ -775,6 +780,7 @@ function renderSettings() {
            <p id="syncstate" class="small muted"></p>`
         : `<p class="notice">Set BGG_TOKEN and BGG_USERNAME in the server's .env file to turn on search and sync.</p>`}
     </section>
+    ${claudeSettingsHtml()}
     <section class="card">
       <h2 style="margin-top:0">Your data</h2>
       <p class="small muted">Everything lives in one database on your server, with a daily backup copy kept there.</p>
@@ -808,6 +814,7 @@ function renderSettings() {
   });
 
   view.querySelector("#copy").addEventListener("click", copyForClaude);
+  bindClaudeSettings();
   view.querySelector("#hideexp").addEventListener("change", async (e) => {
     try {
       state.settings = await api.put("/api/settings", { hideExpansions: e.target.checked });
@@ -876,6 +883,204 @@ async function copyText(text) {
     ta.select();
     document.execCommand("copy");
     ta.remove();
+  }
+}
+
+// ---------- Claude predictions ----------
+
+/** The Predict button for a BGG search result: not for a game already scored. */
+function predictLinkHtml(r) {
+  if (!state.claude.configured) return "";
+  const g = state.games.find((x) => x.bggId === r.bggId);
+  if (g && final(g) != null) return "";
+  return `<a class="btn" href="${predictHref(g, r.bggId, r.name)}">Predict</a>`;
+}
+
+function predictHref(g, bggId, name) {
+  return g ? `#/predict/game/${g.id}` : `#/predict/bgg/${bggId}?name=${encodeURIComponent(name || "")}`;
+}
+
+/** The prediction page for a game in the list or a BGG game that isn't. */
+let predictPoll;
+async function renderPrediction(kind, id, name) {
+  clearTimeout(predictPoll);
+  const game = kind === "game" ? byId(id) : state.games.find((g) => g.bggId === id);
+  if (kind === "bgg" && game) return void location.replace(`#/predict/game/${game.id}`);
+  if (kind === "game" && !game) {
+    view.innerHTML = `<p class="empty">That game isn't in your list. <a href="#/">Back to games</a></p>`;
+    return;
+  }
+  const label = game?.name || name || `BGG game ${id}`;
+  const back = game ? `#/g/${game.id}` : "#/add";
+  const query = game ? `gameId=${game.id}` : `bggId=${id}`;
+  view.innerHTML = `
+    <header class="score-head">
+      <a class="back" href="${back}" aria-label="Back">‹</a>
+      <div class="title"><div class="name">${esc(label)}</div><div class="save-state">Claude prediction</div></div>
+      <div class="final" id="pfinal"></div>
+    </header>
+    <div id="pbody"><p class="empty">Loading…</p></div>`;
+  const here = location.hash;
+  const body = view.querySelector("#pbody");
+
+  const paint = (list) => {
+    if (location.hash !== here) return;
+    const [latest, ...older] = list;
+    const scored = game && final(game) != null;
+    const running = latest?.status === "running";
+    const canPredict = state.claude.configured && !scored && !running;
+    view.querySelector("#pfinal").innerHTML = latest?.status === "done"
+      ? `<div class="num predicted">${formatNumber(latest.final)}</div><div class="lbl">predicted</div>`
+      : "";
+    body.innerHTML = `
+      ${!state.claude.configured ? `<p class="notice">Predictions are off because the server has no ANTHROPIC_API_KEY.</p>` : ""}
+      ${scored ? `<p class="notice">You've scored this game (${formatNumber(final(game))}), so there's nothing left to predict.</p>` : ""}
+      ${running ? `<section class="card"><p><b>Claude is working on it.</b> This usually takes under a minute. You can leave this page; the prediction is saved when it's done.</p></section>` : ""}
+      ${latest && !running ? predictionCardHtml(latest, game) : ""}
+      ${!latest ? `<p class="small muted">Claude compares this game with every game you've scored, your taste profile and BGG's details, searches the web if it needs to, and predicts each of the seven criteria. The final score uses your weights.</p>` : ""}
+      ${canPredict ? `<div class="btn-row"><button class="btn primary" id="predict" type="button">${latest ? "Predict again" : "Predict my score"}</button></div>` : ""}
+      ${!game && latest?.status === "done" ? `<div class="btn-row">
+          <button class="btn" type="button" data-add-as="list">Add to list</button>
+          <button class="btn" type="button" data-add-as="watch">Add to watchlist</button>
+        </div>` : ""}
+      ${older.length ? `<details class="card"><summary>Earlier predictions (${older.length})</summary>
+          <ul class="plain">${older.map((p) => `<li>${esc(dateLabel(p.createdAt))}: ${p.status === "done" ? `<b>${formatNumber(p.final)}</b> (${esc(p.confidence)} confidence)` : `<span class="muted">${esc(p.status)}${p.error ? `: ${esc(p.error)}` : ""}</span>`}</li>`).join("")}</ul>
+        </details>` : ""}`;
+    body.querySelector("#predict")?.addEventListener("click", start);
+    body.querySelectorAll("[data-add-as]").forEach((b) => b.addEventListener("click", () => addPredicted(b, id)));
+    if (running) predictPoll = setTimeout(load, 3000);
+  };
+
+  const load = async () => {
+    try {
+      const list = await api.get(`/api/predictions?${query}`);
+      // A finished job may have filled a watched game's predicted score.
+      if (list[0] && list[0].status !== "running" && body.dataset.wasRunning) await reload();
+      body.dataset.wasRunning = list[0]?.status === "running" ? "1" : "";
+      paint(list);
+    } catch (e) {
+      if (location.hash === here) body.innerHTML = `<p class="empty">${esc(e.message)}</p>`;
+    }
+  };
+
+  async function start(e) {
+    e.target.disabled = true;
+    try {
+      await api.post("/api/predictions", game ? { gameId: game.id } : { bggId: id, name: label });
+      await load();
+    } catch (err) {
+      e.target.disabled = false;
+      toast(err.message, 5000);
+    }
+  }
+
+  await load();
+}
+
+async function addPredicted(b, bggId) {
+  b.disabled = true;
+  try {
+    const g = await api.post("/api/games/from-bgg", { bggId, ...(b.dataset.addAs === "watch" ? { watchStage: STAGES[0].key } : {}) });
+    if (!byId(g.id)) state.games.push(g);
+    location.hash = `#/g/${g.id}`;
+  } catch (err) {
+    b.disabled = false;
+    toast(err.message, 5000);
+  }
+}
+
+function dateLabel(iso) {
+  return iso ? new Date(iso).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) : "";
+}
+
+function predictionCardHtml(p, game) {
+  if (p.status === "failed") {
+    return `<p class="notice"><b>The prediction failed.</b> ${esc(p.error || "")}</p>`;
+  }
+  const searches = p.usage?.searches ? ` · ${p.usage.searches} web ${p.usage.searches === 1 ? "search" : "searches"}` : "";
+  return `
+    ${p.avoidTheme ? `<p class="notice"><b>Avoid theme.</b> ${esc(p.avoidThemeReason)}</p>` : ""}
+    <section class="card">
+      <p class="small muted" style="margin-top:0">${esc(dateLabel(p.createdAt))} · ${esc(p.confidence)} confidence · from ${p.scoredGames} scored games${searches}</p>
+      <div class="pred-crit">${CRITERIA.map((c) => {
+        const v = p.scores[c.key];
+        const mine = game?.scores?.[c.key];
+        return `<div class="pc-name">${esc(c.name)} <span class="muted small">${state.settings.weights[c.key]}%</span></div>
+          <div class="pc-bar"><span style="width:${v * 10}%"></span></div>
+          <div class="pc-val">${formatNumber(v)}${typeof mine === "number" ? ` <span class="muted small">you ${formatNumber(mine)}</span>` : ""}</div>`;
+      }).join("")}</div>
+      ${p.rationale ? `<p>${esc(p.rationale)}</p>` : ""}
+      ${p.twoPlayer ? `<p><b>At two:</b> ${esc(p.twoPlayer)}</p>` : ""}
+      ${p.sources.length ? `<details><summary>Sources (${p.sources.length})</summary><ul class="plain">${p.sources.map((s) =>
+        `<li><a href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">${esc(s.title)}</a></li>`).join("")}</ul></details>` : ""}
+    </section>`;
+}
+
+/** The game page's prediction card: Predict for unscored games, predicted vs actual once scored. */
+async function paintGamePrediction(g) {
+  const box = view.querySelector("#prediction");
+  if (!box || !state.claude.configured) return;
+  let list;
+  try {
+    list = await api.get(`/api/predictions?gameId=${g.id}`);
+  } catch {
+    return; // the page works without it
+  }
+  if (!view.contains(box)) return;
+  const f = final(g);
+  const done = list.filter((p) => p.status === "done");
+  if (f != null) {
+    // Same rule as the accuracy report: the last prediction made before the first full score.
+    const before = g.scoredAt ? done.find((p) => p.createdAt < g.scoredAt) : null;
+    if (before) {
+      const d = before.final - f;
+      box.innerHTML = `<p class="small muted pred-line">Claude predicted <a href="#/predict/game/${g.id}">${formatNumber(before.final)}</a>; you scored ${formatNumber(f)} (${d > 0 ? "+" : ""}${formatNumber(d)}).</p>`;
+    }
+    return;
+  }
+  const latest = list[0];
+  box.innerHTML = `<div class="btn-row pred-line">
+    <a class="btn" href="#/predict/game/${g.id}">${latest?.status === "running" ? "Prediction running…" : latest?.status === "done" ? `Claude predicts ${formatNumber(latest.final)}` : "Predict my score"}</a>
+  </div>`;
+}
+
+function claudeSettingsHtml() {
+  if (!state.claude.configured) {
+    return `<section class="card"><h2 style="margin-top:0">Claude predictions</h2>
+      <p class="notice">Set ANTHROPIC_API_KEY in the server's .env file to turn on predictions.</p></section>`;
+  }
+  return `<section class="card">
+    <h2 style="margin-top:0">Claude predictions</h2>
+    <p class="small muted">Model: ${esc(state.claude.model)}. Claude reads this taste profile with every prediction, alongside your scores.</p>
+    <label class="field"><span>Taste profile</span>
+      <textarea id="taste" rows="8" maxlength="4000" placeholder="Who you usually play with and at what counts, what you love, what you avoid, what a game needs to land with your group…">${esc(state.settings.tasteProfile || "")}</textarea></label>
+    <div class="btn-row"><button class="btn primary" id="taste-save" type="button">Save taste profile</button></div>
+    <h3>Accuracy</h3>
+    <div id="accuracy" class="small muted">Loading…</div>
+  </section>`;
+}
+
+async function bindClaudeSettings() {
+  const save = view.querySelector("#taste-save");
+  if (!save) return;
+  save.addEventListener("click", async () => {
+    try {
+      state.settings = await api.put("/api/settings", { tasteProfile: view.querySelector("#taste").value });
+      toast("Taste profile saved");
+    } catch (err) {
+      toast(err.message, 5000);
+    }
+  });
+  const box = view.querySelector("#accuracy");
+  try {
+    const acc = await api.get("/api/predictions/accuracy");
+    box.innerHTML = acc.n
+      ? `<p>Off by <b>${formatNumber(acc.meanAbsError, 2)}</b> on average across ${acc.n} ${acc.n === 1 ? "game" : "games"} you scored after a prediction.</p>
+         <table><tbody>${acc.pairs.map((x) => `<tr><td><a href="#/g/${x.gameId}">${esc(x.name)}</a></td>
+           <td class="num">${formatNumber(x.predicted)} → ${formatNumber(x.actual)}</td><td class="num">${x.error > 0 ? "+" : ""}${formatNumber(x.error)}</td></tr>`).join("")}</tbody></table>`
+      : "No games scored after a prediction yet. Once you score a game Claude predicted, it shows up here.";
+  } catch (err) {
+    box.textContent = err.message;
   }
 }
 

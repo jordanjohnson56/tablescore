@@ -251,3 +251,12 @@ td.num, th.num { text-align: right; }
   .crit-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; align-items: start; }
   .watch-edit { grid-template-columns: 1fr 12rem; }
 }
+
+/* Claude predictions */
+.pred-crit { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr) auto; gap: 8px 10px; align-items: center; font-size: 0.9rem; }
+.pred-crit .pc-bar { height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; }
+.pred-crit .pc-bar span { display: block; height: 100%; background: var(--accent); }
+.pred-crit .pc-val { font-weight: 600; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.pred-line { margin: 8px 0; }
+ul.plain { padding-left: 18px; margin: 8px 0; }
+ul.plain li { margin: 4px 0; overflow-wrap: anywhere; }
