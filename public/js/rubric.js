@@ -131,6 +131,8 @@ export const DEFAULT_SETTINGS = {
   stretch: 1.25,
   hideExpansions: false,
   includeWatching: false,
+  // Free text Claude reads with every prediction: who you play with, what you love and avoid.
+  tasteProfile: "",
 };
 
 export const PROVISIONAL_PLAYS = 3;
