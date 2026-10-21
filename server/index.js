@@ -2,6 +2,8 @@ import { join } from "node:path";
 import { openDb } from "./db.js";
 import { BggClient } from "./bgg.js";
 import { createApp } from "./app.js";
+import { Predictor, DEFAULT_MODEL } from "./predict.js";
+import Anthropic from "@anthropic-ai/sdk";
 
 const env = process.env;
 const dataDir = env.DATA_DIR || "data";
@@ -11,7 +13,14 @@ const keep = Number(env.BACKUP_KEEP || 14);
 
 const store = openDb(join(dataDir, "tablescore.db"));
 const bgg = new BggClient({ token: env.BGG_TOKEN });
-const app = createApp({ store, bgg, bggUsername: env.BGG_USERNAME });
+const predictor = new Predictor({
+  client: env.ANTHROPIC_API_KEY ? new Anthropic({ apiKey: env.ANTHROPIC_API_KEY }) : null,
+  model: env.CLAUDE_MODEL || DEFAULT_MODEL,
+});
+const app = createApp({ store, bgg, bggUsername: env.BGG_USERNAME, predictor });
+
+const cutOff = store.failRunningPredictions();
+if (cutOff) console.log(`${cutOff} prediction(s) cut off by the last restart marked failed.`);
 
 function backup() {
   try {
@@ -26,4 +35,5 @@ setInterval(backup, 24 * 60 * 60 * 1000).unref();
 app.listen(port, host, () => {
   console.log(`Tablescore listening on http://${host}:${port}`);
   if (!bgg.configured) console.log("BGG_TOKEN not set: BGG search and sync are disabled.");
+  if (!predictor.configured) console.log("ANTHROPIC_API_KEY not set: Claude predictions are disabled.");
 });

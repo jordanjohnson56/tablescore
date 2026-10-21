@@ -2,7 +2,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { CRITERIA, DEFAULT_SETTINGS } from "../public/js/rubric.js";
+import { CRITERIA, DEFAULT_SETTINGS, finalScore } from "../public/js/rubric.js";
 import { PLATFORMS, STAGE_KEYS } from "../public/js/watchlist.js";
 
 const SCORE_COLS = CRITERIA.map((c) => `s_${c.key}`);
@@ -114,6 +114,30 @@ export function openDb(file) {
       updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     );
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    -- Claude's predicted scores. Keyed by BGG ID so a game can be predicted
+    -- without adding it; game_id covers games in the list that have no BGG ID.
+    CREATE TABLE IF NOT EXISTS predictions (
+      id INTEGER PRIMARY KEY,
+      bgg_id INTEGER,
+      game_id INTEGER,
+      name TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'running',
+      error TEXT,
+      model TEXT NOT NULL,
+      scored_games INTEGER NOT NULL DEFAULT 0,
+      ${SCORE_COLS.map((c) => `${c} REAL`).join(",\n      ")},
+      confidence TEXT,
+      avoid_theme INTEGER NOT NULL DEFAULT 0,
+      avoid_theme_reason TEXT NOT NULL DEFAULT '',
+      rationale TEXT NOT NULL DEFAULT '',
+      two_player TEXT NOT NULL DEFAULT '',
+      sources TEXT NOT NULL DEFAULT '[]',
+      usage TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      finished_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS predictions_bgg ON predictions (bgg_id);
+    CREATE INDEX IF NOT EXISTS predictions_game ON predictions (game_id);
   `);
   migrate(db);
   return new Store(db);
@@ -126,6 +150,9 @@ function migrate(db) {
     if (!have.has(col)) db.exec(`ALTER TABLE games ADD COLUMN ${col} ${type}`);
   }
   if (!have.has("wont_score")) db.exec("ALTER TABLE games ADD COLUMN wont_score INTEGER NOT NULL DEFAULT 0");
+  // When all seven scores were first entered in the app. Null for games scored
+  // before this column existed, which keeps them out of prediction accuracy.
+  if (!have.has("scored_at")) db.exec("ALTER TABLE games ADD COLUMN scored_at TEXT");
 }
 
 export class Store {
@@ -144,7 +171,7 @@ export class Store {
     const stmt = this.db.prepare(
       "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     );
-    for (const key of ["weights", "stretch", "hideExpansions", "includeWatching"]) {
+    for (const key of ["weights", "stretch", "hideExpansions", "includeWatching", "tasteProfile"]) {
       if (patch[key] !== undefined) stmt.run(key, JSON.stringify(patch[key]));
     }
     return this.getSettings();
@@ -212,6 +239,9 @@ export class Store {
     if (sets.length) {
       sets.push("updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')");
       this.db.prepare(`UPDATE games SET ${sets.join(", ")} WHERE id = ?`).run(...vals, id);
+      if (patch.scores && CRITERIA.every((c) => this.getGame(id).scores[c.key] != null)) {
+        this.db.prepare("UPDATE games SET scored_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND scored_at IS NULL").run(id);
+      }
     }
     return this.getGame(id);
   }
@@ -232,6 +262,83 @@ export class Store {
   deleteGame(id) {
     const { changes } = this.db.prepare("DELETE FROM games WHERE id = ?").run(id);
     if (!changes) throw new HttpError(404, "game not found");
+  }
+
+  /** Start a prediction row in the running state. */
+  createPrediction({ bggId = null, gameId = null, name, model }) {
+    const { lastInsertRowid } = this.db
+      .prepare("INSERT INTO predictions (bgg_id, game_id, name, model) VALUES (?, ?, ?, ?)")
+      .run(bggId, gameId, name, model);
+    return this.getPrediction(Number(lastInsertRowid));
+  }
+
+  finishPrediction(id, p) {
+    this.db
+      .prepare(
+        `UPDATE predictions SET status = 'done', name = ?, scored_games = ?, ${SCORE_COLS.map((c) => `${c} = ?`).join(", ")},
+         confidence = ?, avoid_theme = ?, avoid_theme_reason = ?, rationale = ?, two_player = ?, sources = ?, usage = ?,
+         finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`,
+      )
+      .run(
+        p.name, p.scoredGames, ...CRITERIA.map((c) => p.scores[c.key]),
+        p.confidence, p.avoidTheme ? 1 : 0, p.avoidThemeReason, p.rationale, p.twoPlayer,
+        JSON.stringify(p.sources), JSON.stringify(p.usage ?? null), id,
+      );
+    return this.getPrediction(id);
+  }
+
+  failPrediction(id, error) {
+    this.db
+      .prepare("UPDATE predictions SET status = 'failed', error = ?, finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?")
+      .run(error, id);
+    return this.getPrediction(id);
+  }
+
+  /** On startup: a prediction still running was cut off by a restart. */
+  failRunningPredictions() {
+    return this.db
+      .prepare("UPDATE predictions SET status = 'failed', error = 'The server restarted before it finished.', finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE status = 'running'")
+      .run().changes;
+  }
+
+  getPrediction(id) {
+    const row = this.db.prepare("SELECT * FROM predictions WHERE id = ?").get(id);
+    return row ? toPrediction(row, this.getSettings()) : null;
+  }
+
+  /** Every prediction for a BGG ID or a game in the list, newest first. */
+  listPredictions({ bggId = null, gameId = null }) {
+    const settings = this.getSettings();
+    return this.db
+      .prepare("SELECT * FROM predictions WHERE bgg_id = ? OR game_id = ? ORDER BY created_at DESC, id DESC")
+      .all(bggId, gameId)
+      .map((r) => toPrediction(r, settings));
+  }
+
+  /**
+   * Predicted vs actual for every game scored in the app after a prediction:
+   * the latest finished prediction made before the game's first full score.
+   */
+  predictionAccuracy() {
+    const settings = this.getSettings();
+    const pairs = [];
+    for (const row of this.db.prepare("SELECT * FROM games WHERE scored_at IS NOT NULL").all()) {
+      const game = toGame(row);
+      const actual = finalScore(game.scores, settings);
+      if (actual == null) continue;
+      const before = this.db
+        .prepare(
+          `SELECT * FROM predictions WHERE status = 'done' AND created_at < ? AND (bgg_id = ? OR game_id = ?)
+           ORDER BY created_at DESC, id DESC LIMIT 1`,
+        )
+        .get(row.scored_at, game.bggId, game.id);
+      if (!before) continue;
+      const p = toPrediction(before, settings);
+      pairs.push({ gameId: game.id, name: game.name, predictionId: p.id, predicted: p.final, actual, error: Math.round((p.final - actual) * 10) / 10 });
+    }
+    const n = pairs.length;
+    const meanAbsError = n ? Math.round((pairs.reduce((t, x) => t + Math.abs(x.predicted - x.actual), 0) / n) * 100) / 100 : null;
+    return { n, meanAbsError, pairs };
   }
 
   transaction(fn) {
@@ -299,6 +406,33 @@ function toGame(r) {
     thumbnail: r.thumbnail,
     ...Object.fromEntries(Object.entries(WATCH_FIELDS).map(([k, [col]]) => [k, r[col]])),
     scores: Object.fromEntries(CRITERIA.map((c) => [c.key, r[`s_${c.key}`]])),
+    scoredAt: r.scored_at,
     updatedAt: r.updated_at,
+  };
+}
+
+/** The final score is worked out with the current weights, like a game's. */
+function toPrediction(r, settings) {
+  const scores = Object.fromEntries(CRITERIA.map((c) => [c.key, r[`s_${c.key}`]]));
+  return {
+    id: r.id,
+    bggId: r.bgg_id,
+    gameId: r.game_id,
+    name: r.name,
+    status: r.status,
+    error: r.error,
+    model: r.model,
+    scoredGames: r.scored_games,
+    scores,
+    final: r.status === "done" ? finalScore(scores, settings) : null,
+    confidence: r.confidence,
+    avoidTheme: !!r.avoid_theme,
+    avoidThemeReason: r.avoid_theme_reason,
+    rationale: r.rationale,
+    twoPlayer: r.two_player,
+    sources: JSON.parse(r.sources),
+    usage: r.usage ? JSON.parse(r.usage) : null,
+    createdAt: r.created_at,
+    finishedAt: r.finished_at,
   };
 }

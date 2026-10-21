@@ -55,6 +55,17 @@ BGG's XML API needs a registered application token, sent as `Authorization: Bear
 - **Settings → Sync from BGG** pulls your collection (status, plays, your BGG rating, images, player counts), then fetches weight and best player counts in batches of 20. Requests are spaced 5 s apart. A sync never changes your rubric scores, notes or flags, or a name you've edited.
 - BGG's API is read-only, so ratings can't be pushed back. When your score differs from your BGG rating, the game is tagged **BGG** and its page shows the number to enter. **Copy & open BGG** copies the score and opens the game on BGG. **I've rated it** records that rating locally so the tag clears without a sync, and the next sync replaces it with whatever BGG actually has. From the **Update BGG** filter, **I've rated it** moves on to the next game that needs rating.
 
+## Claude predictions
+
+Tablescore can ask Claude to predict your score for a game you haven't scored. Set `ANTHROPIC_API_KEY` in `.env` (from console.anthropic.com; usage is billed to that account, and Max plans include monthly API credits). Without a key the feature is off.
+
+- Claude sees the rubric (criteria, bands, weights, stretch), your **taste profile** (free text under Settings), every game you've scored with its seven criterion scores, plays, BGG weight and player counts, and your old ratings for games not yet rescored, labeled as the weaker signal they are. Watched games and the game being predicted are left out.
+- For the game itself it gets BGG's details (description, mechanics, categories, designers, and the base game for an expansion, with your score for it if you have one), plus up to 5 web searches. A game with no BGG ID is predicted from its name and the web.
+- It returns a score for each criterion, a confidence, a short rationale naming the games it compared against, a note on how the game plays at two, an avoid-theme flag and the pages it relied on. The final score is worked out by the app with your current weights, like any other score.
+- A prediction runs as a job on the server (one at a time, usually 20–60 s), so closing the app doesn't lose it. Every prediction is kept. A game you've scored can't be predicted any more; instead, `GET /api/predictions/accuracy` compares your score with the last prediction made before you first scored it.
+- A watched game takes Claude's prediction as its predicted score only when it has none of its own. Adding a predicted game from BGG carries over the avoid-theme flag.
+- The model is `claude-opus-5-5`. Set `CLAUDE_MODEL=claude-sonnet-5-5` in `.env` for faster, cheaper predictions. Each prediction's token and search counts are stored with it.
+
 ## Watchlist
 
 The **Watchlist** tab follows crowdfunded games you aren't backing, so you can wait for delivery and reviews before buying a used copy. Mark a game as Watching with **Watch instead of score** on Add, or from the Watch section of any game's page. Each watched game has a campaign URL, platform, campaign end date, estimated delivery month, a **predicted score** (kept apart from real rubric scores) and a **target price**.

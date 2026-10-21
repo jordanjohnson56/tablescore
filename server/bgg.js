@@ -75,6 +75,13 @@ export class BggClient {
     return out;
   }
 
+  /** One game's details plus what a prediction needs: description, mechanics, categories, designers, base games. */
+  async details(id) {
+    const doc = await this.get("thing", { id: String(id), stats: "1" });
+    const it = doc.items?.item?.[0];
+    return it ? { ...parseThing(it), ...parseExtras(it) } : null;
+  }
+
   /** The user's whole collection: base games and expansions (two requests). */
   async collection(username) {
     const base = await this.get("collection", { username, stats: "1", excludesubtype: "boardgameexpansion" });
@@ -99,6 +106,38 @@ export function parseThing(it) {
     image: it.image || null,
     thumbnail: it.thumbnail || null,
   };
+}
+
+const DESCRIPTION_LIMIT = 4000;
+
+/** The descriptive fields parseThing leaves out. Only predictions use them, so they aren't stored. */
+export function parseExtras(it) {
+  const links = (type) => (it.link || []).filter((l) => l.type === type);
+  const names = (type) => links(type).map((l) => l.value);
+  const description = decodeEntities(text(it.description)).replace(/\n{3,}/g, "\n\n").trim();
+  return {
+    description: description.length > DESCRIPTION_LIMIT ? `${description.slice(0, DESCRIPTION_LIMIT)}…` : description,
+    mechanics: names("boardgamemechanic"),
+    categories: names("boardgamecategory"),
+    designers: names("boardgamedesigner"),
+    // On an expansion, inbound expansion links point at the games it expands.
+    baseGames: links("boardgameexpansion")
+      .filter((l) => l.inbound === "true")
+      .map((l) => ({ bggId: Number(l.id), name: l.value })),
+  };
+}
+
+const NAMED = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", mdash: "—", ndash: "–", rsquo: "’", lsquo: "‘", rdquo: "”", ldquo: "“", hellip: "…" };
+
+/** BGG escapes descriptions twice, so one entity layer is left after XML parsing. */
+function decodeEntities(s) {
+  return s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (m, e) => {
+    if (e[0] === "#") {
+      const code = e[1].toLowerCase() === "x" ? parseInt(e.slice(2), 16) : Number(e.slice(1));
+      return Number.isFinite(code) && code <= 0x10ffff ? String.fromCodePoint(code) : m;
+    }
+    return NAMED[e.toLowerCase()] ?? m;
+  });
 }
 
 export function parseCollectionItem(it) {

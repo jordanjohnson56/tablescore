@@ -13,6 +13,7 @@
     "test": "node --disable-warning=ExperimentalWarning --test"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^1.0.0",
     "exceljs": "^4.4.0",
     "express": "^5.2.1",
     "fast-xml-parser": "^5.11.2"
