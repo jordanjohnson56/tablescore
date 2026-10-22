@@ -1058,7 +1058,8 @@ function predRowHtml(p) {
   const badge = p.status === "done"
     ? `<div class="num predicted">${formatNumber(p.final)}</div><div class="lbl">predicted</div>`
     : `<div class="num old">—</div>`;
-  const inner = `${g ? thumbHtml(g) : `<div class="thumb" aria-hidden="true"></div>`}
+  // A game in the list may have no photo yet; the prediction keeps BGG's.
+  const inner = `${thumbHtml({ thumbnail: g?.thumbnail || p.thumbnail })}
     <div class="info"><div class="name">${esc(predName(p))}</div>
       <div class="meta">${tags ? `<span class="tags">${tags}</span>` : ""}<span class="details">${tags ? "· " : ""}${esc(details)}</span></div></div>
     <div class="score-badge">${badge}</div>`;

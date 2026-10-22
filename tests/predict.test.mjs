@@ -71,11 +71,11 @@ function fakeBgg(thing = THING) {
   return new BggClient({ token: "tok", fetchImpl, spacingMs: 0, retryMs: 0, sleep: async () => {} });
 }
 
-async function startApp({ replies = [], configured = true, model } = {}) {
+async function startApp({ replies = [], configured = true, model, thing } = {}) {
   const store = openDb(":memory:");
   const claude = fakeClaude(replies);
   const predictor = new Predictor({ client: configured ? claude.client : null, model });
-  const app = createApp({ store, bgg: fakeBgg(), bggUsername: "tester", predictor });
+  const app = createApp({ store, bgg: fakeBgg(thing), bggUsername: "tester", predictor });
   const server = await new Promise((r) => {
     const s = app.listen(0, "127.0.0.1", () => r(s));
   });
@@ -394,6 +394,22 @@ test("latest predictions: one per game, the newest finished one, joined to the l
     assert.equal(by["Only failed"].gameId, null);
     assert.equal(by["No BGG"].running, true);
     assert.equal(by["Gone"].gameId, null);
+  } finally {
+    t.close();
+  }
+});
+
+test("a prediction keeps BGG's thumbnail, and older ones get it backfilled once", async () => {
+  const thing = THING.replace("<yearpublished", "<thumbnail>https://img.example/500.jpg</thumbnail><yearpublished");
+  const t = await startApp({ replies: [submitMsg()], thing });
+  try {
+    const p = await t.settle((await t.call("POST", "/api/predictions", { bggId: 500 })).body.id);
+    assert.equal(p.thumbnail, "https://img.example/500.jpg");
+
+    t.store.db.prepare("UPDATE predictions SET thumbnail = NULL").run();
+    assert.deepEqual(t.store.predictionBggIdsWithoutThumbnail(), [500]);
+    const list = (await t.call("GET", "/api/predictions/latest")).body;
+    assert.equal(list[0].thumbnail, "https://img.example/500.jpg");
   } finally {
     t.close();
   }

@@ -133,6 +133,7 @@ export function openDb(file) {
       two_player TEXT NOT NULL DEFAULT '',
       sources TEXT NOT NULL DEFAULT '[]',
       usage TEXT,
+      thumbnail TEXT,
       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
       finished_at TEXT
     );
@@ -153,6 +154,9 @@ function migrate(db) {
   // When all seven scores were first entered in the app. Null for games scored
   // before this column existed, which keeps them out of prediction accuracy.
   if (!have.has("scored_at")) db.exec("ALTER TABLE games ADD COLUMN scored_at TEXT");
+  // BGG's thumbnail for a predicted game that isn't in the list.
+  const predCols = new Set(db.prepare("PRAGMA table_info(predictions)").all().map((c) => c.name));
+  if (!predCols.has("thumbnail")) db.exec("ALTER TABLE predictions ADD COLUMN thumbnail TEXT");
 }
 
 export class Store {
@@ -276,13 +280,13 @@ export class Store {
     this.db
       .prepare(
         `UPDATE predictions SET status = 'done', name = ?, scored_games = ?, ${SCORE_COLS.map((c) => `${c} = ?`).join(", ")},
-         confidence = ?, avoid_theme = ?, avoid_theme_reason = ?, rationale = ?, two_player = ?, sources = ?, usage = ?,
+         confidence = ?, avoid_theme = ?, avoid_theme_reason = ?, rationale = ?, two_player = ?, sources = ?, usage = ?, thumbnail = ?,
          finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`,
       )
       .run(
         p.name, p.scoredGames, ...CRITERIA.map((c) => p.scores[c.key]),
         p.confidence, p.avoidTheme ? 1 : 0, p.avoidThemeReason, p.rationale, p.twoPlayer,
-        JSON.stringify(p.sources), JSON.stringify(p.usage ?? null), id,
+        JSON.stringify(p.sources), JSON.stringify(p.usage ?? null), p.thumbnail ?? null, id,
       );
     return this.getPrediction(id);
   }
@@ -313,6 +317,18 @@ export class Store {
       .prepare("SELECT * FROM predictions WHERE bgg_id = ? OR game_id = ? ORDER BY created_at DESC, id DESC")
       .all(bggId, gameId)
       .map((r) => toPrediction(r, settings));
+  }
+
+  /** BGG IDs with a prediction but no thumbnail, for a backfill. */
+  predictionBggIdsWithoutThumbnail() {
+    return this.db
+      .prepare("SELECT DISTINCT bgg_id FROM predictions WHERE bgg_id IS NOT NULL AND thumbnail IS NULL")
+      .all()
+      .map((r) => r.bgg_id);
+  }
+
+  setPredictionThumbnail(bggId, thumbnail) {
+    this.db.prepare("UPDATE predictions SET thumbnail = ? WHERE bgg_id = ?").run(thumbnail, bggId);
   }
 
   /**
@@ -462,6 +478,7 @@ function toPrediction(r, settings) {
     twoPlayer: r.two_player,
     sources: JSON.parse(r.sources),
     usage: r.usage ? JSON.parse(r.usage) : null,
+    thumbnail: r.thumbnail,
     createdAt: r.created_at,
     finishedAt: r.finished_at,
   };
