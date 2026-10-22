@@ -27,13 +27,25 @@
     </a>
   </footer>
   <nav class="tabs" aria-label="Sections">
-    <a href="#/" data-tab="games">Games</a>
-    <a href="#/watchlist" data-tab="watchlist">Watchlist</a>
-    <a href="#/predictions" data-tab="predictions">Predicted</a>
-    <a href="#/add" data-tab="add">Add</a>
-    <a href="#/summary" data-tab="summary">Summary</a>
-    <a href="#/settings" data-tab="settings">Settings</a>
+    <a href="#/" data-tab="games"><span class="ind"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1.5"/><rect x="13" y="4" width="7" height="7" rx="1.5"/><rect x="4" y="13" width="7" height="7" rx="1.5"/><rect x="13" y="13" width="7" height="7" rx="1.5"/></svg></span>Games</a>
+    <a href="#/watchlist" data-tab="watchlist"><span class="ind"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.5-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.5 6.5-9.5 6.5S2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.8"/></svg></span>Watchlist</a>
+    <a href="#/discover" data-tab="discover"><span class="ind"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.3-4.3"/></svg></span>Discover</a>
+    <a href="#/summary" data-tab="summary" class="wide-only"><span class="ind"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20v-8M12 20V5M19 20v-5"/></svg></span>Summary</a>
+    <a href="#/settings" data-tab="settings" class="wide-only"><span class="ind"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6.5h9M17 6.5h3M4 12h3M11 12h9M4 17.5h11M19 17.5h1"/><circle cx="15" cy="6.5" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="17.5" r="2"/></svg></span>Settings</a>
+    <button type="button" class="more" data-tab="more" aria-haspopup="dialog" aria-controls="more" aria-expanded="false"><span class="ind"><svg viewBox="0 0 24 24" aria-hidden="true"><circle class="dot" cx="5.5" cy="12" r="1.3"/><circle class="dot" cx="12" cy="12" r="1.3"/><circle class="dot" cx="18.5" cy="12" r="1.3"/></svg></span>More</button>
   </nav>
+  <!-- Phone only: Summary, Settings and two Settings shortcuts. The desktop sidebar lists Summary and Settings directly. -->
+  <div id="more" class="sheet-wrap" hidden>
+    <div class="scrim" data-close></div>
+    <div class="sheet" role="dialog" aria-modal="true" aria-label="More">
+      <div class="grabber" aria-hidden="true"></div>
+      <a class="sheet-row" href="#/summary"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20v-8M12 20V5M19 20v-5"/></svg><span><b>Summary</b><small>Old ratings vs new scores</small></span></a>
+      <a class="sheet-row" href="#/settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6.5h9M17 6.5h3M4 12h3M11 12h9M4 17.5h11M19 17.5h1"/><circle cx="15" cy="6.5" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="17.5" r="2"/></svg><span><b>Settings</b><small>Weights, display, BGG, Claude, your data</small></span></a>
+      <hr>
+      <button class="sheet-row" type="button" id="more-sync"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.5-4.5M4 13a8 8 0 0 0 14.5 4.5"/><path d="M5 3v4h4M19 21v-4h-4"/></svg><span><b>Sync from BGG</b><small>Opens Settings to show progress</small></span></button>
+      <button class="sheet-row" type="button" id="more-copy"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5.5A1.5 1.5 0 0 0 14.5 4h-9A1.5 1.5 0 0 0 4 5.5v9A1.5 1.5 0 0 0 5.5 16H8"/></svg><span><b>Copy scores for Claude</b><small>Same as the Settings button</small></span></button>
+    </div>
+  </div>
   <div id="toast" role="status" hidden></div>
 </body>
 </html>

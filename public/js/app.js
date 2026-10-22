@@ -10,7 +10,7 @@ import { api } from "./api.js";
 
 const view = document.getElementById("view");
 let state = { settings: null, games: [], bgg: { configured: false }, claude: { configured: false } };
-const DEFAULT_PREFS = { filter: "all", sort: "score", q: "", predSort: "recent", predQ: "" };
+const DEFAULT_PREFS = { filter: "all", sort: "score", q: "", predSort: "recent", discoverQ: "" };
 const prefs = loadPrefs();
 
 // ---------- helpers ----------
@@ -113,14 +113,20 @@ window.addEventListener("pagehide", () => {
 // ---------- router ----------
 
 // Each tab's renderer, matched by hash prefix; anything else is the games list.
-const TABS = { watchlist: renderWatchlist, predictions: renderPredictions, add: renderAdd, summary: renderSummary, settings: renderSettings, games: renderList };
+const TABS = { watchlist: renderWatchlist, discover: renderDiscover, summary: renderSummary, settings: renderSettings, games: renderList };
+// Screens that were merged into Discover; old links and bookmarks land there.
+const MERGED = ["#/add", "#/predictions"];
 
 function route() {
   const hash = location.hash || "#/";
-  // A prediction page sits under Predictions, wherever it was opened from.
-  const tab = hash.startsWith("#/predict/") ? "predictions" : Object.keys(TABS).find((t) => hash.startsWith(`#/${t}`)) || "games";
-  document.querySelectorAll(".tabs a").forEach((a) => {
-    if (a.dataset.tab === tab) a.setAttribute("aria-current", "page");
+  if (MERGED.some((h) => hash.startsWith(h))) return void location.replace("#/discover");
+  closeMore();
+  // A prediction page sits under Discover, wherever it was opened from.
+  const tab = hash.startsWith("#/predict/") ? "discover" : Object.keys(TABS).find((t) => hash.startsWith(`#/${t}`)) || "games";
+  // On a phone, Summary and Settings are reached through More, so More lights up for them.
+  const current = (t) => t === tab || (t === "more" && (tab === "summary" || tab === "settings"));
+  document.querySelectorAll(".tabs [data-tab]").forEach((a) => {
+    if (current(a.dataset.tab)) a.setAttribute("aria-current", "page");
     else a.removeAttribute("aria-current");
   });
   const m = hash.match(/^#\/g\/(\d+)/);
@@ -130,8 +136,8 @@ function route() {
   return TABS[tab]();
 }
 window.addEventListener("hashchange", (e) => {
-  // A prediction page opened from the predictions screen goes back there.
-  if (location.hash.startsWith("#/predict/")) predictBack = new URL(e.oldURL).hash.startsWith("#/predictions") ? "#/predictions" : null;
+  // A prediction page opened from Discover goes back there.
+  if (location.hash.startsWith("#/predict/")) predictBack = new URL(e.oldURL).hash.startsWith("#/discover") ? "#/discover" : null;
   route();
   window.scrollTo(0, 0);
 });
@@ -192,7 +198,7 @@ function renderList() {
     document.getElementById("count").textContent = `${list.length} ${list.length === 1 ? "game" : "games"}`;
     document.getElementById("games").innerHTML = list.length
       ? list.map(rowHtml).join("")
-      : `<li class="empty">${shownGames().length ? "No games match." : state.games.length ? "Every game is hidden: Settings can hide watched games and expansions from this list." : 'No games yet. Import your spreadsheet or use <a href="#/add">Add</a>.'}</li>`;
+      : `<li class="empty">${shownGames().length ? "No games match." : state.games.length ? "Every game is hidden: Settings can hide watched games and expansions from this list." : 'No games yet. Import your spreadsheet or use <a href="#/discover">Discover</a>.'}</li>`;
   };
   fill();
   view.querySelector("#q").addEventListener("input", (e) => {
@@ -620,49 +626,75 @@ function watchRowHtml(g, today) {
   </li>`;
 }
 
-// ---------- add ----------
+// ---------- discover ----------
 
-function renderAdd() {
+/**
+ * Add and Predicted in one screen: with an empty search box it lists every
+ * prediction; while typing it shows matching predictions, then BGG results.
+ */
+async function renderDiscover() {
   const bggOn = state.bgg.configured;
   view.innerHTML = `
-    <h1>Add a game</h1>
-    <label class="toggle"><input type="checkbox" id="mwatch"> Watch instead of score</label>
-    ${bggOn
-      ? `<input type="search" id="bq" placeholder="Search BoardGameGeek" aria-label="Search BoardGameGeek" autofocus>
-         <ul class="list" id="results"><li class="empty">Type at least 2 letters.</li></ul>`
-      : `<p class="notice">BGG search is off because the server has no BGG_TOKEN. You can still add games by name.</p>`}
-    <h2>Add by name</h2>
-    <form id="manual">
-      <label class="field"><span>Name</span><input type="text" id="mname" required></label>
-      <label class="field"><span>Type</span><select id="mtype"><option>Base</option><option>Expansion</option></select></label>
-      <button class="btn primary" type="submit">Add game</button>
-    </form>`;
+    <h1>Discover</h1>
+    <div class="toolbar">
+      <input type="search" id="dq" placeholder="${bggOn ? "Search BGG and predictions" : "Search predictions"}"
+        value="${esc(prefs.discoverQ)}" aria-label="${bggOn ? "Search BoardGameGeek and your predictions" : "Search your predictions"}">
+      <label class="toggle"><input type="checkbox" id="mwatch"> Watch instead of score</label>
+    </div>
+    ${bggOn ? "" : `<p class="notice">BGG search is off because the server has no BGG_TOKEN. You can still add games by name.</p>`}
+    <section id="predsec">
+      <div class="sec-head"><h2 id="phead"></h2>
+        <select id="psort" aria-label="Sort predictions">
+          ${PRED_SORTS.map(([v, l]) => `<option value="${v}" ${prefs.predSort === v ? "selected" : ""}>${l}</option>`).join("")}
+        </select>
+      </div>
+      <ul class="list" id="preds"><li class="empty">Loading…</li></ul>
+    </section>
+    <section id="bggsec" hidden>
+      <h2>BoardGameGeek</h2>
+      <ul class="list" id="results"></ul>
+    </section>
+    <details class="add-name"><summary>${bggOn ? "Not on BGG? Add by name" : "Add by name"}</summary>
+      <form id="manual">
+        <label class="field"><span>Name</span><input type="text" id="mname" required></label>
+        <label class="field"><span>Type</span><select id="mtype"><option>Base</option><option>Expansion</option></select></label>
+        <button class="btn primary" type="submit">Add game</button>
+      </form>
+    </details>`;
+  if (!bggOn) view.querySelector(".add-name").open = true;
 
   // A watched game starts at the first stage, Campaign live.
   const watch = () => (view.querySelector("#mwatch").checked ? { watchStage: STAGES[0].key } : {});
-
-  view.querySelector("#manual").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const name = view.querySelector("#mname").value.trim();
-    if (!name) return;
-    try {
-      const g = await api.post("/api/games", { name, type: view.querySelector("#mtype").value, ...watch() });
-      state.games.push(g);
-      location.hash = `#/g/${g.id}`;
-    } catch (err) {
-      toast(err.message, 5000);
-    }
-  });
-
-  if (!bggOn) return;
+  const here = location.hash;
   const results = view.querySelector("#results");
+  let all = null;
+  let loadError = "";
+
+  const fill = () => {
+    const q = prefs.discoverQ.trim();
+    const searching = bggOn && q.length >= 2;
+    const matches = all && sortPredictions(all.filter((p) => !q || predName(p).toLowerCase().includes(q.toLowerCase())), prefs.predSort);
+    view.querySelector("#phead").innerHTML = `${q ? "Your predictions" : "Predictions"}${matches ? ` <span class="muted small">${matches.length}</span>` : ""}`;
+    view.querySelector("#preds").innerHTML = loadError
+      ? `<li class="empty">${esc(loadError)}</li>`
+      : !matches
+        ? `<li class="empty">Loading…</li>`
+        : matches.length
+          ? matches.map(predRowHtml).join("")
+          : `<li class="empty">${all.length ? "No predictions match." : state.claude.configured ? "No predictions yet. Search for a game above and tap Predict." : "No predictions yet."}</li>`;
+    // While BGG results are showing, an empty predictions section is just noise.
+    view.querySelector("#predsec").hidden = searching && matches?.length === 0;
+    view.querySelector("#bggsec").hidden = !searching;
+  };
+
   let timer;
   let seq = 0;
-  view.querySelector("#bq").addEventListener("input", (e) => {
+  const searchBgg = () => {
     clearTimeout(timer);
-    const q = e.target.value.trim();
-    if (q.length < 2) {
-      results.innerHTML = `<li class="empty">Type at least 2 letters.</li>`;
+    const q = prefs.discoverQ.trim();
+    if (!bggOn || q.length < 2) {
+      seq++;
+      results.innerHTML = "";
       return;
     }
     timer = setTimeout(async () => {
@@ -686,6 +718,30 @@ function renderAdd() {
         if (mine === seq) results.innerHTML = `<li class="empty">${esc(err.message)}</li>`;
       }
     }, 450);
+  };
+
+  view.querySelector("#dq").addEventListener("input", (e) => {
+    prefs.discoverQ = e.target.value;
+    savePrefs();
+    fill();
+    searchBgg();
+  });
+  view.querySelector("#psort").addEventListener("change", (e) => {
+    prefs.predSort = e.target.value;
+    savePrefs();
+    fill();
+  });
+  view.querySelector("#manual").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const name = view.querySelector("#mname").value.trim();
+    if (!name) return;
+    try {
+      const g = await api.post("/api/games", { name, type: view.querySelector("#mtype").value, ...watch() });
+      state.games.push(g);
+      location.hash = `#/g/${g.id}`;
+    } catch (err) {
+      toast(err.message, 5000);
+    }
   });
   results.addEventListener("click", async (e) => {
     const b = e.target.closest("[data-add]");
@@ -702,6 +758,15 @@ function renderAdd() {
       toast(err.message, 5000);
     }
   });
+
+  fill();
+  searchBgg();
+  try {
+    all = await api.get("/api/predictions/latest");
+  } catch (e) {
+    loadError = e.message;
+  }
+  if (location.hash === here) fill();
 }
 
 // ---------- summary ----------
@@ -916,7 +981,7 @@ async function renderPrediction(kind, id, name) {
     return;
   }
   const label = game?.name || name || `BGG game ${id}`;
-  const back = predictBack || (game ? `#/g/${game.id}` : "#/add");
+  const back = predictBack || (game ? `#/g/${game.id}` : "#/discover");
   const query = game ? `gameId=${game.id}` : `bggId=${id}`;
   view.innerHTML = `
     <header class="score-head">
@@ -980,49 +1045,6 @@ async function renderPrediction(kind, id, name) {
   }
 
   await load();
-}
-
-/** Every game Claude has predicted, one row each, with search and sort. */
-async function renderPredictions() {
-  view.innerHTML = `
-    <div class="toolbar">
-      <div class="toolbar-row">
-        <input type="search" id="pq" placeholder="Search predictions" value="${esc(prefs.predQ)}" aria-label="Search predictions">
-        <select id="psort" aria-label="Sort">
-          ${PRED_SORTS.map(([v, l]) => `<option value="${v}" ${prefs.predSort === v ? "selected" : ""}>${l}</option>`).join("")}
-        </select>
-      </div>
-      <p class="list-count muted" id="pcount" aria-live="polite"></p>
-    </div>
-    <ul class="list" id="preds"><li class="empty">Loading…</li></ul>`;
-  const here = location.hash;
-  let all;
-  try {
-    all = await api.get("/api/predictions/latest");
-  } catch (e) {
-    if (location.hash === here) view.querySelector("#preds").innerHTML = `<li class="empty">${esc(e.message)}</li>`;
-    return;
-  }
-  if (location.hash !== here) return;
-  const fill = () => {
-    const q = prefs.predQ.trim().toLowerCase();
-    const list = sortPredictions(all.filter((p) => !q || predName(p).toLowerCase().includes(q)), prefs.predSort);
-    view.querySelector("#pcount").textContent = `${list.length} ${list.length === 1 ? "game" : "games"}`;
-    view.querySelector("#preds").innerHTML = list.length
-      ? list.map(predRowHtml).join("")
-      : `<li class="empty">${all.length ? "No predictions match." : 'No predictions yet. Search for a game in <a href="#/add">Add</a> and tap Predict.'}</li>`;
-  };
-  fill();
-  view.querySelector("#pq").addEventListener("input", (e) => {
-    prefs.predQ = e.target.value;
-    savePrefs();
-    fill();
-  });
-  view.querySelector("#psort").addEventListener("change", (e) => {
-    prefs.predSort = e.target.value;
-    savePrefs();
-    fill();
-  });
 }
 
 const PRED_SORTS = [["recent", "Recent"], ["score", "Score"], ["name", "Name"]];
@@ -1174,6 +1196,52 @@ async function bindClaudeSettings() {
     box.textContent = err.message;
   }
 }
+
+// ---------- more sheet ----------
+
+const moreSheet = document.getElementById("more");
+const moreBtn = document.querySelector(".tabs .more");
+
+function openMore() {
+  const sync = document.getElementById("more-sync");
+  sync.hidden = !state.bgg.configured || !state.bgg.username;
+  moreSheet.hidden = false;
+  moreBtn.setAttribute("aria-expanded", "true");
+  moreSheet.querySelector(".sheet-row").focus();
+}
+function closeMore() {
+  if (moreSheet.hidden) return;
+  moreSheet.hidden = true;
+  moreBtn.setAttribute("aria-expanded", "false");
+}
+moreBtn.addEventListener("click", () => (moreSheet.hidden ? openMore() : closeMore()));
+moreSheet.querySelector("[data-close]").addEventListener("click", () => {
+  closeMore();
+  moreBtn.focus();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !moreSheet.hidden) {
+    closeMore();
+    moreBtn.focus();
+  }
+});
+// Tapping the row for the screen you're already on doesn't fire hashchange.
+moreSheet.querySelectorAll("a.sheet-row").forEach((a) => a.addEventListener("click", closeMore));
+document.getElementById("more-copy").addEventListener("click", () => {
+  closeMore();
+  copyForClaude();
+});
+// Settings polls the running sync and shows its progress.
+document.getElementById("more-sync").addEventListener("click", async () => {
+  closeMore();
+  try {
+    await api.post("/api/bgg/sync", {});
+    if (location.hash.startsWith("#/settings")) route();
+    else location.hash = "#/settings";
+  } catch (err) {
+    toast(err.message, 5000);
+  }
+});
 
 // ---------- boot ----------
 
