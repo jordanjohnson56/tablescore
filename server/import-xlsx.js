@@ -2,32 +2,32 @@
 // Usage: npm run import-xlsx -- "/path/to/Game Rating Rubric v2.xlsx" [--overwrite]
 // Games already in the database are skipped unless --overwrite is given, in which
 // case their scores, flags, notes and old rating are replaced from the sheet.
-import ExcelJS from "exceljs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { openDb } from "./db.js";
 import { checkFile } from "./files.js";
 import { CRITERIA } from "../public/js/rubric.js";
+import { readXlsx } from "./xlsx.js";
 
 const WEIGHT_KEYS = { Desire: "desire", Table: "table", Depth: "depth", Interaction: "interaction", Replay: "replay", Art: "art", Theme: "theme" };
 
 export async function readWorkbook(file) {
   checkFile(file, "a spreadsheet");
-  const wb = new ExcelJS.Workbook();
-  await wb.xlsx.readFile(file);
+  const wb = readXlsx(readFileSync(file));
 
-  const ws = wb.getWorksheet("Scores");
+  const ws = wb.get("Scores");
   if (!ws) throw new Error('No "Scores" tab in that workbook');
   const header = {};
-  ws.getRow(1).eachCell((cell, col) => (header[String(cell.value).trim()] = col));
+  (ws[1] ?? []).forEach((value, col) => value !== null && (header[String(value).trim()] = col));
   const need = ["Game", "BGG ID", ...CRITERIA.map((c) => c.name)];
   const missing = need.filter((h) => !header[h]);
   if (missing.length) throw new Error(`Scores tab is missing columns: ${missing.join(", ")}`);
 
   const games = [];
-  ws.eachRow((row, i) => {
+  ws.forEach((row, i) => {
     if (i === 1) return;
-    const v = (h) => (header[h] ? cellValue(row.getCell(header[h]).value) : null);
+    const v = (h) => (header[h] ? (row[header[h]] ?? null) : null);
     const name = v("Game");
     if (!name) return;
     games.push({
@@ -47,14 +47,15 @@ export async function readWorkbook(file) {
   });
 
   let settings = null;
-  const w = wb.getWorksheet("Weights");
+  const w = wb.get("Weights");
   if (w) {
+    const cell = (r, c) => w[r]?.[c] ?? null;
     const weights = {};
     for (let r = 4; r <= 10; r++) {
-      const key = WEIGHT_KEYS[cellValue(w.getCell(r, 1).value)];
-      if (key) weights[key] = num(cellValue(w.getCell(r, 3).value));
+      const key = WEIGHT_KEYS[cell(r, 1)];
+      if (key) weights[key] = num(cell(r, 3));
     }
-    const stretch = num(cellValue(w.getCell("C14").value));
+    const stretch = num(cell(14, 3));
     if (CRITERIA.every((c) => typeof weights[c.key] === "number") && stretch) settings = { weights, stretch };
   }
   return { games, settings };
@@ -82,15 +83,6 @@ export function importInto(store, { games, settings }, { overwrite = false } = {
     }
   });
   return { added, replaced, skipped, settings: !!settings };
-}
-
-function cellValue(v) {
-  if (v && typeof v === "object") {
-    if ("result" in v) return v.result; // formula cell
-    if ("richText" in v) return v.richText.map((t) => t.text).join("");
-    if ("text" in v) return v.text; // hyperlink
-  }
-  return v;
 }
 
 function num(v) {
