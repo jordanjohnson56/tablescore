@@ -170,6 +170,8 @@ export function createApp({ store, bgg, bggUsername, predictor = new Predictor()
 
   app.get("/api/predictions/accuracy", (req, res) => res.json(store.predictionAccuracy()));
 
+  app.get("/api/predictions/latest", (req, res) => res.json(store.latestPredictions()));
+
   app.get("/api/predictions/:id", (req, res) => {
     const p = store.getPrediction(Number(req.params.id));
     if (!p) throw new HttpError(404, "prediction not found");

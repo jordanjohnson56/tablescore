@@ -316,6 +316,36 @@ export class Store {
   }
 
   /**
+   * One prediction per game, for the predictions screen: the latest finished
+   * one, or the latest of any status when none finished. A game in the list
+   * gathers predictions made for it and for its BGG ID, and its gameId is set
+   * even when the prediction was made from search. `count` is every attempt;
+   * `running` says a newer one is under way.
+   */
+  latestPredictions() {
+    const settings = this.getSettings();
+    const ids = new Set();
+    const byBgg = new Map();
+    for (const r of this.db.prepare("SELECT id, bgg_id FROM games").all()) {
+      ids.add(r.id);
+      if (r.bgg_id != null) byBgg.set(r.bgg_id, r.id);
+    }
+    const groups = new Map();
+    for (const row of this.db.prepare("SELECT * FROM predictions ORDER BY created_at DESC, id DESC").all()) {
+      // A deleted game's predictions fall back to their BGG ID.
+      const gameId = (ids.has(row.game_id) ? row.game_id : byBgg.get(row.bgg_id)) ?? null;
+      const key = gameId != null ? `g${gameId}` : row.bgg_id != null ? `b${row.bgg_id}` : `x${row.game_id}`;
+      const group = groups.get(key) || { gameId, rows: [] };
+      group.rows.push(row);
+      groups.set(key, group);
+    }
+    return [...groups.values()].map(({ gameId, rows }) => {
+      const pick = rows.find((r) => r.status === "done") || rows[0];
+      return { ...toPrediction(pick, settings), gameId, count: rows.length, running: rows[0].status === "running" };
+    });
+  }
+
+  /**
    * Predicted vs actual for every game scored in the app after a prediction:
    * the latest finished prediction made before the game's first full score.
    */

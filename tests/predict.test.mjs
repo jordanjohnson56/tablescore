@@ -368,6 +368,37 @@ test("predictions left running by a restart are marked failed", () => {
   assert.match(store.getPrediction(p.id).error, /restarted/);
 });
 
+test("latest predictions: one per game, the newest finished one, joined to the list by BGG ID", async () => {
+  const t = await startApp();
+  try {
+    const add = (sql) => t.store.db.prepare(`INSERT INTO predictions (bgg_id, game_id, name, model, status, created_at) VALUES ${sql}`).run();
+    const g = t.store.createGame({ name: "Brass: Extra", bggId: 500 });
+    const local = t.store.createGame({ name: "No BGG" });
+    // Predicted from search before it was added, then again from the game page, then a failed retry.
+    add("(500, NULL, 'Brass: Extra', 'm', 'done', '2026-01-01T00:00:00.000Z')");
+    add("(500, " + g.id + ", 'Brass: Extra', 'm', 'done', '2026-01-02T00:00:00.000Z')");
+    add("(500, " + g.id + ", 'Brass: Extra', 'm', 'failed', '2026-01-03T00:00:00.000Z')");
+    add("(600, NULL, 'Only failed', 'm', 'failed', '2026-01-04T00:00:00.000Z')");
+    add("(NULL, " + local.id + ", 'No BGG', 'm', 'running', '2026-01-05T00:00:00.000Z')");
+    // A deleted game with no BGG ID keeps its own row.
+    add("(NULL, 999, 'Gone', 'm', 'done', '2026-01-06T00:00:00.000Z')");
+
+    const { status, body } = await t.call("GET", "/api/predictions/latest");
+    assert.equal(status, 200);
+    const by = Object.fromEntries(body.map((p) => [p.name, p]));
+    assert.equal(body.length, 4);
+    assert.equal(by["Brass: Extra"].createdAt, "2026-01-02T00:00:00.000Z");
+    assert.equal(by["Brass: Extra"].gameId, g.id);
+    assert.equal(by["Brass: Extra"].count, 3);
+    assert.equal(by["Only failed"].status, "failed");
+    assert.equal(by["Only failed"].gameId, null);
+    assert.equal(by["No BGG"].running, true);
+    assert.equal(by["Gone"].gameId, null);
+  } finally {
+    t.close();
+  }
+});
+
 test("the taste profile is a setting with a length limit", async () => {
   const t = await startApp();
   try {
