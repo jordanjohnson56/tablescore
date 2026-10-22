@@ -8,6 +8,8 @@ final = 5 + (weighted average − 5) × stretch, clamped to 0–10, one decimal
 
 The default weights (Desire 40, Table Appeal 15, Depth 10, Interaction 10, Replayability 10, Art 10, Theme 5) and the stretch factor (1.25) are editable under Settings.
 
+On a phone the bottom bar has **Games**, **Watchlist**, **Discover** (search BGG, add games, Claude predictions) and **More**, which holds **Summary**, **Settings** and shortcuts to Sync from BGG and Copy scores for Claude. On a wide screen a sidebar lists every screen.
+
 It runs as a small self-hosted server: Node 22 with its built-in SQLite and a plain HTML/JS front end. It's meant to be reached privately over Tailscale. This repo is code only. Your games, scores and BGG token stay on your machine in `data/` and `.env`, and both are git-ignored.
 
 ## Run it (Docker)
@@ -59,7 +61,7 @@ BGG's XML API needs a registered application token, sent as `Authorization: Bear
 
 Tablescore can ask Claude to predict your score for a game you haven't scored. Set `ANTHROPIC_API_KEY` in `.env` (from console.anthropic.com; usage is billed to that account, and Max plans include monthly API credits). Without a key the feature is off.
 
-**Add → search** shows **Predict** next to each BGG result, and an unscored game's page has a **Predict my score** button. The prediction page shows each criterion, the rationale, a note on two-player play and the sources, with **Add to list** and **Add to watchlist** for a game that isn't in your list yet. The **Predicted** tab lists every game Claude has predicted, one row each (its latest finished prediction), newest first; sort it by predicted score or name, or search by name. Write your **taste profile** under **Settings → Claude predictions**; the same card shows how far off past predictions were once you've scored those games.
+**Discover** search shows **Predict** next to each BGG result, and an unscored game's page has a **Predict my score** button. The prediction page shows each criterion, the rationale, a note on two-player play and the sources, with **Add to list** and **Add to watchlist** for a game that isn't in your list yet. With the search box empty, **Discover** lists every game Claude has predicted, one row each (its latest finished prediction), newest first; sort it by predicted score or name. Typing filters that list and searches BGG below it. Write your **taste profile** under **Settings → Claude predictions**; the same card shows how far off past predictions were once you've scored those games.
 
 - Claude sees the rubric (criteria, bands, weights, stretch), your **taste profile** (free text under Settings), every game you've scored with its seven criterion scores, plays, BGG weight and player counts, and your old ratings for games not yet rescored, labeled as the weaker signal they are. Watched games and the game being predicted are left out.
 - For the game itself it gets BGG's details (description, mechanics, categories, designers, and the base game for an expansion, with your score for it if you have one), plus up to 5 web searches. A game with no BGG ID is predicted from its name and the web.
@@ -70,7 +72,7 @@ Tablescore can ask Claude to predict your score for a game you haven't scored. S
 
 ## Watchlist
 
-The **Watchlist** tab follows crowdfunded games you aren't backing, so you can wait for delivery and reviews before buying a used copy. Mark a game as Watching with **Watch instead of score** on Add, or from the Watch section of any game's page. Each watched game has a campaign URL, platform, campaign end date, estimated delivery month, a **predicted score** (kept apart from real rubric scores) and a **target price**.
+The **Watchlist** tab follows crowdfunded games you aren't backing, so you can wait for delivery and reviews before buying a used copy. Mark a game as Watching with **Watch instead of score** on Discover, or from the Watch section of any game's page. Each watched game has a campaign URL, platform, campaign end date, estimated delivery month, a **predicted score** (kept apart from real rubric scores) and a **target price**.
 
 A watched game moves through these **watch stages**, only when you change them: Campaign live → Awaiting delivery → Delivered → Reviews out → Buy or Pass. Buy and Pass are **Decided** and sit in a collapsed section. The watch stage is separate from status, so a BGG sync never touches it.
 
