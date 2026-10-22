@@ -4,12 +4,13 @@ import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import ExcelJS from "exceljs";
+import { strToU8, zipSync } from "fflate";
 import { openDb } from "../server/db.js";
 import { BggClient } from "../server/bgg.js";
 import { createApp } from "../server/app.js";
 import { syncCollection } from "../server/sync.js";
 import { readWorkbook, importInto } from "../server/import-xlsx.js";
+import { readXlsx } from "../server/xlsx.js";
 import { watchlistExport, writeWatchlist } from "../server/export-watchlist.js";
 import { importWatchlist, readWatchlistFile } from "../server/import-watchlist.js";
 
@@ -365,27 +366,60 @@ test("BGG endpoints explain a missing token", async () => {
 
 // ---------- import + backups ----------
 
+// Builds a minimal .xlsx. sheets: { name: { "A1": value } }. Strings go to the
+// shared-string table; { f, v } is a formula with a cached result; { rich: [...] }
+// is a rich-text inline string; { xml } is a raw <c> body for odd cases.
+function makeXlsx(sheets) {
+  const shared = [];
+  const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  const cellXml = (ref, v) => {
+    if (typeof v === "number") return `<c r="${ref}"><v>${v}</v></c>`;
+    if (typeof v === "boolean") return `<c r="${ref}" t="b"><v>${v ? 1 : 0}</v></c>`;
+    if (typeof v === "string") return `<c r="${ref}" t="s"><v>${shared.push(v) - 1}</v></c>`;
+    if (v.rich) return `<c r="${ref}" t="inlineStr"><is>${v.rich.map((t) => `<r><t xml:space="preserve">${esc(t)}</t></r>`).join("")}</is></c>`;
+    if (v.f) return `<c r="${ref}"${typeof v.v === "string" ? ' t="str"' : ""}><f>${esc(v.f)}</f><v>${esc(v.v)}</v></c>`;
+    return v.xml;
+  };
+  const files = {};
+  const names = Object.keys(sheets);
+  names.forEach((name, i) => {
+    const rows = {};
+    for (const [ref, v] of Object.entries(sheets[name])) (rows[ref.match(/\d+/)[0]] ??= []).push(cellXml(ref, v));
+    const body = Object.entries(rows).sort((a, b) => a[0] - b[0]).map(([r, cs]) => `<row r="${r}">${cs.join("")}</row>`);
+    files[`xl/worksheets/sheet${i + 1}.xml`] = `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${body.join("")}</sheetData></worksheet>`;
+  });
+  const ns = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"';
+  files["xl/workbook.xml"] = `<workbook ${ns}><sheets>${names.map((n, i) => `<sheet name="${esc(n)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join("")}</sheets></workbook>`;
+  const rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+  files["xl/_rels/workbook.xml.rels"] = `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${names
+    .map((_, i) => `<Relationship Id="rId${i + 1}" Type="${rel}/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`)
+    .join("")}<Relationship Id="rIdS" Type="${rel}/sharedStrings" Target="sharedStrings.xml"/></Relationships>`;
+  files["xl/sharedStrings.xml"] = `<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">${shared.map((t) => `<si><t>${esc(t)}</t></si>`).join("")}</sst>`;
+  return Buffer.from(zipSync(Object.fromEntries(Object.entries(files).map(([k, v]) => [k, strToU8(v)]))));
+}
+
+const col = (n) => (n > 26 ? col(Math.floor((n - 1) / 26)) : "") + String.fromCharCode(65 + ((n - 1) % 26));
+const sheetFromRows = (rows) =>
+  Object.fromEntries(rows.flatMap((row, r) => row.map((v, c) => [`${col(c + 1)}${r + 1}`, v]).filter(([, v]) => v !== null && v !== undefined)));
+
 test("imports the spreadsheet layout, skipping games already present", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ts-"));
   const file = join(dir, "rubric.xlsx");
-  const wb = new ExcelJS.Workbook();
-  const s = wb.addWorksheet("Scores");
-  s.addRow(["Game", "BGG ID", "Type", "Status in collection", "Plays", "Old Rating", "BGG Avg", "Calibration",
+  const scores = [
+    ["Game", "BGG ID", "Type", "Status in collection", "Plays", "Old Rating", "BGG Avg", "Calibration",
     "Desire to Play", "Table Appeal", "Decision Depth & Tension", "Interaction Quality",
     "Replayability & Strategic Variety", "Art & Production", "Theme & Narrative", "Avoid Theme?", "Raw Average", "New Score",
-    "Change vs Old", "Provisional", "Rescore Status", "Notes"]);
-  s.addRow(["Alpha", 1, "Base", "Owned", 5, 8, 7.5, "Yes", 8, 7, 6, 5, 4, 3, 2, "Yes", { formula: "1+1", result: 2 }, null, null, null, null, "note"]);
-  s.addRow(["Beta", 2, "Expansion", null, 0, null, 7, null]);
-  s.addRow([]);
-  const w = wb.addWorksheet("Weights");
-  const keys = ["Desire", "Table", "Depth", "Interaction", "Replay", "Art", "Theme"];
-  const vals = [30, 20, 10, 10, 10, 10, 10];
-  keys.forEach((k, i) => {
-    w.getCell(4 + i, 1).value = k;
-    w.getCell(4 + i, 3).value = vals[i];
+    "Change vs Old", "Provisional", "Rescore Status", "Notes"],
+    ["Alpha", 1, "Base", "Owned", 5, 8, 7.5, "Yes", 8, 7, 6, 5, 4, 3, 2, "Yes", { f: "1+1", v: 2 }, null, null, null, null, { rich: ["no", "te"] }],
+    ["Beta", 2, "Expansion", null, 0, null, 7, null],
+    [],
+  ];
+  const weights = { C14: 1.5 };
+  ["Desire", "Table", "Depth", "Interaction", "Replay", "Art", "Theme"].forEach((k, i) => {
+    weights[`A${4 + i}`] = k;
+    weights[`C${4 + i}`] = [30, 20, 10, 10, 10, 10, 10][i];
   });
-  w.getCell("C14").value = 1.5;
-  await wb.xlsx.writeFile(file);
+  writeFileSync(file, makeXlsx({ Scores: sheetFromRows(scores), Weights: weights }));
 
   const store = openDb(":memory:");
   const parsed = await readWorkbook(file);
@@ -421,10 +455,33 @@ test("backups keep only the newest N daily files", () => {
   assert.equal(copy.listGames()[0].name, "A");
 });
 
-test("import explains a folder or missing path instead of crashing", async () => {
+test("import explains a folder, missing path or non-xlsx file instead of crashing", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ts-imp-"));
   await assert.rejects(readWorkbook(dir), /is a folder, not a spreadsheet/);
   await assert.rejects(readWorkbook(join(dir, "nope.xlsx")), /No file at/);
+  writeFileSync(join(dir, "junk.xlsx"), "not a zip");
+  await assert.rejects(readWorkbook(join(dir, "junk.xlsx")), /not a valid \.xlsx/);
+  writeFileSync(join(dir, "other.xlsx"), makeXlsx({ Sheet1: { A1: "x" } }));
+  await assert.rejects(readWorkbook(join(dir, "other.xlsx")), /No "Scores" tab/);
+});
+
+test("xlsx reader handles cell types, entities and cells without refs", () => {
+  const rows = readXlsx(
+    makeXlsx({
+      S: {
+        A1: "Fish & <Chips>",
+        B1: true,
+        C1: { f: 'A1&"!"', v: "Fish!" },
+        D1: { xml: '<c r="D1" t="e"><v>#N/A</v></c>' },
+        E1: { xml: '<c r="E1"/>' },
+        AA2: 3.25,
+        A3: { xml: '<c><v>7</v></c><c t="inlineStr"><is><t>plain</t></is></c>' },
+      },
+    }),
+  ).get("S");
+  assert.deepEqual(rows[1].slice(1), ["Fish & <Chips>", true, "Fish!", "#N/A", null]);
+  assert.equal(rows[2][27], 3.25);
+  assert.deepEqual(rows[3].slice(1), [7, "plain"]);
 });
 
 test("includeWatching setting persists and is validated", async () => {
