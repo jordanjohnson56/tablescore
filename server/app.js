@@ -170,6 +170,26 @@ export function createApp({ store, bgg, bggUsername, predictor = new Predictor()
 
   app.get("/api/predictions/accuracy", (req, res) => res.json(store.predictionAccuracy()));
 
+  app.get("/api/predictions/latest", async (req, res) => {
+    await backfillThumbnails();
+    res.json(store.latestPredictions());
+  });
+
+  // Predictions made before thumbnails were stored get BGG's, once per BGG ID
+  // per run of the server, so a BGG outage doesn't slow every visit.
+  const thumbTried = new Set();
+  async function backfillThumbnails() {
+    if (!bgg.configured) return;
+    const ids = store.predictionBggIdsWithoutThumbnail().filter((id) => !thumbTried.has(id));
+    if (!ids.length) return;
+    ids.forEach((id) => thumbTried.add(id));
+    try {
+      for (const t of await bgg.things(ids)) if (t.thumbnail) store.setPredictionThumbnail(t.bggId, t.thumbnail);
+    } catch (e) {
+      console.error("BGG thumbnails for predictions failed:", e.message);
+    }
+  }
+
   app.get("/api/predictions/:id", (req, res) => {
     const p = store.getPrediction(Number(req.params.id));
     if (!p) throw new HttpError(404, "prediction not found");
@@ -214,7 +234,9 @@ export function createApp({ store, bgg, bggUsername, predictor = new Predictor()
       system: system.text,
       target: buildTarget({ name: target.name, details, games, settings }),
     });
-    const done = store.finishPrediction(id, { ...result, name: details?.name || target.name, scoredGames: system.scoredGames });
+    const done = store.finishPrediction(id, {
+      ...result, name: details?.name || target.name, thumbnail: details?.thumbnail, scoredGames: system.scoredGames,
+    });
     // A watched game in the list takes the prediction only if its own is empty.
     const game = target.gameId ? store.getGame(target.gameId) : target.bggId ? store.getByBggId(target.bggId) : null;
     if (game?.watchStage && game.predictedScore == null && done.final != null) {

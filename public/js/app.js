@@ -10,6 +10,7 @@ import { api } from "./api.js";
 
 const view = document.getElementById("view");
 let state = { settings: null, games: [], bgg: { configured: false }, claude: { configured: false } };
+const DEFAULT_PREFS = { filter: "all", sort: "score", q: "", predSort: "recent", predQ: "" };
 const prefs = loadPrefs();
 
 // ---------- helpers ----------
@@ -22,9 +23,9 @@ const shownGames = () => visibleGames(state.games, state.settings);
 
 function loadPrefs() {
   try {
-    return { filter: "all", sort: "score", q: "", ...JSON.parse(localStorage.getItem("tablescore.prefs") || "{}") };
+    return { ...DEFAULT_PREFS, ...JSON.parse(localStorage.getItem("tablescore.prefs") || "{}") };
   } catch {
-    return { filter: "all", sort: "score", q: "" };
+    return { ...DEFAULT_PREFS };
   }
 }
 function savePrefs() {
@@ -112,11 +113,12 @@ window.addEventListener("pagehide", () => {
 // ---------- router ----------
 
 // Each tab's renderer, matched by hash prefix; anything else is the games list.
-const TABS = { watchlist: renderWatchlist, add: renderAdd, summary: renderSummary, settings: renderSettings, games: renderList };
+const TABS = { watchlist: renderWatchlist, predictions: renderPredictions, add: renderAdd, summary: renderSummary, settings: renderSettings, games: renderList };
 
 function route() {
   const hash = location.hash || "#/";
-  const tab = Object.keys(TABS).find((t) => hash.startsWith(`#/${t}`)) || "games";
+  // A prediction page sits under Predictions, wherever it was opened from.
+  const tab = hash.startsWith("#/predict/") ? "predictions" : Object.keys(TABS).find((t) => hash.startsWith(`#/${t}`)) || "games";
   document.querySelectorAll(".tabs a").forEach((a) => {
     if (a.dataset.tab === tab) a.setAttribute("aria-current", "page");
     else a.removeAttribute("aria-current");
@@ -127,7 +129,9 @@ function route() {
   if (p) return renderPrediction(p[1], Number(p[2]), p[3] ? decodeURIComponent(p[3]) : "");
   return TABS[tab]();
 }
-window.addEventListener("hashchange", () => {
+window.addEventListener("hashchange", (e) => {
+  // A prediction page opened from the predictions screen goes back there.
+  if (location.hash.startsWith("#/predict/")) predictBack = new URL(e.oldURL).hash.startsWith("#/predictions") ? "#/predictions" : null;
   route();
   window.scrollTo(0, 0);
 });
@@ -902,6 +906,7 @@ function predictHref(g, bggId, name) {
 
 /** The prediction page for a game in the list or a BGG game that isn't. */
 let predictPoll;
+let predictBack = null;
 async function renderPrediction(kind, id, name) {
   clearTimeout(predictPoll);
   const game = kind === "game" ? byId(id) : state.games.find((g) => g.bggId === id);
@@ -911,7 +916,7 @@ async function renderPrediction(kind, id, name) {
     return;
   }
   const label = game?.name || name || `BGG game ${id}`;
-  const back = game ? `#/g/${game.id}` : "#/add";
+  const back = predictBack || (game ? `#/g/${game.id}` : "#/add");
   const query = game ? `gameId=${game.id}` : `bggId=${id}`;
   view.innerHTML = `
     <header class="score-head">
@@ -975,6 +980,92 @@ async function renderPrediction(kind, id, name) {
   }
 
   await load();
+}
+
+/** Every game Claude has predicted, one row each, with search and sort. */
+async function renderPredictions() {
+  view.innerHTML = `
+    <div class="toolbar">
+      <div class="toolbar-row">
+        <input type="search" id="pq" placeholder="Search predictions" value="${esc(prefs.predQ)}" aria-label="Search predictions">
+        <select id="psort" aria-label="Sort">
+          ${PRED_SORTS.map(([v, l]) => `<option value="${v}" ${prefs.predSort === v ? "selected" : ""}>${l}</option>`).join("")}
+        </select>
+      </div>
+      <p class="list-count muted" id="pcount" aria-live="polite"></p>
+    </div>
+    <ul class="list" id="preds"><li class="empty">Loading…</li></ul>`;
+  const here = location.hash;
+  let all;
+  try {
+    all = await api.get("/api/predictions/latest");
+  } catch (e) {
+    if (location.hash === here) view.querySelector("#preds").innerHTML = `<li class="empty">${esc(e.message)}</li>`;
+    return;
+  }
+  if (location.hash !== here) return;
+  const fill = () => {
+    const q = prefs.predQ.trim().toLowerCase();
+    const list = sortPredictions(all.filter((p) => !q || predName(p).toLowerCase().includes(q)), prefs.predSort);
+    view.querySelector("#pcount").textContent = `${list.length} ${list.length === 1 ? "game" : "games"}`;
+    view.querySelector("#preds").innerHTML = list.length
+      ? list.map(predRowHtml).join("")
+      : `<li class="empty">${all.length ? "No predictions match." : 'No predictions yet. Search for a game in <a href="#/add">Add</a> and tap Predict.'}</li>`;
+  };
+  fill();
+  view.querySelector("#pq").addEventListener("input", (e) => {
+    prefs.predQ = e.target.value;
+    savePrefs();
+    fill();
+  });
+  view.querySelector("#psort").addEventListener("change", (e) => {
+    prefs.predSort = e.target.value;
+    savePrefs();
+    fill();
+  });
+}
+
+const PRED_SORTS = [["recent", "Recent"], ["score", "Score"], ["name", "Name"]];
+
+/** The list's name for the game, which can be renamed after the prediction. */
+const predName = (p) => (p.gameId && byId(p.gameId)?.name) || p.name;
+
+function sortPredictions(list, sort) {
+  const byName = (a, b) => predName(a).localeCompare(predName(b));
+  const sorters = {
+    recent: (a, b) => b.createdAt.localeCompare(a.createdAt) || b.id - a.id,
+    score: (a, b) => (b.final ?? -1) - (a.final ?? -1) || byName(a, b),
+    name: byName,
+  };
+  return list.sort(sorters[sort] || sorters.recent);
+}
+
+function predRowHtml(p) {
+  const g = p.gameId ? byId(p.gameId) : null;
+  const mine = g ? final(g) : null;
+  const avoid = p.avoidTheme || g?.avoidTheme;
+  const tags = [
+    p.running ? `<span class="tag">Running</span>` : "",
+    p.status === "failed" ? `<span class="tag warn">Failed</span>` : "",
+    avoid ? `<span class="tag danger">Avoid</span>` : "",
+  ].join("");
+  const details = [
+    mine != null ? `you scored ${formatNumber(mine)}` : "",
+    dateLabel(p.createdAt),
+    p.count > 1 ? `${p.count} predictions` : "",
+    p.status === "done" ? `${p.confidence} confidence` : "",
+  ].filter(Boolean).join(" · ");
+  const badge = p.status === "done"
+    ? `<div class="num predicted">${formatNumber(p.final)}</div><div class="lbl">predicted</div>`
+    : `<div class="num old">—</div>`;
+  // A game in the list may have no photo yet; the prediction keeps BGG's.
+  const inner = `${thumbHtml({ thumbnail: g?.thumbnail || p.thumbnail })}
+    <div class="info"><div class="name">${esc(predName(p))}</div>
+      <div class="meta">${tags ? `<span class="tags">${tags}</span>` : ""}<span class="details">${tags ? "· " : ""}${esc(details)}</span></div></div>
+    <div class="score-badge">${badge}</div>`;
+  // A game deleted from the list with no BGG ID has no prediction page left.
+  const href = g || p.bggId ? predictHref(g, p.bggId, p.name) : null;
+  return `<li class="${avoid ? "avoid" : ""}">${href ? `<a class="game-row" href="${href}">${inner}</a>` : `<div class="game-row">${inner}</div>`}</li>`;
 }
 
 async function addPredicted(b, bggId) {
