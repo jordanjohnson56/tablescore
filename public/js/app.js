@@ -1201,30 +1201,90 @@ async function bindClaudeSettings() {
 
 const moreSheet = document.getElementById("more");
 const moreBtn = document.querySelector(".tabs .more");
+const sheet = moreSheet.querySelector(".sheet");
+const scrim = moreSheet.querySelector(".scrim");
+const SHEET_MS = 220; // matches the .sheet-wrap transitions in app.css
+let moreOpen = false;
+let hideTimer;
 
 function openMore() {
   const sync = document.getElementById("more-sync");
   sync.hidden = !state.bgg.configured || !state.bgg.username;
+  clearTimeout(hideTimer);
+  moreOpen = true;
   moreSheet.hidden = false;
+  void sheet.offsetHeight; // start the slide from the closed position
+  moreSheet.classList.add("open");
   moreBtn.setAttribute("aria-expanded", "true");
-  moreSheet.querySelector(".sheet-row").focus();
+  moreSheet.querySelector(".sheet-row").focus({ preventScroll: true });
 }
 function closeMore() {
-  if (moreSheet.hidden) return;
-  moreSheet.hidden = true;
+  if (!moreOpen) return;
+  moreOpen = false;
+  // Clearing a drag offset lets the slide carry on from where the finger let go.
+  sheet.style.transform = scrim.style.opacity = "";
+  moreSheet.classList.remove("open");
   moreBtn.setAttribute("aria-expanded", "false");
+  hideTimer = setTimeout(() => (moreSheet.hidden = true), SHEET_MS);
 }
-moreBtn.addEventListener("click", () => (moreSheet.hidden ? openMore() : closeMore()));
-moreSheet.querySelector("[data-close]").addEventListener("click", () => {
+moreBtn.addEventListener("click", () => (moreOpen ? closeMore() : openMore()));
+scrim.addEventListener("click", () => {
   closeMore();
   moreBtn.focus();
 });
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && !moreSheet.hidden) {
+  if (e.key === "Escape" && moreOpen) {
     closeMore();
     moreBtn.focus();
   }
 });
+
+// Drag the sheet down to close it. A short drag or a slow one snaps back.
+let drag = null;
+sheet.addEventListener("pointerdown", (e) => {
+  if (!moreOpen || (e.pointerType === "mouse" && e.button !== 0)) return;
+  drag = { id: e.pointerId, y0: e.clientY, dy: 0, t: e.timeStamp, v: 0, moved: false };
+});
+sheet.addEventListener("pointermove", (e) => {
+  if (!drag || e.pointerId !== drag.id) return;
+  const dy = Math.max(0, e.clientY - drag.y0);
+  if (!drag.moved) {
+    if (dy < 6) return;
+    drag.moved = true;
+    sheet.setPointerCapture(e.pointerId);
+    moreSheet.classList.add("dragging");
+  }
+  const dt = e.timeStamp - drag.t;
+  if (dt > 0) drag.v = (dy - drag.dy) / dt;
+  drag.dy = dy;
+  drag.t = e.timeStamp;
+  sheet.style.transform = `translateY(${dy}px)`;
+  scrim.style.opacity = String(Math.max(0, 1 - dy / sheet.offsetHeight));
+});
+function endDrag(e) {
+  if (!drag || e.pointerId !== drag.id) return;
+  const { moved, dy, v } = drag;
+  drag = null;
+  if (!moved) return;
+  moreSheet.classList.remove("dragging");
+  // The release was a drag, not a tap: keep it from activating the row under the finger.
+  sheet.addEventListener("click", swallowClick, { capture: true, once: true });
+  setTimeout(() => sheet.removeEventListener("click", swallowClick, true), 0);
+  if (e.type === "pointerup" && (dy > sheet.offsetHeight * 0.3 || v > 0.5)) {
+    closeMore();
+    moreBtn.focus({ preventScroll: true });
+  } else {
+    sheet.style.transform = scrim.style.opacity = "";
+  }
+}
+function swallowClick(e) {
+  e.preventDefault();
+  e.stopPropagation();
+}
+// A mouse drag on a link would start the browser's own drag and drop instead.
+sheet.addEventListener("dragstart", (e) => e.preventDefault());
+sheet.addEventListener("pointerup", endDrag);
+sheet.addEventListener("pointercancel", endDrag);
 // Tapping the row for the screen you're already on doesn't fire hashchange.
 moreSheet.querySelectorAll("a.sheet-row").forEach((a) => a.addEventListener("click", closeMore));
 document.getElementById("more-copy").addEventListener("click", () => {
