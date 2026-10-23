@@ -82,6 +82,18 @@ export class BggClient {
     return it ? { ...parseThing(it), ...parseExtras(it) } : null;
   }
 
+  /** BGG's current Hotness list (about 50 games), in rank order. */
+  async hot() {
+    const doc = await this.get("hot", { type: "boardgame" });
+    return (doc.items?.item || []).map((it) => ({
+      bggId: Number(it.id),
+      rank: num(it.rank),
+      name: primaryName(it.name),
+      year: num(it.yearpublished?.value),
+      thumbnail: it.thumbnail?.value || null,
+    }));
+  }
+
   /** The user's whole collection: base games and expansions (two requests). */
   async collection(username) {
     const base = await this.get("collection", { username, stats: "1", excludesubtype: "boardgameexpansion" });
