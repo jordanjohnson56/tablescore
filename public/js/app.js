@@ -1,5 +1,5 @@
 import {
-  CRITERIA, BAND_LABELS, bandIndex, finalScore, formatNumber, rawAverage, scaleEntry, scoredCount,
+  CRITERIA, BAND_LABELS, RECOMMEND_FREQUENCIES, bandIndex, finalScore, formatNumber, rawAverage, scaleEntry, scoredCount,
   rescoreStatus, isProvisional, weightTotal,
 } from "./rubric.js";
 import {
@@ -642,6 +642,11 @@ async function renderDiscover() {
       <label class="toggle"><input type="checkbox" id="mwatch"> Watch instead of score</label>
     </div>
     ${bggOn ? "" : `<p class="notice">BGG search is off because the server has no BGG_TOKEN. You can still add games by name.</p>`}
+    <section id="recsec" ${recommendationsOn() ? "" : "hidden"}>
+      <div class="sec-head"><h2>Recommended for you</h2><button class="btn small-btn" id="rec-refresh" type="button">Refresh</button></div>
+      <p class="small muted" id="rec-when"></p>
+      <ul class="list" id="recs"><li class="empty">Loading…</li></ul>
+    </section>
     <section id="predsec">
       <div class="sec-head"><h2 id="phead"></h2>
         <select id="psort" aria-label="Sort predictions">
@@ -685,6 +690,8 @@ async function renderDiscover() {
     // While BGG results are showing, an empty predictions section is just noise.
     view.querySelector("#predsec").hidden = searching && matches?.length === 0;
     view.querySelector("#bggsec").hidden = !searching;
+    // Searching is for finding one game; the recommendations wait until the box is empty.
+    view.querySelector("#recsec").hidden = !recommendationsOn() || !!q;
   };
 
   let timer;
@@ -761,12 +768,106 @@ async function renderDiscover() {
 
   fill();
   searchBgg();
+  bindRecommendations(view.querySelector("#recsec"));
   try {
     all = await api.get("/api/predictions/latest");
   } catch (e) {
     loadError = e.message;
   }
   if (location.hash === here) fill();
+}
+
+// ---------- recommendations ----------
+
+const recommendationsOn = () => state.claude.configured && state.bgg.configured;
+let recPoll;
+
+/** Loads the picks into a Discover section (or a Settings card) and keeps them fresh while a run is going. */
+async function bindRecommendations(sec, { onChange } = {}) {
+  clearInterval(recPoll);
+  const list = sec.querySelector("#recs");
+  const when = sec.querySelector("#rec-when");
+  const refresh = sec.querySelector("#rec-refresh");
+  let data = null;
+
+  const draw = () => {
+    if (!view.contains(sec)) return clearInterval(recPoll);
+    const running = data?.running;
+    refresh.disabled = !!running;
+    refresh.dataset.label ??= refresh.textContent;
+    refresh.textContent = running ? "Refreshing…" : refresh.dataset.label;
+    when.innerHTML = data ? recWhenHtml(data) : "";
+    list.innerHTML = !data
+      ? `<li class="empty">Loading…</li>`
+      : data.picks.length
+        ? data.picks.map(recRowHtml).join("")
+        : `<li class="empty">${running ? "Claude is picking games for you. This takes 10–20 minutes." : data.run ? "Nothing left from the last refresh. Refresh for a new set." : "No recommendations yet. Tap Refresh, or wait for the scheduled run."}</li>`;
+    onChange?.(data);
+  };
+  const load = async () => {
+    try {
+      data = await api.get("/api/recommendations");
+    } catch (err) {
+      if (!data) list.innerHTML = `<li class="empty">${esc(err.message)}</li>`;
+      return;
+    }
+    draw();
+    if (data.running && !recPoll) recPoll = setInterval(load, 15000);
+    if (!data.running) {
+      clearInterval(recPoll);
+      recPoll = null;
+    }
+  };
+
+  refresh.addEventListener("click", async () => {
+    refresh.disabled = true;
+    try {
+      data = await api.post("/api/recommendations/refresh", {});
+      draw();
+      recPoll = setInterval(load, 15000);
+    } catch (err) {
+      refresh.disabled = false;
+      toast(err.message, 5000);
+    }
+  });
+  list.addEventListener("click", async (e) => {
+    const b = e.target.closest("[data-dismiss]");
+    if (!b) return;
+    const bggId = Number(b.dataset.dismiss);
+    const pick = data.picks.find((p) => p.bggId === bggId);
+    b.disabled = true;
+    try {
+      await api.post("/api/recommendations/dismissed", { bggId, name: pick.name });
+      data.picks = data.picks.filter((p) => p.bggId !== bggId);
+      draw();
+      toast(`${pick.name} won't be recommended again. Undo under Settings.`);
+    } catch (err) {
+      b.disabled = false;
+      toast(err.message, 5000);
+    }
+  });
+  await load();
+}
+
+function recWhenHtml(d) {
+  const parts = [];
+  if (d.running) parts.push("Refreshing now");
+  else if (d.run) parts.push(`Updated ${dateLabel(d.run.finishedAt)}`);
+  if (d.lastRun?.status === "failed" && !d.running) parts.push(`<span class="tag warn">Last refresh failed</span> ${esc(d.lastRun.error || "")}`);
+  if (d.nextRunAt) parts.push(`next ${dateLabel(d.nextRunAt)}`);
+  else parts.push("scheduled runs are off");
+  return parts.join(" · ");
+}
+
+function recRowHtml(p) {
+  const details = [p.year, p.type === "Expansion" ? "expansion" : "", p.confidence ? `${p.confidence} confidence` : ""].filter(Boolean).join(" · ");
+  return `<li class="rec"><a class="game-row rec-row" href="${predictHref(null, p.bggId, p.name)}">
+    ${thumbHtml(p)}
+    <div class="info"><div class="name">${esc(p.name)}</div>
+      <div class="meta"><span class="details">${esc(details)}</span></div>
+      <div class="reason">${esc(p.reason)}</div></div>
+    <div class="score-badge">${p.final != null ? `<div class="num predicted">${formatNumber(p.final)}</div><div class="lbl">predicted</div>` : `<div class="num old">—</div>`}</div>
+  </a><div class="rec-actions"><button class="btn small-btn" type="button" data-dismiss="${p.bggId}">Not interested</button></div></li>`;
 }
 
 // ---------- summary ----------
@@ -1170,7 +1271,107 @@ function claudeSettingsHtml() {
     <div class="btn-row"><button class="btn primary" id="taste-save" type="button">Save taste profile</button></div>
     <h3>Accuracy</h3>
     <div id="accuracy" class="small muted">Loading…</div>
+  </section>
+  ${recommendSettingsHtml()}`;
+}
+
+function recommendSettingsHtml() {
+  const s = state.settings;
+  if (!state.bgg.configured) {
+    return `<section class="card"><h2 style="margin-top:0">Recommendations</h2>
+      <p class="notice">Recommendations need BGG_TOKEN as well, to look up the games Claude nominates.</p></section>`;
+  }
+  return `<section class="card" id="recsec">
+    <h2 style="margin-top:0">Recommendations</h2>
+    <p class="small muted">Claude nominates games you don't have, each gets a prediction, and the five highest show on Discover. A run is about ${s.recommendNominees} predictions' worth of tokens.</p>
+    <label class="field"><span>How often</span>
+      <select id="rec-freq">${RECOMMEND_FREQUENCIES.map((f) => `<option value="${f.key}" ${s.recommendFrequency === f.key ? "selected" : ""}>${f.label}</option>`).join("")}</select></label>
+    <label class="field"><span>Games Claude nominates per run (5–20)</span>
+      <input type="number" id="rec-count" min="5" max="20" step="1" inputmode="numeric" value="${s.recommendNominees}"></label>
+    <p class="small muted">Scheduled runs start at 4 am server time. More nominees cost more and give the top five more to choose from.</p>
+    <div class="btn-row"><button class="btn primary" id="rec-refresh" type="button">Refresh now</button></div>
+    <p class="small muted" id="rec-when"></p>
+    <ul class="list" id="recs" hidden></ul>
+    <h3>Not interested</h3>
+    <div id="rec-dismissed" class="small muted">Loading…</div>
+    <h3>Runs</h3>
+    <div id="rec-runs" class="small muted">Loading…</div>
   </section>`;
+}
+
+/** Rough cost of a run's tokens, from the model's list prices, or null for a model without one. */
+function runCost(run) {
+  const u = run.usage;
+  const price = /opus/.test(run.model) ? [4, 20] : /sonnet/.test(run.model) ? [3, 15] : /haiku/.test(run.model) ? [1, 5] : null;
+  if (!u || !price) return null;
+  const [inp, out] = price.map((x) => x / 1e6);
+  return u.input * inp + u.cacheWrite * inp * 1.25 + u.cacheRead * inp * 0.1 + u.output * out + u.searches * 0.01;
+}
+
+async function bindRecommendSettings() {
+  const sec = view.querySelector("#recsec");
+  if (!sec) return;
+  const save = async (patch, msg) => {
+    try {
+      state.settings = await api.put("/api/settings", patch);
+      toast(msg);
+      loadRuns(); // the next run time changed
+    } catch (err) {
+      toast(`Couldn't save: ${err.message}`, 5000);
+    }
+  };
+  sec.querySelector("#rec-freq").addEventListener("change", (e) => save({ recommendFrequency: e.target.value }, "Schedule saved"));
+  sec.querySelector("#rec-count").addEventListener("change", (e) => {
+    const n = Number(e.target.value);
+    if (!Number.isInteger(n) || n < 5 || n > 20) return toast("Nominees must be a whole number from 5 to 20", 4000);
+    save({ recommendNominees: n }, "Nominee count saved");
+  });
+
+  const dismissed = sec.querySelector("#rec-dismissed");
+  const drawDismissed = (rows) => {
+    dismissed.innerHTML = rows.length
+      ? `<ul class="plain">${rows.map((d) => `<li>${esc(d.name)} <span class="muted">· ${dateLabel(d.dismissedAt)}</span> <button class="btn small-btn" type="button" data-undo="${d.bggId}">Undo</button></li>`).join("")}</ul>`
+      : "Nothing dismissed. Tap Not interested on a recommendation to keep it from coming back.";
+  };
+  dismissed.addEventListener("click", async (e) => {
+    const b = e.target.closest("[data-undo]");
+    if (!b) return;
+    b.disabled = true;
+    try {
+      drawDismissed(await api.del(`/api/recommendations/dismissed/${b.dataset.undo}`));
+    } catch (err) {
+      b.disabled = false;
+      toast(err.message, 5000);
+    }
+  });
+
+  const runs = sec.querySelector("#rec-runs");
+  const loadRuns = async () => {
+    try {
+      const [rows, view] = await Promise.all([api.get("/api/recommendations/runs"), api.get("/api/recommendations")]);
+      sec.querySelector("#rec-when").innerHTML = recWhenHtml(view);
+      runs.innerHTML = rows.length
+        ? `<table><tbody>${rows.slice(0, 20).map((r) => {
+            const cost = runCost(r);
+            const shown = r.nominees.filter((n) => n.rank != null).length;
+            const what = r.status === "running" ? "running" : r.status === "failed" ? `<span class="tag warn">failed</span> ${esc(r.error || "")}` : `${shown} shown, ${r.predicted} predicted, ${r.reused} reused`;
+            return `<tr><td>${dateLabel(r.startedAt)}<br><span class="muted">${r.trigger === "manual" ? "refresh" : "scheduled"}</span></td>
+              <td>${what}</td><td class="num">${cost != null ? `≈$${cost.toFixed(2)}` : r.usage ? `${Math.round((r.usage.input + r.usage.cacheRead + r.usage.cacheWrite) / 1000)}k in` : ""}</td></tr>`;
+          }).join("")}</tbody></table>`
+        : "No runs yet.";
+    } catch (err) {
+      runs.textContent = err.message;
+    }
+  };
+
+  try {
+    drawDismissed(await api.get("/api/recommendations/dismissed"));
+  } catch (err) {
+    dismissed.textContent = err.message;
+  }
+  await loadRuns();
+  // Refresh now shares the Discover section's loader; the picks list stays hidden here.
+  bindRecommendations(sec, { onChange: (d) => d.running || loadRuns() });
 }
 
 async function bindClaudeSettings() {
@@ -1184,6 +1385,7 @@ async function bindClaudeSettings() {
       toast(err.message, 5000);
     }
   });
+  bindRecommendSettings();
   const box = view.querySelector("#accuracy");
   try {
     const acc = await api.get("/api/predictions/accuracy");
