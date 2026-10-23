@@ -304,6 +304,18 @@ ul.plain li { margin: 4px 0; overflow-wrap: anywhere; }
 
 /* Discover */
 .sec-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 20px 0 4px; }
+.btn.small-btn { min-height: 32px; padding: 4px 10px; font-size: 0.82rem; }
+.rec-row { align-items: flex-start; }
+.rec-row .thumb { width: 56px; height: 56px; }
+.rec-row .name { white-space: normal; }
+.rec-row .reason { font-size: 0.85rem; color: var(--ink-2); margin: 4px 0 6px; }
+.rec-row .score-badge { padding-top: 2px; }
+.rec-row { padding-bottom: 4px; }
+.rec-actions { display: flex; justify-content: flex-end; padding: 0 4px 10px; }
+#rec-when { margin: 0 0 6px; }
+ul.plain { list-style: none; margin: 0; padding: 0; }
+ul.plain li { display: flex; align-items: center; gap: 8px; min-height: 36px; }
+ul.plain li .btn { margin-left: auto; }
 .sec-head h2 { margin: 0; }
 .sec-head select { width: auto; min-height: 36px; padding: 4px 10px; }
 .add-name { margin: 20px 0 0; }
