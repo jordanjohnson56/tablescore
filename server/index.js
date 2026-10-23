@@ -38,6 +38,6 @@ app.listen(port, host, () => {
   console.log(`Tablescore listening on http://${host}:${port}`);
   if (!bgg.configured) console.log("BGG_TOKEN not set: BGG search and sync are disabled.");
   if (!predictor.configured) console.log("ANTHROPIC_API_KEY not set: Claude predictions are disabled.");
-  const next = app.scheduler.nextRunAt;
+  const next = bgg.configured && predictor.configured ? app.scheduler.nextRunAt : null;
   console.log(next ? `Next recommendation run: ${next.toLocaleString()} (${env.TZ || "server local time"})` : "Scheduled recommendations are off.");
 });

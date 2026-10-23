@@ -4,7 +4,7 @@ import { openDb } from "../server/db.js";
 import { BggClient } from "../server/bgg.js";
 import { createApp } from "../server/app.js";
 import { Predictor, parseNominees } from "../server/predict.js";
-import { DROP, RecommendScheduler, buildNominateSystem, buildNominateUser, matches, nextRunAt } from "../server/recommend.js";
+import { DROP, RecommendScheduler, buildNominateSystem, buildNominateUser, matchNominee, matches, nextRunAt } from "../server/recommend.js";
 import { DEFAULT_SETTINGS } from "../public/js/rubric.js";
 
 const all = (v) => ({ desire: v, table: v, depth: v, interaction: v, replay: v, art: v, theme: v });
@@ -189,12 +189,26 @@ test("parseNominees trims, drops blanks and duplicates, caps the count and rejec
   assert.throws(() => parseNominees({ nominees: [] }), /nominated no games/);
 });
 
-test("matches compares names loosely and years within one", () => {
+test("matches takes the same name, or a word prefix only when the years are known and close", () => {
   assert.ok(matches({ name: "Brass Birmingham", year: 2018 }, { name: "Brass: Birmingham", year: 2018 }));
   assert.ok(matches({ name: "Arcs", year: 2024 }, { name: "Arcs: The Blighted Reach", year: 2025 }));
   assert.ok(matches({ name: "Arcs", year: null }, { name: "Arcs", year: 2024 }));
   assert.ok(!matches({ name: "Arcs", year: 2024 }, { name: "Arcs", year: 1999 }));
   assert.ok(!matches({ name: "Root", year: 2018 }, { name: "Rootin Tootin", year: 2018 }));
+  assert.ok(!matches({ name: "Dune", year: null }, { name: "Dune: Imperium", year: 2020 }), "no year, no prefix match");
+});
+
+test("a nominee whose BGG ID lookup fails is still found by name", async () => {
+  const log = { error() {} };
+  const bgg = {
+    details: async (id) => {
+      if (id === 999) throw new Error("BGG 502");
+      return { ...THINGS[id], bggId: id, type: "Base" };
+    },
+    search: async () => [{ bggId: 301, name: "Arcs", year: 2024, type: "Base" }],
+  };
+  const d = await matchNominee(bgg, { name: "Arcs", year: 2024, bggId: 999 }, log);
+  assert.equal(d.bggId, 301);
 });
 
 // ---------- runs ----------
@@ -214,10 +228,10 @@ test("a run nominates, matches, excludes, predicts and ranks the top 5 with at m
     "Brass: More": { score: 9.8 },
   };
   const nominees = TEN.map((n) => nominee(n, n.startsWith("Brass:") ? { expansion: true } : {}));
-  nominees.push(nominee("Munchkin: Deluxe", { expansion: true }), nominee("Totally Made Up"));
+  nominees.push(nominee("Munchkin: Deluxe", { expansion: true }), nominee("Totally Made Up"), nominee("Arcs: Base", { bgg_id: 301 }));
   const t = await startApp({ claude: { nominees, predictions }, bgg: { hot: [{ id: 301, name: "Arcs", year: 2024 }] } });
   try {
-    t.store.setSettings({ recommendNominees: 12 });
+    t.store.setSettings({ recommendNominees: 13 });
     t.store.createGame({ name: "Brass: Birmingham", bggId: 100, plays: 10, scores: all(10) });
     t.store.createGame({ name: "Munchkin", bggId: 200, plays: 2, scores: all(3) });
     t.store.createGame({ name: "Dune: Imperium", bggId: 307, plays: 0, scores: all(null) });
@@ -244,7 +258,7 @@ test("a run nominates, matches, excludes, predicts and ranks the top 5 with at m
 
     const nominate = t.claude[0];
     assert.match(nominate.system[0].text, /- Brass: Birmingham \| 10\.0/);
-    assert.match(nominate.messages[0].content, /Nominate 12 games/);
+    assert.match(nominate.messages[0].content, /Nominate 13 games/);
     assert.match(nominate.messages[0].content, /- Arcs \(2024\), BGG ID 301/);
 
     const runs = (await t.call("GET", "/api/recommendations/runs")).body;
@@ -258,6 +272,7 @@ test("a run nominates, matches, excludes, predicts and ranks the top 5 with at m
       "Dune: Imperium": DROP.inList,
       "Munchkin: Deluxe": DROP.expansionBase,
       "Totally Made Up": DROP.unmatched,
+      "Arcs: Base": DROP.duplicate,
     });
     assert.equal(runs[0].predicted, 9);
     assert.equal(runs[0].reused, 0);
@@ -297,6 +312,7 @@ test("a run reuses a recent prediction, and the picks drop games since added or 
     view = (await t.call("GET", "/api/recommendations")).body;
     assert.deepEqual(view.picks.map((p) => p.name), ["Nucleum", "Hegemony", "Voidfall", "Kutna Hora"]);
     assert.equal((await t.call("POST", "/api/recommendations/dismissed", { bggId: 0, name: "x" })).status, 400);
+    assert.equal((await t.call("DELETE", "/api/recommendations/dismissed/abc", {})).status, 400);
   } finally {
     t.close();
   }
@@ -382,6 +398,7 @@ test("a manual prediction goes ahead of a run's remaining nominees", async () =>
     // Wait for the run to start its first prediction, then ask for a manual one.
     for (let i = 0; i < 200 && !order.length; i++) await new Promise((r) => setTimeout(r, 5));
     assert.equal((await t.call("POST", "/api/recommendations/refresh", {})).status, 409, "one run at a time");
+    assert.equal((await t.call("POST", "/api/predictions", { bggId: 301, name: "Arcs" })).status, 409, "the run is predicting it right now");
     const m = await t.call("POST", "/api/predictions", { bggId: 100, name: "Brass: Birmingham" });
     assert.equal(m.status, 202);
     assert.equal((await t.call("POST", "/api/predictions", { bggId: 200 })).status, 409, "one manual prediction at a time");
@@ -414,21 +431,25 @@ test("the recommendation settings are validated", async () => {
   }
 });
 
-test("nextRunAt is 4am on the day the interval lands, never before the floor, and null when off", () => {
+test("nextRunAt is 4am on the day the interval lands, never more than an hour in the past, and null when off", () => {
   const at = (s) => new Date(s);
-  const boot = at("2026-10-19T10:00:00"); // Monday
+  const now = at("2026-10-19T10:00:00"); // Monday
   // A scheduled run started Sunday 04:00:30: next Sunday 04:00.
-  assert.equal(nextRunAt("weekly", "2026-10-18T04:00:30", boot).getTime(), at("2026-10-25T04:00:00").getTime());
+  assert.equal(nextRunAt("weekly", "2026-10-18T04:00:30", now).getTime(), at("2026-10-25T04:00:00").getTime());
   // A manual refresh at 9pm Sunday: the interval runs past Sunday 04:00, so Monday.
-  assert.equal(nextRunAt("weekly", "2026-10-18T21:00:00", boot).getTime(), at("2026-10-26T04:00:00").getTime());
-  // Overdue at boot: the next 4am after boot, not now.
-  assert.equal(nextRunAt("daily", "2026-10-10T04:00:00", boot).getTime(), at("2026-10-20T04:00:00").getTime());
-  // No run yet: the next 4am after boot.
-  assert.equal(nextRunAt("weekly", null, boot).getTime(), at("2026-10-20T04:00:00").getTime());
+  assert.equal(nextRunAt("weekly", "2026-10-18T21:00:00", now).getTime(), at("2026-10-26T04:00:00").getTime());
+  // Overdue by days (server was down, or the schedule was just switched on): the next 4am, not now.
+  assert.equal(nextRunAt("daily", "2026-10-10T04:00:00", now).getTime(), at("2026-10-20T04:00:00").getTime());
+  // Due this morning and noticed within the hour: still due.
+  assert.equal(nextRunAt("daily", "2026-10-18T04:00:00", at("2026-10-19T04:30:00")).getTime(), at("2026-10-19T04:00:00").getTime());
+  // No run yet: the next 4am.
+  assert.equal(nextRunAt("weekly", null, now).getTime(), at("2026-10-20T04:00:00").getTime());
   assert.equal(nextRunAt("weekly", null, at("2026-10-19T03:00:00")).getTime(), at("2026-10-19T04:00:00").getTime());
-  assert.equal(nextRunAt("biweekly", "2026-10-18T04:00:00", boot).getTime(), at("2026-11-01T04:00:00").getTime());
-  assert.equal(nextRunAt("off", "2026-10-18T04:00:00", boot), null);
-  assert.equal(nextRunAt("bogus", null, boot), null);
+  // A failed run this morning pushes the retry to tomorrow.
+  assert.equal(nextRunAt("daily", "2026-10-18T04:00:00", at("2026-10-19T04:30:00"), at("2026-10-19T04:01:00")).getTime(), at("2026-10-20T04:00:00").getTime());
+  assert.equal(nextRunAt("biweekly", "2026-10-18T04:00:00", now).getTime(), at("2026-11-01T04:00:00").getTime());
+  assert.equal(nextRunAt("off", "2026-10-18T04:00:00", now), null);
+  assert.equal(nextRunAt("bogus", null, now), null);
 });
 
 test("the scheduler runs when due, once, and retries a failure only at the next 4am", () => {
@@ -456,8 +477,12 @@ test("the scheduler runs when due, once, and retries a failure only at the next 
     assert.equal(sched.tick(), false);
     assert.equal(sched.nextRunAt.getDate(), 27);
     store.setSettings({ recommendFrequency: "off" });
-    clock = new Date("2026-12-01T04:01:00");
+    clock = new Date("2026-12-01T12:00:00");
     assert.equal(sched.tick(), false);
+    // Switched back on weeks later, mid-day: waits for the next 4am rather than running now.
+    store.setSettings({ recommendFrequency: "weekly" });
+    assert.equal(sched.tick(), false);
+    assert.equal(sched.nextRunAt.getTime(), new Date("2026-12-02T04:00:00").getTime());
     assert.equal(runs.length, 2);
   } finally {
     store.db.close();

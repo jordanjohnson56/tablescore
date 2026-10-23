@@ -40,15 +40,20 @@ export function createApp({ store, bgg, bggUsername, predictor = new Predictor()
     if (predicting || !queue.length) return;
     const task = queue.shift();
     predicting = task.id;
+    current = task.target;
     task
       .work()
       .then(task.resolve, task.reject)
       .finally(() => {
         predicting = null;
+        current = null;
         pump();
       });
   }
   const pending = (id) => predicting === id || queue.some((t) => t.id === id);
+  let current = null; // target of the running prediction
+  const sameTarget = (a, b) => (a.gameId != null && a.gameId === b.gameId) || (a.bggId != null && a.bggId === b.bggId);
+  const targetPending = (target) => (current && sameTarget(current, target)) || queue.some((t) => sameTarget(t.target, target));
   let manual = null; // id of the last prediction the user asked for
 
   let recommending = null; // the promise of the running recommendation run
@@ -178,9 +183,10 @@ export function createApp({ store, bgg, bggUsername, predictor = new Predictor()
     if (!predictor.configured) throw new HttpError(400, "ANTHROPIC_API_KEY is not set on the server");
     if (manual != null && pending(manual)) throw new HttpError(409, "a prediction is already running");
     const target = predictionTarget(req.body);
+    if (targetPending(target)) throw new HttpError(409, "that game is being predicted right now");
     const prediction = store.createPrediction({ ...target, model: predictor.model });
     manual = prediction.id;
-    enqueue({ id: prediction.id, work: () => runPrediction(prediction.id, target) }, { front: true }).catch(() => {});
+    enqueue({ id: prediction.id, target, work: () => runPrediction(prediction.id, target) }, { front: true }).catch(() => {});
     res.status(202).json(prediction);
   });
 
@@ -285,10 +291,10 @@ export function createApp({ store, bgg, bggUsername, predictor = new Predictor()
   // A run nominates games with Claude, predicts each through the queue (behind
   // any manual prediction) and keeps the top picks. One run at a time.
   function startRun(trigger) {
-    if (recommending) return false;
+    if (recommending || !predictor.configured || !bgg.configured) return false;
     const predict = async (target, details) => {
       const row = store.createPrediction({ ...target, model: predictor.model });
-      const done = await enqueue({ id: row.id, work: () => runPrediction(row.id, target, details) });
+      const done = await enqueue({ id: row.id, target, work: () => runPrediction(row.id, target, details) });
       if (done.status !== "done") throw new PredictError(done.error || "prediction failed");
       return done;
     };
@@ -311,7 +317,7 @@ export function createApp({ store, bgg, bggUsername, predictor = new Predictor()
       // The newest run of any status, so a failed refresh after a good one can be shown.
       lastRun: latest && latest.id !== run?.id ? { ...latest, nominees: undefined } : null,
       running: !!recommending,
-      nextRunAt: scheduler.nextRunAt?.toISOString() ?? null,
+      nextRunAt: predictor.configured && bgg.configured ? (scheduler.nextRunAt?.toISOString() ?? null) : null,
     };
   }
 
@@ -337,7 +343,9 @@ export function createApp({ store, bgg, bggUsername, predictor = new Predictor()
   });
 
   app.delete("/api/recommendations/dismissed/:bggId", (req, res) => {
-    res.json(store.undismissGame(Number(req.params.bggId)));
+    const bggId = Number(req.params.bggId);
+    if (!Number.isInteger(bggId) || bggId <= 0) throw new HttpError(400, "bggId must be a positive integer");
+    res.json(store.undismissGame(bggId));
   });
 
   /**
