@@ -139,6 +139,40 @@ export function openDb(file) {
     );
     CREATE INDEX IF NOT EXISTS predictions_bgg ON predictions (bgg_id);
     CREATE INDEX IF NOT EXISTS predictions_game ON predictions (game_id);
+    -- Recommendation runs: Claude nominates games, each is predicted, and the
+    -- best are picked. Every nominee is kept with why it was or wasn't shown.
+    CREATE TABLE IF NOT EXISTS recommendation_runs (
+      id INTEGER PRIMARY KEY,
+      status TEXT NOT NULL DEFAULT 'running',
+      trigger TEXT NOT NULL DEFAULT 'schedule',
+      error TEXT,
+      model TEXT NOT NULL,
+      usage TEXT,
+      predicted INTEGER NOT NULL DEFAULT 0,
+      reused INTEGER NOT NULL DEFAULT 0,
+      started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      finished_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS recommendations (
+      id INTEGER PRIMARY KEY,
+      run_id INTEGER NOT NULL REFERENCES recommendation_runs(id) ON DELETE CASCADE,
+      bgg_id INTEGER,
+      name TEXT NOT NULL,
+      year INTEGER,
+      type TEXT NOT NULL DEFAULT 'Base',
+      thumbnail TEXT,
+      reason TEXT NOT NULL DEFAULT '',
+      prediction_id INTEGER,
+      rank INTEGER,
+      dropped TEXT
+    );
+    CREATE INDEX IF NOT EXISTS recommendations_run ON recommendations (run_id);
+    -- Games the user marked Not interested. They are never recommended again.
+    CREATE TABLE IF NOT EXISTS dismissed_games (
+      bgg_id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      dismissed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
   `);
   migrate(db);
   return new Store(db);
@@ -175,7 +209,7 @@ export class Store {
     const stmt = this.db.prepare(
       "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     );
-    for (const key of ["weights", "stretch", "hideExpansions", "includeWatching", "tasteProfile"]) {
+    for (const key of ["weights", "stretch", "hideExpansions", "includeWatching", "tasteProfile", "recommendFrequency", "recommendNominees"]) {
       if (patch[key] !== undefined) stmt.run(key, JSON.stringify(patch[key]));
     }
     return this.getSettings();
@@ -387,6 +421,146 @@ export class Store {
     return { n, meanAbsError, pairs };
   }
 
+  // ---------- recommendations ----------
+
+  createRecommendationRun({ model, trigger = "schedule", startedAt = null }) {
+    const { lastInsertRowid } = this.db
+      .prepare("INSERT INTO recommendation_runs (model, trigger, started_at) VALUES (?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))")
+      .run(model, trigger, startedAt);
+    return this.getRecommendationRun(Number(lastInsertRowid));
+  }
+
+  /** Record a nominee. `dropped` says why it isn't shown; `rank` is its place when it is. */
+  addRecommendation(runId, r) {
+    this.db
+      .prepare(
+        `INSERT INTO recommendations (run_id, bgg_id, name, year, type, thumbnail, reason, prediction_id, rank, dropped)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(runId, r.bggId ?? null, r.name, r.year ?? null, r.type || "Base", r.thumbnail ?? null, r.reason || "", r.predictionId ?? null, r.rank ?? null, r.dropped ?? null);
+  }
+
+  finishRecommendationRun(id, { usage, predicted, reused }) {
+    this.db
+      .prepare("UPDATE recommendation_runs SET status = 'done', usage = ?, predicted = ?, reused = ?, finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?")
+      .run(JSON.stringify(usage ?? null), predicted, reused, id);
+    return this.getRecommendationRun(id);
+  }
+
+  failRecommendationRun(id, error, { usage = null, predicted = 0, reused = 0 } = {}) {
+    this.db
+      .prepare("UPDATE recommendation_runs SET status = 'failed', error = ?, usage = ?, predicted = ?, reused = ?, finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?")
+      .run(error, JSON.stringify(usage), predicted, reused, id);
+    return this.getRecommendationRun(id);
+  }
+
+  /** On startup: a run still going was cut off by a restart. */
+  failRunningRecommendationRuns() {
+    return this.db
+      .prepare("UPDATE recommendation_runs SET status = 'failed', error = 'The server restarted before it finished.', finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE status = 'running'")
+      .run().changes;
+  }
+
+  getRecommendationRun(id) {
+    const row = this.db.prepare("SELECT * FROM recommendation_runs WHERE id = ?").get(id);
+    return row ? toRun(row) : null;
+  }
+
+  /** Every run, newest first, with its nominees. */
+  listRecommendationRuns(limit = 50) {
+    return this.db
+      .prepare("SELECT * FROM recommendation_runs ORDER BY started_at DESC, id DESC LIMIT ?")
+      .all(limit)
+      .map((r) => ({ ...toRun(r), nominees: this.runNominees(r.id) }));
+  }
+
+  runNominees(runId) {
+    return this.db
+      .prepare("SELECT * FROM recommendations WHERE run_id = ? ORDER BY rank IS NULL, rank, id")
+      .all(runId)
+      .map(toRecommendation);
+  }
+
+  /** The newest finished run, or null. */
+  lastRecommendationRun(status = "done") {
+    const row = this.db
+      .prepare("SELECT * FROM recommendation_runs WHERE status = ? ORDER BY finished_at DESC, id DESC LIMIT 1")
+      .get(status);
+    return row ? toRun(row) : null;
+  }
+
+  /**
+   * The picks to show: the newest finished run's ranked nominees, with their
+   * predictions, minus games since added to the list or dismissed.
+   */
+  currentRecommendations() {
+    const run = this.lastRecommendationRun();
+    if (!run) return { run: null, picks: [] };
+    const settings = this.getSettings();
+    const inList = new Set(this.db.prepare("SELECT bgg_id FROM games WHERE bgg_id IS NOT NULL").all().map((r) => r.bgg_id));
+    const dismissed = new Set(this.db.prepare("SELECT bgg_id FROM dismissed_games").all().map((r) => r.bgg_id));
+    const picks = this.db
+      .prepare(
+        `SELECT r.*, p.id AS p_id, p.confidence AS p_confidence, p.thumbnail AS p_thumbnail, p.created_at AS p_created_at,
+                ${SCORE_COLS.map((c) => `p.${c} AS p_${c}`).join(", ")}
+         FROM recommendations r LEFT JOIN predictions p ON p.id = r.prediction_id
+         WHERE r.run_id = ? AND r.rank IS NOT NULL ORDER BY r.rank`,
+      )
+      .all(run.id)
+      .filter((r) => !inList.has(r.bgg_id) && !dismissed.has(r.bgg_id))
+      .map((r) => ({
+        ...toRecommendation(r),
+        thumbnail: r.thumbnail ?? r.p_thumbnail,
+        final: r.p_id ? finalScore(Object.fromEntries(CRITERIA.map((c) => [c.key, r[`p_s_${c.key}`]])), settings) : null,
+        confidence: r.p_confidence ?? null,
+        predictedAt: r.p_created_at ?? null,
+      }));
+    return { run, picks };
+  }
+
+  /** Games shown in the newest `runs` finished runs, for the nominator to steer away from. */
+  recentRecommendations(runs = 3) {
+    return this.db
+      .prepare(
+        `SELECT DISTINCT r.bgg_id, r.name FROM recommendations r
+         JOIN (SELECT id FROM recommendation_runs WHERE status = 'done' ORDER BY finished_at DESC, id DESC LIMIT ?) x ON x.id = r.run_id
+         WHERE r.rank IS NOT NULL ORDER BY r.name COLLATE NOCASE`,
+      )
+      .all(runs)
+      .map((r) => ({ bggId: r.bgg_id, name: r.name }));
+  }
+
+  /** The newest finished prediction for a BGG ID made after `since` (an ISO time), or null. */
+  recentPrediction(bggId, since) {
+    const row = this.db
+      .prepare("SELECT * FROM predictions WHERE bgg_id = ? AND status = 'done' AND created_at >= ? ORDER BY created_at DESC, id DESC LIMIT 1")
+      .get(bggId, since);
+    return row ? toPrediction(row, this.getSettings()) : null;
+  }
+
+  dismissGame(bggId, name) {
+    this.db
+      .prepare("INSERT INTO dismissed_games (bgg_id, name) VALUES (?, ?) ON CONFLICT(bgg_id) DO UPDATE SET name = excluded.name")
+      .run(bggId, name);
+    return this.listDismissed();
+  }
+
+  undismissGame(bggId) {
+    this.db.prepare("DELETE FROM dismissed_games WHERE bgg_id = ?").run(bggId);
+    return this.listDismissed();
+  }
+
+  listDismissed() {
+    return this.db
+      .prepare("SELECT * FROM dismissed_games ORDER BY dismissed_at DESC")
+      .all()
+      .map((r) => ({ bggId: r.bgg_id, name: r.name, dismissedAt: r.dismissed_at }));
+  }
+
+  isDismissed(bggId) {
+    return !!this.db.prepare("SELECT 1 FROM dismissed_games WHERE bgg_id = ?").get(bggId);
+  }
+
   transaction(fn) {
     this.db.exec("BEGIN");
     try {
@@ -454,6 +628,37 @@ function toGame(r) {
     scores: Object.fromEntries(CRITERIA.map((c) => [c.key, r[`s_${c.key}`]])),
     scoredAt: r.scored_at,
     updatedAt: r.updated_at,
+  };
+}
+
+function toRun(r) {
+  return {
+    id: r.id,
+    status: r.status,
+    trigger: r.trigger,
+    error: r.error,
+    model: r.model,
+    usage: r.usage ? JSON.parse(r.usage) : null,
+    predicted: r.predicted,
+    reused: r.reused,
+    startedAt: r.started_at,
+    finishedAt: r.finished_at,
+  };
+}
+
+function toRecommendation(r) {
+  return {
+    id: r.id,
+    runId: r.run_id,
+    bggId: r.bgg_id,
+    name: r.name,
+    year: r.year,
+    type: r.type,
+    thumbnail: r.thumbnail,
+    reason: r.reason,
+    predictionId: r.prediction_id,
+    rank: r.rank,
+    dropped: r.dropped,
   };
 }
 

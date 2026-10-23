@@ -6,6 +6,9 @@ import { isWatching } from "../public/js/watchlist.js";
 
 export const DEFAULT_MODEL = "claude-opus-5-5";
 const MAX_SEARCHES = 5;
+// Nominating a batch of games needs more looking around than scoring one.
+const NOMINATE_SEARCHES = 10;
+export const MAX_NOMINEES = 20;
 // API calls per prediction: one, plus resumes after a long search turn pauses,
 // plus one nudge if Claude finishes without submitting.
 const MAX_CALLS = 6;
@@ -56,6 +59,35 @@ const SUBMIT_TOOL = {
   },
 };
 
+const NOMINATE_TOOL = {
+  name: "submit_nominees",
+  description: "Submit the games you nominate. Call it exactly once, when you are done researching.",
+  strict: true,
+  input_schema: {
+    type: "object",
+    properties: {
+      nominees: {
+        type: "array",
+        description: "The nominated games, best fit first.",
+        items: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "The game's name as BoardGameGeek lists it." },
+            year: { type: "integer", description: "Year published, or 0 if unsure." },
+            bgg_id: { type: "integer", description: "Its BoardGameGeek ID if you know it for certain, else 0." },
+            expansion: { type: "boolean", description: "True if it is an expansion." },
+            reason: { type: "string", description: "One sentence on why this person should look at it, naming a scored game it resembles." },
+          },
+          required: ["name", "year", "bgg_id", "expansion", "reason"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["nominees"],
+    additionalProperties: false,
+  },
+};
+
 /** Talks to Claude. `client` is an Anthropic SDK client, or a fake in tests. */
 export class Predictor {
   constructor({ client = null, model = DEFAULT_MODEL } = {}) {
@@ -69,8 +101,23 @@ export class Predictor {
 
   /** Run one prediction. Returns the parsed submission plus token usage. */
   async predict({ system, target }) {
+    const { input, found, usage } = await this.converse({ system, user: target, tool: SUBMIT_TOOL, maxSearches: MAX_SEARCHES });
+    return { ...parseSubmission(input, found), usage };
+  }
+
+  /** Ask for games to recommend. Returns the parsed nominees plus token usage. */
+  async nominate({ system, user, count }) {
+    const { input, usage } = await this.converse({ system, user, tool: NOMINATE_TOOL, maxSearches: NOMINATE_SEARCHES });
+    return { nominees: parseNominees(input, count), usage };
+  }
+
+  /**
+   * One conversation with Claude that ends when it calls `tool`: web search
+   * turns are resumed, and Claude gets one nudge if it stops without calling.
+   */
+  async converse({ system, user, tool, maxSearches }) {
     if (!this.client) throw new PredictError("ANTHROPIC_API_KEY is not set on the server");
-    const messages = [{ role: "user", content: target }];
+    const messages = [{ role: "user", content: user }];
     const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, searches: 0 };
     const found = new Map(); // url -> title, from the search results Claude actually got
     let nudged = false;
@@ -83,7 +130,7 @@ export class Predictor {
           system: [{ type: "text", text: system, cache_control: { type: "ephemeral" } }],
           thinking: { type: "adaptive" },
           output_config: { effort: "high" },
-          tools: [{ type: "web_search_20260209", name: "web_search", max_uses: MAX_SEARCHES }, SUBMIT_TOOL],
+          tools: [{ type: "web_search_20260209", name: "web_search", max_uses: maxSearches }, tool],
           messages,
           ...(FALLBACK_MODELS.has(this.model) ? { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" } : {}),
         })
@@ -95,15 +142,15 @@ export class Predictor {
         }
       }
       if (msg.stop_reason === "refusal") throw new PredictError("Claude declined to make this prediction.");
-      const submit = msg.content.find((b) => b.type === "tool_use" && b.name === SUBMIT_TOOL.name);
-      if (submit) return { ...parseSubmission(submit.input, found), usage };
+      const submit = msg.content.find((b) => b.type === "tool_use" && b.name === tool.name);
+      if (submit) return { input: submit.input, found, usage };
       if (msg.stop_reason === "max_tokens") throw new PredictError("Claude ran out of room before finishing.");
       messages.push({ role: "assistant", content: msg.content });
       // pause_turn: a long search turn stopped early; sending it back resumes it.
       if (msg.stop_reason === "pause_turn") continue;
       if (nudged) break;
       nudged = true;
-      messages.push({ role: "user", content: "Please submit your prediction now with the submit_prediction tool." });
+      messages.push({ role: "user", content: `Please finish now by calling the ${tool.name} tool.` });
     }
     throw new PredictError("Claude finished without submitting a prediction.");
   }
@@ -148,23 +195,34 @@ const isTarget = (g, target) => (target.gameId != null && g.id === target.gameId
  * the target game. It holds nothing per-request, so it caches between predictions.
  * Returns the text and how many fully scored games went into it.
  */
-export function buildSystem(games, settings, target = {}) {
-  const final = (g) => finalScore(g.scores, settings);
-  const pool = games.filter((g) => !isWatching(g) && !isTarget(g, target));
-  const scored = pool.filter((g) => final(g) != null).sort((a, b) => final(b) - final(a) || a.name.localeCompare(b.name));
-  const old = pool
-    .filter((g) => final(g) == null && (g.bggRating ?? g.oldRating) != null)
-    .sort((a, b) => (b.bggRating ?? b.oldRating) - (a.bggRating ?? a.oldRating) || a.name.localeCompare(b.name));
-  const w = settings.weights;
+/** Clean up a nominees submission: trims names, drops blanks and duplicates, caps the count. */
+export function parseNominees(input, count = MAX_NOMINEES) {
+  const seen = new Set();
+  const out = [];
+  for (const n of Array.isArray(input?.nominees) ? input.nominees : []) {
+    const name = String(n?.name ?? "").trim();
+    const key = name.toLowerCase();
+    if (!name || seen.has(key)) continue;
+    seen.add(key);
+    const year = Number.isInteger(n.year) && n.year > 0 ? n.year : null;
+    const bggId = Number.isInteger(n.bgg_id) && n.bgg_id > 0 ? n.bgg_id : null;
+    out.push({ name, year, bggId, expansion: !!n.expansion, reason: String(n.reason ?? "").trim() });
+    if (out.length >= count) break;
+  }
+  if (!out.length) throw new PredictError("Claude nominated no games.");
+  return out;
+}
 
+export function buildSystem(games, settings, target = {}) {
   const rubric = CRITERIA.map((c) =>
     [
-      `### ${c.name} (key "${c.key}", weight ${w[c.key]}, ${c.yardstick})`,
+      `### ${c.name} (key "${c.key}", weight ${settings.weights[c.key]}, ${c.yardstick})`,
       c.purpose,
       `Question: ${c.ask}`,
       ...c.bands.map((b, i) => `- ${["9-10", "7-8", "5-6", "3-4", "0-2"][i]}: ${b}`),
     ].join("\n"),
   ).join("\n\n");
+  const scores = scoreContext(games, settings, target);
 
   const lines = [
     "You predict how one board gamer would score a game they haven't scored yet, using their personal rubric. Your prediction is compared with their real score after they play, so aim for accuracy, not flattery.",
@@ -184,8 +242,29 @@ export function buildSystem(games, settings, target = {}) {
     rubric,
     "",
     "## Their taste in their own words",
-    settings.tasteProfile?.trim() || "(They haven't written a taste profile yet. Go by their scores.)",
+    tasteProfile(settings),
     "",
+    ...scores.lines,
+  ];
+  return { text: lines.join("\n"), scoredGames: scores.scoredGames };
+}
+
+export function tasteProfile(settings) {
+  return settings.tasteProfile?.trim() || "(They haven't written a taste profile yet. Go by their scores.)";
+}
+
+/**
+ * The prompt sections listing what the user has scored, and their old ratings
+ * for games not yet rescored. Watched games and the target are left out.
+ */
+export function scoreContext(games, settings, target = {}) {
+  const final = (g) => finalScore(g.scores, settings);
+  const pool = games.filter((g) => !isWatching(g) && !isTarget(g, target));
+  const scored = pool.filter((g) => final(g) != null).sort((a, b) => final(b) - final(a) || a.name.localeCompare(b.name));
+  const old = pool
+    .filter((g) => final(g) == null && (g.bggRating ?? g.oldRating) != null)
+    .sort((a, b) => (b.bggRating ?? b.oldRating) - (a.bggRating ?? a.oldRating) || a.name.localeCompare(b.name));
+  const lines = [
     `## Games they've scored (${scored.length})`,
     `Format: name | final | ${CRITERIA.map((c) => c.key).join("/")} | plays | BGG weight | players. "Provisional" means under 3 plays.`,
     ...scored.map((g) => `- ${scoredLine(g, final(g))}`),
@@ -198,7 +277,7 @@ export function buildSystem(games, settings, target = {}) {
       ...old.map((g) => `- ${gameLabel(g)}: ${formatNumber(g.bggRating ?? g.oldRating)}${g.wontScore ? " (won't rescore)" : ""}`),
     );
   }
-  return { text: lines.join("\n"), scoredGames: scored.length };
+  return { lines, scoredGames: scored.length, scored };
 }
 
 function gameLabel(g) {

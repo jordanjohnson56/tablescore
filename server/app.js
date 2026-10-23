@@ -4,14 +4,15 @@ import { HttpError } from "./db.js";
 import { BggError } from "./bgg.js";
 import { syncCollection, addFromBgg, linkToBgg } from "./sync.js";
 import { watchlistExport } from "./export-watchlist.js";
-import { Predictor, PredictError, buildSystem, buildTarget } from "./predict.js";
-import { CRITERIA, finalScore } from "../public/js/rubric.js";
+import { Predictor, PredictError, MAX_NOMINEES, buildSystem, buildTarget } from "./predict.js";
+import { RecommendScheduler, SHOWN, runRecommendations } from "./recommend.js";
+import { CRITERIA, RECOMMEND_FREQUENCIES, finalScore } from "../public/js/rubric.js";
 
 const PUBLIC_DIR = fileURLToPath(new URL("../public", import.meta.url));
 
 const TASTE_PROFILE_LIMIT = 4000;
 
-export function createApp({ store, bgg, bggUsername, predictor = new Predictor() }) {
+export function createApp({ store, bgg, bggUsername, predictor = new Predictor(), now = () => new Date(), schedulerTickMs } = {}) {
   const app = express();
   app.disable("x-powered-by");
   app.use(express.json({ limit: "1mb" }));
@@ -25,7 +26,32 @@ export function createApp({ store, bgg, bggUsername, predictor = new Predictor()
     next();
   });
 
+  // Predictions run one at a time. A manual one goes to the front of the line,
+  // ahead of a recommendation run's remaining nominees.
+  const queue = [];
   let predicting = null; // id of the running Claude prediction
+  function enqueue(task, { front = false } = {}) {
+    return new Promise((resolve, reject) => {
+      queue[front ? "unshift" : "push"]({ ...task, resolve, reject });
+      pump();
+    });
+  }
+  function pump() {
+    if (predicting || !queue.length) return;
+    const task = queue.shift();
+    predicting = task.id;
+    task
+      .work()
+      .then(task.resolve, task.reject)
+      .finally(() => {
+        predicting = null;
+        pump();
+      });
+  }
+  const pending = (id) => predicting === id || queue.some((t) => t.id === id);
+  let manual = null; // id of the last prediction the user asked for
+
+  let recommending = null; // the promise of the running recommendation run
   const job = { running: false, phase: "", done: 0, total: 0, error: null, result: null, finishedAt: null };
 
   app.get("/api/state", (req, res) => {
@@ -33,12 +59,12 @@ export function createApp({ store, bgg, bggUsername, predictor = new Predictor()
       settings: store.getSettings(),
       games: store.listGames(),
       bgg: { configured: bgg.configured, username: bggUsername || null },
-      claude: { configured: predictor.configured, model: predictor.model, running: predicting },
+      claude: { configured: predictor.configured, model: predictor.model, running: predicting, recommending: !!recommending },
     });
   });
 
   app.put("/api/settings", (req, res) => {
-    const { weights, stretch, hideExpansions, includeWatching, tasteProfile } = req.body;
+    const { weights, stretch, hideExpansions, includeWatching, tasteProfile, recommendFrequency, recommendNominees } = req.body;
     if (weights !== undefined) {
       const ok = CRITERIA.every((c) => typeof weights[c.key] === "number" && weights[c.key] >= 0);
       if (!ok) throw new HttpError(400, "weights needs a non-negative number for every criterion");
@@ -55,7 +81,13 @@ export function createApp({ store, bgg, bggUsername, predictor = new Predictor()
     if (tasteProfile !== undefined && !(typeof tasteProfile === "string" && tasteProfile.length <= TASTE_PROFILE_LIMIT)) {
       throw new HttpError(400, `tasteProfile must be text of at most ${TASTE_PROFILE_LIMIT} characters`);
     }
-    res.json(store.setSettings({ weights, stretch, hideExpansions, includeWatching, tasteProfile }));
+    if (recommendFrequency !== undefined && !RECOMMEND_FREQUENCIES.some((f) => f.key === recommendFrequency)) {
+      throw new HttpError(400, `recommendFrequency must be one of ${RECOMMEND_FREQUENCIES.map((f) => f.key).join(", ")}`);
+    }
+    if (recommendNominees !== undefined && !(Number.isInteger(recommendNominees) && recommendNominees >= SHOWN && recommendNominees <= MAX_NOMINEES)) {
+      throw new HttpError(400, `recommendNominees must be a whole number from ${SHOWN} to ${MAX_NOMINEES}`);
+    }
+    res.json(store.setSettings({ weights, stretch, hideExpansions, includeWatching, tasteProfile, recommendFrequency, recommendNominees }));
   });
 
   app.post("/api/games", (req, res) => {
@@ -144,18 +176,11 @@ export function createApp({ store, bgg, bggUsername, predictor = new Predictor()
   // the prediction, so a locked phone doesn't lose it.
   app.post("/api/predictions", (req, res) => {
     if (!predictor.configured) throw new HttpError(400, "ANTHROPIC_API_KEY is not set on the server");
-    if (predicting) throw new HttpError(409, "a prediction is already running");
+    if (manual != null && pending(manual)) throw new HttpError(409, "a prediction is already running");
     const target = predictionTarget(req.body);
     const prediction = store.createPrediction({ ...target, model: predictor.model });
-    predicting = prediction.id;
-    runPrediction(prediction.id, target)
-      .catch((e) => {
-        if (!(e instanceof PredictError || e instanceof BggError)) console.error("prediction failed:", e);
-        store.failPrediction(prediction.id, e.message || "prediction failed");
-      })
-      .finally(() => {
-        predicting = null;
-      });
+    manual = prediction.id;
+    enqueue({ id: prediction.id, work: () => runPrediction(prediction.id, target) }, { front: true }).catch(() => {});
     res.status(202).json(prediction);
   });
 
@@ -217,32 +242,103 @@ export function createApp({ store, bgg, bggUsername, predictor = new Predictor()
     return target;
   }
 
-  async function runPrediction(id, target) {
-    // BGG details are a bonus: if BGG fails, Claude works from the name and the web.
-    let details = null;
-    if (target.bggId && bgg.configured) {
-      try {
-        details = await bgg.details(target.bggId);
-      } catch (e) {
-        console.error(`BGG details for ${target.bggId} failed, predicting by name:`, e.message);
+  /**
+   * Run a prediction to the end and return it, finished or failed. `details`
+   * is BGG data when the caller already has it; otherwise it is fetched here
+   * as a bonus: if BGG fails, Claude works from the name and the web.
+   */
+  async function runPrediction(id, target, details) {
+    try {
+      if (details === undefined) {
+        details = null;
+        if (target.bggId && bgg.configured) {
+          try {
+            details = await bgg.details(target.bggId);
+          } catch (e) {
+            console.error(`BGG details for ${target.bggId} failed, predicting by name:`, e.message);
+          }
+        }
       }
-    }
-    const settings = store.getSettings();
-    const games = store.listGames();
-    const system = buildSystem(games, settings, target);
-    const result = await predictor.predict({
-      system: system.text,
-      target: buildTarget({ name: target.name, details, games, settings }),
-    });
-    const done = store.finishPrediction(id, {
-      ...result, name: details?.name || target.name, thumbnail: details?.thumbnail, scoredGames: system.scoredGames,
-    });
-    // A watched game in the list takes the prediction only if its own is empty.
-    const game = target.gameId ? store.getGame(target.gameId) : target.bggId ? store.getByBggId(target.bggId) : null;
-    if (game?.watchStage && game.predictedScore == null && done.final != null) {
-      store.updateGame(game.id, { predictedScore: done.final });
+      const settings = store.getSettings();
+      const games = store.listGames();
+      const system = buildSystem(games, settings, target);
+      const result = await predictor.predict({
+        system: system.text,
+        target: buildTarget({ name: target.name, details, games, settings }),
+      });
+      const done = store.finishPrediction(id, {
+        ...result, name: details?.name || target.name, thumbnail: details?.thumbnail, scoredGames: system.scoredGames,
+      });
+      // A watched game in the list takes the prediction only if its own is empty.
+      const game = target.gameId ? store.getGame(target.gameId) : target.bggId ? store.getByBggId(target.bggId) : null;
+      if (game?.watchStage && game.predictedScore == null && done.final != null) {
+        store.updateGame(game.id, { predictedScore: done.final });
+      }
+      return done;
+    } catch (e) {
+      if (!(e instanceof PredictError || e instanceof BggError)) console.error("prediction failed:", e);
+      return store.failPrediction(id, e.message || "prediction failed");
     }
   }
+
+  // ---------- recommendations ----------
+  // A run nominates games with Claude, predicts each through the queue (behind
+  // any manual prediction) and keeps the top picks. One run at a time.
+  function startRun(trigger) {
+    if (recommending) return false;
+    const predict = async (target, details) => {
+      const row = store.createPrediction({ ...target, model: predictor.model });
+      const done = await enqueue({ id: row.id, work: () => runPrediction(row.id, target, details) });
+      if (done.status !== "done") throw new PredictError(done.error || "prediction failed");
+      return done;
+    };
+    recommending = runRecommendations({ store, bgg, predictor, predict, trigger, now })
+      .catch((e) => console.error("recommendation run crashed:", e))
+      .finally(() => {
+        recommending = null;
+      });
+    return true;
+  }
+  const scheduler = new RecommendScheduler({ store, run: ({ trigger }) => startRun(trigger), now, tickMs: schedulerTickMs });
+  app.scheduler = scheduler;
+
+  function recommendationsView() {
+    const { run, picks } = store.currentRecommendations();
+    const latest = store.listRecommendationRuns(1)[0] ?? null;
+    return {
+      picks,
+      run,
+      // The newest run of any status, so a failed refresh after a good one can be shown.
+      lastRun: latest && latest.id !== run?.id ? { ...latest, nominees: undefined } : null,
+      running: !!recommending,
+      nextRunAt: scheduler.nextRunAt?.toISOString() ?? null,
+    };
+  }
+
+  app.get("/api/recommendations", (req, res) => res.json(recommendationsView()));
+
+  app.post("/api/recommendations/refresh", (req, res) => {
+    if (!predictor.configured) throw new HttpError(400, "ANTHROPIC_API_KEY is not set on the server");
+    if (!bgg.configured) throw new HttpError(400, "BGG_TOKEN is not set on the server");
+    if (!startRun("manual")) throw new HttpError(409, "a recommendation run is already going");
+    res.status(202).json(recommendationsView());
+  });
+
+  app.get("/api/recommendations/runs", (req, res) => res.json(store.listRecommendationRuns()));
+
+  app.get("/api/recommendations/dismissed", (req, res) => res.json(store.listDismissed()));
+
+  app.post("/api/recommendations/dismissed", (req, res) => {
+    const bggId = Number(req.body.bggId);
+    if (!Number.isInteger(bggId) || bggId <= 0) throw new HttpError(400, "bggId must be a positive integer");
+    const name = typeof req.body.name === "string" && req.body.name.trim();
+    if (!name) throw new HttpError(400, "name is required");
+    res.json(store.dismissGame(bggId, name));
+  });
+
+  app.delete("/api/recommendations/dismissed/:bggId", (req, res) => {
+    res.json(store.undismissGame(Number(req.params.bggId)));
+  });
 
   /**
    * A game just added from BGG takes its latest prediction: the avoid-theme

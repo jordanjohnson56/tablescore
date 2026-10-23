@@ -21,6 +21,8 @@ const app = createApp({ store, bgg, bggUsername: env.BGG_USERNAME, predictor });
 
 const cutOff = store.failRunningPredictions();
 if (cutOff) console.log(`${cutOff} prediction(s) cut off by the last restart marked failed.`);
+if (store.failRunningRecommendationRuns()) console.log("A recommendation run cut off by the last restart was marked failed.");
+app.scheduler.start();
 
 function backup() {
   try {
@@ -36,4 +38,6 @@ app.listen(port, host, () => {
   console.log(`Tablescore listening on http://${host}:${port}`);
   if (!bgg.configured) console.log("BGG_TOKEN not set: BGG search and sync are disabled.");
   if (!predictor.configured) console.log("ANTHROPIC_API_KEY not set: Claude predictions are disabled.");
+  const next = app.scheduler.nextRunAt;
+  console.log(next ? `Next recommendation run: ${next.toLocaleString()} (${env.TZ || "server local time"})` : "Scheduled recommendations are off.");
 });

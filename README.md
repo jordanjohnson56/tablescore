@@ -111,6 +111,18 @@ npm run import-watchlist -- data/watchlist-seed.json
 
 A game already in the database is skipped and listed as skipped, never overwritten. It matches when the BGG IDs are equal or the names match ignoring case, so a game you added by hand without a BGG ID isn't duplicated and running the import twice is harmless. If any game is invalid (no name, an unknown stage, a bad date or price), the import names it and writes nothing. Keep personal seed files under `data/`, which git ignores.
 
+## Recommendations
+
+Once a week (by default), Tablescore asks Claude for games you should be looking at and shows the five with the highest predicted scores. It needs both `ANTHROPIC_API_KEY` and `BGG_TOKEN`.
+
+- A run asks Claude to nominate about 10 games (`recommendNominees` in Settings, 5–20) that fit your scores and taste profile, with BGG's Hotness list, your recent picks and your Not interested list in the prompt. Live crowdfunding campaigns are out of scope; the watchlist covers those. Expansions are allowed only for base games you've scored 8 or higher.
+- Each nominee is matched to BGG (by the ID Claude gives, checked against the name, or by a name search) and dropped if it's already in your list or marked Not interested. Each remaining one gets a full prediction, unless it has one under 30 days old, which is reused. A game whose prediction flags an avoided theme is never shown.
+- The five highest predicted scores are shown, with at most one expansion. Every nominee is recorded with why it was or wasn't shown (`GET /api/recommendations/runs`), and every prediction made this way shows on **Discover** like any other.
+- A run that can't fill five picks is recorded as failed and the last good set stays up. A manual prediction asked for during a run goes ahead of the run's remaining nominees.
+- Scheduled runs start at 04:00 server time, counted from the last successful run's start: **Off**, **Daily**, **Weekly**, **Every 2 weeks** or **Monthly** (`recommendFrequency`). A run that is overdue when the server starts waits for the next 04:00. A failed run is retried at the next 04:00. **Refresh now** (`POST /api/recommendations/refresh`) runs at once. Set `TZ` (for example `TZ=America/Chicago`) in `.env` so 04:00 is your 04:00; in Docker it is UTC otherwise.
+- **Not interested** (`POST /api/recommendations/dismissed`) hides a game for good; undo it under Settings. Adding a game to your list or watchlist drops it from the picks too.
+- A run is roughly ten predictions, so expect 10–20 minutes and about ten times a single prediction's tokens. Each run's token and search counts are stored with it.
+
 ## Data and backups
 
 Everything lives in `data/tablescore.db`. On start and every 24 h, the server writes `data/backups/tablescore-YYYY-MM-DD.db` and keeps the newest `BACKUP_KEEP` (default 14). Copying `data/` somewhere else is your off-box backup. **Settings → Export JSON** downloads everything, and **Copy scores for Claude** puts a plain-text summary on the clipboard for asking about recommendations.

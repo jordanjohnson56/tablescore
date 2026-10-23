@@ -36,3 +36,19 @@ _Avoid_: projected score, expected score
 **Target price**:
 The most the user wants to pay for a used copy, with its currency.
 _Avoid_: max price, budget
+
+### Recommendations
+
+**Recommendation**:
+A game Claude nominated for the user to look at, shown with its predicted score. Up to five are shown at a time, from the newest finished run.
+_Avoid_: suggestion
+
+**Run**:
+One pass of the recommender: Claude nominates games, each is matched to BGG and predicted, and the top five are ranked. A run is scheduled or started by Refresh now, and is kept with every nominee and why it was dropped.
+
+**Nominee**:
+A game Claude put forward in a run, before matching, exclusion and prediction decided whether it is shown.
+
+**Not interested**:
+A game the user dismissed from the recommendations. It is never nominated or shown again until the user undoes it in Settings.
+_Avoid_: hidden, blocked

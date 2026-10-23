@@ -232,7 +232,7 @@ test("predict a BGG game: a job that finishes with scores, a final and sources",
   try {
     t.store.createGame({ name: "Brass", bggId: 100, plays: 10, scores: all(10) });
     const { body: state } = await t.call("GET", "/api/state");
-    assert.deepEqual(state.claude, { configured: true, model: "claude-opus-5-5", running: null });
+    assert.deepEqual(state.claude, { configured: true, model: "claude-opus-5-5", running: null, recommending: false });
 
     const r = await t.call("POST", "/api/predictions", { bggId: 500, name: "Brass: Extra" });
     assert.equal(r.status, 202);

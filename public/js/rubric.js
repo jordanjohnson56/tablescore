@@ -133,7 +133,18 @@ export const DEFAULT_SETTINGS = {
   includeWatching: false,
   // Free text Claude reads with every prediction: who you play with, what you love and avoid.
   tasteProfile: "",
+  // How often Claude refreshes the recommendations, and how many games it nominates per run.
+  recommendFrequency: "weekly",
+  recommendNominees: 10,
 };
+
+export const RECOMMEND_FREQUENCIES = [
+  { key: "off", label: "Off", days: 0 },
+  { key: "daily", label: "Daily", days: 1 },
+  { key: "weekly", label: "Weekly", days: 7 },
+  { key: "biweekly", label: "Every 2 weeks", days: 14 },
+  { key: "monthly", label: "Monthly", days: 30 },
+];
 
 export const PROVISIONAL_PLAYS = 3;
 
