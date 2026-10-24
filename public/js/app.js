@@ -1084,6 +1084,7 @@ async function renderPrediction(kind, id, name) {
   const label = game?.name || name || `BGG game ${id}`;
   const back = predictBack || (game ? `#/g/${game.id}` : "#/discover");
   const query = game ? `gameId=${game.id}` : `bggId=${id}`;
+  const bggId = game ? game.bggId : id;
   view.innerHTML = `
     <header class="score-head">
       <a class="back" href="${back}" aria-label="Back">‹</a>
@@ -1109,6 +1110,7 @@ async function renderPrediction(kind, id, name) {
       ${running ? `<section class="card"><p><b>Claude is working on it.</b> This usually takes under a minute. You can leave this page; the prediction is saved when it's done.</p></section>` : ""}
       ${latest && !running ? predictionCardHtml(latest, game) : ""}
       ${!latest ? `<p class="small muted">Claude compares this game with every game you've scored, your taste profile and BGG's details, searches the web if it needs to, and predicts each of the seven criteria. The final score uses your weights.</p>` : ""}
+      ${bggId ? `<p class="small"><a href="https://boardgamegeek.com/boardgame/${bggId}" target="_blank" rel="noopener">Open on BGG</a></p>` : ""}
       ${canPredict ? `<div class="btn-row"><button class="btn primary" id="predict" type="button">${latest ? "Predict again" : "Predict my score"}</button></div>` : ""}
       ${!game && latest?.status === "done" ? `<div class="btn-row">
           <button class="btn" type="button" data-add-as="list">Add to list</button>
