@@ -144,6 +144,18 @@ label.field > span { display: block; font-size: 0.85rem; color: var(--ink-2); ma
 .toolbar { position: sticky; top: 0; background: var(--bg); padding: 12px 0 0; z-index: 5; }
 .toolbar-row { display: flex; gap: 8px; }
 .toolbar-row select { width: auto; flex: none; }
+.search-box { position: relative; }
+.search-box input[type="search"] { padding-right: 48px; }
+/* The browser's own clear button would sit next to ours on desktop. */
+.search-box input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; }
+.search-clear {
+  position: absolute; top: 0; right: 0; width: 48px; height: 100%; min-height: 44px;
+  display: grid; place-items: center; padding: 0; border: 0; background: none;
+  color: var(--muted); cursor: pointer;
+}
+.search-clear[hidden] { display: none; }
+.search-clear svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; }
+.search-clear:hover, .search-clear:focus-visible { color: var(--ink); }
 .list-count { margin: 0; padding: 0 0 8px; font-size: 0.85rem; }
 
 /* Game list */

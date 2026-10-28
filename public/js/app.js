@@ -628,6 +628,27 @@ function watchRowHtml(g, today) {
 
 // ---------- discover ----------
 
+const CLEAR_BUTTON = `<button class="search-clear" type="button" aria-label="Clear search" hidden>
+  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7l10 10M17 7L7 17"/></svg></button>`;
+
+/**
+ * Wires the X inside a .search-box: shown only while there is text, and
+ * clearing goes through the input's own "input" handler so results reset.
+ */
+function bindClearButton(input) {
+  const btn = input.parentElement.querySelector(".search-clear");
+  const sync = () => (btn.hidden = !input.value);
+  input.addEventListener("input", sync);
+  // Keep focus (and the phone keyboard) in the input instead of on the button.
+  btn.addEventListener("pointerdown", (e) => e.preventDefault());
+  btn.addEventListener("click", () => {
+    input.value = "";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.focus();
+  });
+  sync();
+}
+
 /**
  * Add and Predicted in one screen: with an empty search box it lists every
  * prediction; while typing it shows matching predictions, then BGG results.
@@ -637,8 +658,11 @@ async function renderDiscover() {
   view.innerHTML = `
     <h1>Discover</h1>
     <div class="toolbar">
-      <input type="search" id="dq" placeholder="${bggOn ? "Search BGG and predictions" : "Search predictions"}"
-        value="${esc(prefs.discoverQ)}" aria-label="${bggOn ? "Search BoardGameGeek and your predictions" : "Search your predictions"}">
+      <div class="search-box">
+        <input type="search" id="dq" placeholder="${bggOn ? "Search BGG and predictions" : "Search predictions"}"
+          value="${esc(prefs.discoverQ)}" aria-label="${bggOn ? "Search BoardGameGeek and your predictions" : "Search your predictions"}">
+        ${CLEAR_BUTTON}
+      </div>
       <label class="toggle"><input type="checkbox" id="mwatch"> Watch instead of score</label>
     </div>
     ${bggOn ? "" : `<p class="notice">BGG search is off because the server has no BGG_TOKEN. You can still add games by name.</p>`}
@@ -733,6 +757,7 @@ async function renderDiscover() {
     fill();
     searchBgg();
   });
+  bindClearButton(view.querySelector("#dq"));
   view.querySelector("#psort").addEventListener("change", (e) => {
     prefs.predSort = e.target.value;
     savePrefs();
