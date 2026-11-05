@@ -1,5 +1,6 @@
 // Watchlist export for the monthly routine, which reads it from a private repo (ADR 0001).
 // Usage: npm run export-watchlist -- /path/to/private-repo/watchlist.json
+// A path of "-" writes the JSON to stdout (scripts/sync-watchlist.sh uses this).
 // GET /api/watchlist serves the same JSON. Each game uses the API's field names,
 // so the watchlist import can read the file back.
 import { writeFileSync } from "node:fs";
@@ -26,7 +27,8 @@ export function watchlistExport(store, now = new Date()) {
 
 export function writeWatchlist(store, file) {
   const data = watchlistExport(store);
-  writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+  // fd 1 for "-": the JSON is the only thing on stdout, the summary goes to stderr.
+  writeFileSync(file === "-" ? 1 : file, JSON.stringify(data, null, 2) + "\n");
   return data;
 }
 
@@ -45,5 +47,5 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
     process.exit(1);
   }
   const decided = data.games.filter((g) => g.decided).length;
-  console.log(`Exported ${data.games.length} watched games (${decided} decided) to ${file}`);
+  console.error(`Exported ${data.games.length} watched games (${decided} decided) to ${file === "-" ? "stdout" : file}`);
 }

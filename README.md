@@ -80,15 +80,24 @@ Watched games stay out of the main list, Summary and Claude export. **Settings �
 
 ### Export to the private repo
 
-A monthly cloud routine checks on watched games. It can't reach this server, so it reads a JSON export you commit to a separate private repo (see `docs/adr/0001-watchlist-routine-reads-a-private-repo.md`). The export holds every watched game, Decided ones flagged with `decided: true`, in Watchlist order, plus your weights and stretch factor and an `exportedAt` timestamp. Get it from **Settings → Export watchlist**, from `GET /api/watchlist`, or write it straight into a clone of the private repo:
+A monthly cloud routine checks on watched games. It can't reach this server, so it reads a JSON export you commit to a separate private repo (see `docs/adr/0001-watchlist-routine-reads-a-private-repo.md`). The export holds every watched game, Decided ones flagged with `decided: true`, in Watchlist order, plus your weights and stretch factor and an `exportedAt` timestamp. You can download it from **Settings → Export watchlist** or `GET /api/watchlist`, but the easy way is one command on the box running the container:
 
 ```sh
-npm run export-watchlist -- ~/watchlist-repo/watchlist.json
-# With Docker, write it to data/ and copy it over:
-#   docker compose run --rm tablescore node server/export-watchlist.js /data/watchlist.json
-#   cp data/watchlist.json ~/watchlist-repo/
-cd ~/watchlist-repo && git add watchlist.json && git commit -m "Watchlist $(date +%F)" && git push
+~/tablescore/scripts/sync-watchlist.sh
 ```
+
+It pulls the private repo (the routine commits its `state.json` there), exports the watchlist from the running container, and commits and pushes `watchlist.json` only if a game or setting changed; a new `exportedAt` alone doesn't count, except once the committed one is 30 days old (`REFRESH_DAYS`), so the routine, which calls an export over 45 days old stale, doesn't warn just because nothing changed. It runs from any directory and needs only Docker and git on the host, not Node. It stops with an error, leaving the repo alone, if the container is down or the export doesn't look right.
+
+- The clone defaults to `~/tablescore-watchlist`. If yours is elsewhere, set `WATCHLIST_REPO` in `.env` once (or in the environment, or pass the path as the first argument).
+- Set `DOCKER="sudo docker"` if your user isn't in the `docker` group.
+- To type just `sync-watchlist`, link it onto your PATH: `ln -s ~/tablescore/scripts/sync-watchlist.sh ~/.local/bin/sync-watchlist`.
+- To never think about it, run it from cron (`crontab -e`), e.g. daily at 3:30am. Cron has no SSH agent, so the private repo's remote needs a key without a passphrase or an HTTPS credential helper:
+
+  ```
+  30 3 * * * $HOME/tablescore/scripts/sync-watchlist.sh >>$HOME/tablescore-watchlist-sync.log 2>&1
+  ```
+
+Without Docker, inside the tablescore checkout with Node installed, `npm run export-watchlist -- <path>` writes the export to a file (`-` writes it to stdout); commit it yourself.
 
 ### Import watched games
 
