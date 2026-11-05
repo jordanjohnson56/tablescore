@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Sync the watchlist export into the private repo the monthly routine reads (ADR 0001).
+#
+#   scripts/sync-watchlist.sh [path/to/watchlist-repo]
+#
+# Pulls the private repo, exports the watchlist from the running Tablescore
+# container (no Node needed on the host), and commits and pushes watchlist.json
+# only if a game or setting changed. Works from any directory, and through a
+# symlink (e.g. ~/.local/bin/sync-watchlist).
+#
+# Settings (environment):
+#   WATCHLIST_REPO  clone of the private repo (default ~/tablescore-watchlist);
+#                   the first argument wins over it
+#   DOCKER          docker command (default docker; e.g. "sudo docker")
+set -euo pipefail
+
+die() { echo "sync-watchlist: $*" >&2; exit 1; }
+
+app_dir=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+repo=${1:-${WATCHLIST_REPO:-$HOME/tablescore-watchlist}}
+docker_cmd=${DOCKER:-docker}
+
+[ -d "$repo/.git" ] || die "$repo is not a git clone (set WATCHLIST_REPO or pass the path)"
+
+# Everything but exportedAt, which changes on every export. Comparing on this
+# keeps a cron job from committing every day when nothing changed.
+content() { grep -v '^  "exportedAt": ' "$1" || true; }
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+
+echo "Pulling $repo"
+git -C "$repo" pull --no-rebase --quiet || die "git pull failed in $repo; fix it there and rerun"
+
+echo "Exporting from the Tablescore container"
+# shellcheck disable=SC2086  # DOCKER may hold more than one word
+(cd "$app_dir" && $docker_cmd compose exec -T tablescore node --disable-warning=ExperimentalWarning server/export-watchlist.js -) >"$tmp" \
+  || die "export failed; is the container up? (cd $app_dir && docker compose ps)"
+
+# The export is pretty-printed JSON from JSON.stringify; check it is whole.
+head -c1 "$tmp" | grep -q '{' && tail -n1 "$tmp" | grep -qx '}' \
+  && grep -q '^  "exportedAt": ' "$tmp" && grep -q '^  "games": ' "$tmp" \
+  || die "export didn't look like a watchlist (first line: $(head -n1 "$tmp" | cut -c1-80))"
+
+target="$repo/watchlist.json"
+if [ -f "$target" ] && [ "$(content "$target")" = "$(content "$tmp")" ]; then
+  echo "No changes since the last sync; nothing to commit."
+  exit 0
+fi
+
+cp "$tmp" "$target"
+git -C "$repo" add watchlist.json
+git -C "$repo" commit --quiet -m "Watchlist $(date +%F)"
+echo "Pushing"
+git -C "$repo" push --quiet || die "push failed; the commit is in $repo, push it from there"
+echo "Synced $(grep -c '^      "name": ' "$target") watched games to $(git -C "$repo" remote get-url origin)"
