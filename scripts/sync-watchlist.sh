@@ -12,6 +12,9 @@
 #   WATCHLIST_REPO  clone of the private repo (default ~/tablescore-watchlist);
 #                   the first argument wins over it
 #   DOCKER          docker command (default docker; e.g. "sudo docker")
+#   REFRESH_DAYS    commit anyway once the committed exportedAt is this many
+#                   days old (default 30), so the routine, which flags exports
+#                   over 45 days old as stale, never sees a false stale warning
 set -euo pipefail
 
 die() { echo "sync-watchlist: $*" >&2; exit 1; }
@@ -25,6 +28,14 @@ docker_cmd=${DOCKER:-docker}
 # Everything but exportedAt, which changes on every export. Comparing on this
 # keeps a cron job from committing every day when nothing changed.
 content() { grep -v '^  "exportedAt": ' "$1" || true; }
+# Age in whole days of a file's exportedAt; a huge number if it can't be read.
+age_days() {
+  local ts
+  ts=$(sed -n 's/^  "exportedAt": "\(.*\)",$/\1/p' "$1" | head -n1)
+  ts=$(date -d "$ts" +%s 2>/dev/null) || { echo 99999; return; }
+  echo $(( ($(date +%s) - ts) / 86400 ))
+}
+refresh_days=${REFRESH_DAYS:-30}
 
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
@@ -44,8 +55,12 @@ head -c1 "$tmp" | grep -q '{' && tail -n1 "$tmp" | grep -qx '}' \
 
 target="$repo/watchlist.json"
 if [ -f "$target" ] && [ "$(content "$target")" = "$(content "$tmp")" ]; then
-  echo "No changes since the last sync; nothing to commit."
-  exit 0
+  age=$(age_days "$target")
+  if [ "$age" -lt "$refresh_days" ]; then
+    echo "No changes; the committed export is $age days old. Nothing to commit."
+    exit 0
+  fi
+  echo "No changes, but the committed export is $age days old; refreshing exportedAt."
 fi
 
 cp "$tmp" "$target"

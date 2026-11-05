@@ -86,7 +86,7 @@ A monthly cloud routine checks on watched games. It can't reach this server, so 
 ~/tablescore/scripts/sync-watchlist.sh
 ```
 
-It pulls the private repo (the routine commits its `state.json` there), exports the watchlist from the running container, and commits and pushes `watchlist.json` only if a game or setting changed; a new `exportedAt` alone doesn't count. It runs from any directory and needs only Docker and git on the host, not Node. It stops with an error, leaving the repo alone, if the container is down or the export doesn't look right.
+It pulls the private repo (the routine commits its `state.json` there), exports the watchlist from the running container, and commits and pushes `watchlist.json` only if a game or setting changed; a new `exportedAt` alone doesn't count, except once the committed one is 30 days old (`REFRESH_DAYS`), so the routine, which calls an export over 45 days old stale, doesn't warn just because nothing changed. It runs from any directory and needs only Docker and git on the host, not Node. It stops with an error, leaving the repo alone, if the container is down or the export doesn't look right.
 
 - The clone defaults to `~/tablescore-watchlist`. Pass another path as the first argument or set `WATCHLIST_REPO`.
 - Set `DOCKER="sudo docker"` if your user isn't in the `docker` group.
