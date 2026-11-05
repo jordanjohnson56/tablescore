@@ -9,8 +9,9 @@
 # symlink (e.g. ~/.local/bin/sync-watchlist).
 #
 # Settings (environment):
-#   WATCHLIST_REPO  clone of the private repo (default ~/tablescore-watchlist);
-#                   the first argument wins over it
+#   WATCHLIST_REPO  clone of the private repo (default ~/tablescore-watchlist).
+#                   Also read from this checkout's .env; the environment wins
+#                   over .env, and the first argument wins over both
 #   DOCKER          docker command (default docker; e.g. "sudo docker")
 #   REFRESH_DAYS    commit anyway once the committed exportedAt is this many
 #                   days old (default 30), so the routine, which flags exports
@@ -20,7 +21,10 @@ set -euo pipefail
 die() { echo "sync-watchlist: $*" >&2; exit 1; }
 
 app_dir=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
-repo=${1:-${WATCHLIST_REPO:-$HOME/tablescore-watchlist}}
+# Only this one line of .env is read; .env holds secrets and isn't shell syntax.
+env_repo=$(sed -n 's/^WATCHLIST_REPO=//p' "$app_dir/.env" 2>/dev/null | tail -n1 | sed 's/^["'"'"']//; s/["'"'"']$//')
+repo=${1:-${WATCHLIST_REPO:-${env_repo:-$HOME/tablescore-watchlist}}}
+repo=${repo/#\~/$HOME}
 docker_cmd=${DOCKER:-docker}
 
 [ -d "$repo/.git" ] || die "$repo is not a git clone (set WATCHLIST_REPO or pass the path)"
