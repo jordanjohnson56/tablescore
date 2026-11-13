@@ -7,6 +7,7 @@ import {
   summaryStats, visibleGames, sortWatchlist, awaitingHint, monthLabel,
 } from "./watchlist.js";
 import { api } from "./api.js";
+import * as rk from "./prototype-rank-badge.js"; // PROTOTYPE, throwaway
 
 const view = document.getElementById("view");
 let state = { settings: null, games: [], bgg: { configured: false }, claude: { configured: false } };
@@ -194,6 +195,7 @@ function renderList() {
     </div>
     <ul class="list" id="games"></ul>`;
   const fill = () => {
+    rk.computeRanks(shownGames(), final); // PROTOTYPE
     const list = filtered();
     document.getElementById("count").textContent = `${list.length} ${list.length === 1 ? "game" : "games"}`;
     document.getElementById("games").innerHTML = list.length
@@ -247,16 +249,16 @@ function rowHtml(g) {
     n > 0 && n < 7 ? `<span class="tag warn">${n}/7</span>` : "",
     g.avoidTheme ? `<span class="tag danger">Avoid</span>` : "",
     bggDrift(g) != null ? `<span class="tag warn" title="BGG rating differs">BGG</span>` : "",
-  ].join("");
+  ].join("") + rk.metaTag(g); // PROTOTYPE
   const badge = f != null
-    ? `<div class="num">${formatNumber(f)}</div><div class="lbl">score</div>`
+    ? `<div class="num">${formatNumber(f)}</div><div class="lbl">${rk.badgeLabel(g) ?? "score"}</div>`
     : isWatching(g)
       ? `<div class="num predicted">${formatNumber(g.predictedScore)}</div><div class="lbl">predicted</div>`
       : g.bggRating != null
         ? `<div class="num old">${formatNumber(g.bggRating)}</div><div class="lbl">old</div>`
         : `<div class="num old">—</div>`;
   return `<li class="${g.avoidTheme ? "avoid" : ""}"><a class="game-row" href="#/g/${g.id}">
-    ${thumbHtml(g)}
+    ${rk.leadCol(g)}${rk.thumbWrap(g, thumbHtml(g)) ?? thumbHtml(g)}
     <div class="info"><div class="name">${esc(g.name)}</div><div class="meta">${metaHtml(g, tags)}</div></div>
     <div class="score-badge">${badge}</div></a></li>`;
 }
@@ -283,6 +285,7 @@ function renderScorer(id) {
       <div class="title">
         <div class="name ${g.avoidTheme ? "avoid-name" : ""}">${esc(g.name)}</div>
         <div class="save-state">${esc(rescoreStatus(g.scores))}</div>
+        <div id="rk-head"></div>
       </div>
       <div class="final" id="final"></div>
     </header>
@@ -345,8 +348,12 @@ function renderScorer(id) {
     const f = final(g);
     const n = scoredCount(g.scores);
     const [, label] = f != null ? scaleEntry(f) : [];
+    rk.computeRanks(shownGames(), final); // PROTOTYPE
+    const rkHead = rk.headHtml(g);
+    const rkInLabel = rk.variant === "C" ? rkHead : "";
+    view.querySelector("#rk-head").innerHTML = rk.variant === "C" ? "" : rkHead;
     view.querySelector("#final").innerHTML = f != null
-      ? `<div class="num">${formatNumber(f)}</div><div class="lbl">${esc(label)}${isProvisional(g) ? " · prov." : ""}</div>`
+      ? `<div class="num">${formatNumber(f)}</div><div class="lbl">${esc(label)}${isProvisional(g) ? " · prov." : ""}${rkInLabel}</div>`
       : `<div class="num" style="color:var(--muted)">${n}/7</div><div class="lbl">criteria</div>`;
     const raw = rawAverage(g.scores, state.settings);
     view.querySelector("#raw").textContent = raw == null ? "—" : raw.toFixed(2);
@@ -1537,6 +1544,8 @@ document.getElementById("more-sync").addEventListener("click", async () => {
 async function reload() {
   state = await api.get("/api/state");
 }
+
+rk.mountSwitcher(); // PROTOTYPE
 
 (async () => {
   view.innerHTML = `<p class="empty">Loading…</p>`;
