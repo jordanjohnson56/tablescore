@@ -4,7 +4,7 @@ import {
 } from "./rubric.js";
 import {
   STAGES, STAGE_LABELS, PLATFORMS, DEFAULT_CURRENCY, targetCurrency, claudeExport, isDecided, isWatching, isHiddenType,
-  summaryStats, visibleGames, sortWatchlist, awaitingHint, monthLabel,
+  summaryStats, visibleGames, sortWatchlist, awaitingHint, monthLabel, rankings,
 } from "./watchlist.js";
 import { api } from "./api.js";
 
@@ -20,6 +20,7 @@ const esc = (s) =>
 const final = (g) => finalScore(g.scores, state.settings);
 const byId = (id) => state.games.find((g) => g.id === id);
 const shownGames = () => visibleGames(state.games, state.settings);
+const ranked = () => rankings(state.games, state.settings);
 
 function loadPrefs() {
   try {
@@ -195,9 +196,10 @@ function renderList() {
     <ul class="list" id="games"></ul>`;
   const fill = () => {
     const list = filtered();
+    const ranks = ranked();
     document.getElementById("count").textContent = `${list.length} ${list.length === 1 ? "game" : "games"}`;
     document.getElementById("games").innerHTML = list.length
-      ? list.map(rowHtml).join("")
+      ? list.map((g) => rowHtml(g, ranks)).join("")
       : `<li class="empty">${shownGames().length ? "No games match." : state.games.length ? "Every game is hidden: Settings can hide watched games and expansions from this list." : 'No games yet. Import your spreadsheet or use <a href="#/discover">Discover</a>.'}</li>`;
   };
   fill();
@@ -237,7 +239,20 @@ function thumbHtml(g) {
     : `<div class="thumb" aria-hidden="true"></div>`;
 }
 
-function rowHtml(g) {
+/** "#3 of 105", with "tied" when another game shares the place. */
+function rankText(rank, total) {
+  return `#${rank.place} of ${total}${rank.tied ? " · tied" : ""}`;
+}
+
+/** The thumbnail, with the game's place in the rankings on its corner when it has one. */
+function rankedThumbHtml(g, ranks) {
+  const rank = ranks.get(g.id);
+  if (!rank) return thumbHtml(g);
+  return `<div class="rank-thumb">${thumbHtml(g)}<span class="rank-chip${rank.place <= 3 ? " podium" : ""}"
+    title="Ranked ${esc(rankText(rank, ranks.total))}" aria-label="Ranked ${esc(rankText(rank, ranks.total))}">${rank.place}</span></div>`;
+}
+
+function rowHtml(g, ranks) {
   const f = final(g);
   const n = scoredCount(g.scores);
   const tags = [
@@ -256,7 +271,7 @@ function rowHtml(g) {
         ? `<div class="num old">${formatNumber(g.bggRating)}</div><div class="lbl">old</div>`
         : `<div class="num old">—</div>`;
   return `<li class="${g.avoidTheme ? "avoid" : ""}"><a class="game-row" href="#/g/${g.id}">
-    ${thumbHtml(g)}
+    ${rankedThumbHtml(g, ranks)}
     <div class="info"><div class="name">${esc(g.name)}</div><div class="meta">${metaHtml(g, tags)}</div></div>
     <div class="score-badge">${badge}</div></a></li>`;
 }
@@ -283,6 +298,7 @@ function renderScorer(id) {
       <div class="title">
         <div class="name ${g.avoidTheme ? "avoid-name" : ""}">${esc(g.name)}</div>
         <div class="save-state">${esc(rescoreStatus(g.scores))}</div>
+        <div id="rank"></div>
       </div>
       <div class="final" id="final"></div>
     </header>
@@ -345,6 +361,11 @@ function renderScorer(id) {
     const f = final(g);
     const n = scoredCount(g.scores);
     const [, label] = f != null ? scaleEntry(f) : [];
+    const ranks = ranked();
+    const rank = ranks.get(g.id);
+    view.querySelector("#rank").innerHTML = rank
+      ? `<span class="rank-pill${rank.place <= 3 ? " podium" : ""}">${esc(rankText(rank, ranks.total))}</span>`
+      : "";
     view.querySelector("#final").innerHTML = f != null
       ? `<div class="num">${formatNumber(f)}</div><div class="lbl">${esc(label)}${isProvisional(g) ? " · prov." : ""}</div>`
       : `<div class="num" style="color:var(--muted)">${n}/7</div><div class="lbl">criteria</div>`;

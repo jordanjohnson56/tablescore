@@ -10,6 +10,9 @@ A personal board game scoring app. Games are scored with a weighted rubric and c
 The final score for a game: 5 + (weighted average of the rubric criteria − 5) × stretch, clamped to 0–10, one decimal.
 _Avoid_: rating (that word is reserved for BGG ratings)
 
+**Rank**:
+A game's place among the user's scored games, by Tablescore. Expansions and games the main list hides are left out, and ties share a place (1, 1, 3). It ignores the list's filter and search.
+
 **Status**:
 Where a game sits in the user's BGG collection (Owned, Preordered, Prev. owned, Wishlist, Want to play). It belongs to BGG and a sync overwrites it.
 _Avoid_: using it for anything the app decides

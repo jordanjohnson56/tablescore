@@ -84,6 +84,28 @@ export function visibleGames(games, settings) {
 }
 
 /**
+ * Each game's place in the user's rankings: the scored games the main list shows,
+ * expansions left out, ordered by Tablescore. Ties share a place (1, 1, 3). The
+ * result answers get(id) with { place, tied } or null, and carries the total.
+ */
+export function rankings(games, settings) {
+  const final = scoreWith(settings);
+  const scored = visibleGames(games, settings)
+    .filter((g) => g.type !== "Expansion")
+    .map((g) => ({ id: g.id, f: final(g) }))
+    .filter((x) => x.f != null)
+    .sort((a, b) => b.f - a.f);
+  const places = new Map();
+  scored.forEach((x, i) => places.set(x.id, i > 0 && x.f === scored[i - 1].f ? places.get(scored[i - 1].id) : i + 1));
+  const counts = new Map();
+  for (const p of places.values()) counts.set(p, (counts.get(p) || 0) + 1);
+  return {
+    total: scored.length,
+    get: (id) => (places.has(id) ? { place: places.get(id), tied: counts.get(places.get(id)) > 1 } : null),
+  };
+}
+
+/**
  * The Summary view's numbers: old ratings against new rubric scores for the
  * games the list shows. Only real rubric scores count, never predicted scores.
  */

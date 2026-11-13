@@ -332,3 +332,17 @@ ul.plain li .btn { margin-left: auto; }
 .sec-head select { width: auto; min-height: 36px; padding: 4px 10px; }
 .add-name { margin: 20px 0 0; }
 .add-name > summary { cursor: pointer; color: var(--accent); font-weight: 600; padding: 8px 0; }
+
+/* Place in the rankings: a chip on the list thumbnail and a pill in the scorer header */
+.rank-thumb { position: relative; flex: none; }
+.rank-chip {
+  position: absolute; top: -6px; left: -6px;
+  display: grid; place-items: center; min-width: 22px; height: 22px; padding: 0 5px; border-radius: 11px;
+  border: 2px solid var(--bg); background: var(--ink); color: var(--bg);
+  font-size: 0.68rem; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums;
+}
+.rank-pill {
+  display: inline-flex; align-items: center; height: 20px; margin-top: 2px; padding: 0 8px; border-radius: 10px;
+  background: var(--ink); color: var(--bg); font-size: 0.75rem; font-weight: 700; line-height: 1;
+}
+.rank-chip.podium, .rank-pill.podium { background: #c8961e; color: #1d1f23; }
