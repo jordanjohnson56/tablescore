@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CRITERIA, DEFAULT_SETTINGS } from "../public/js/rubric.js";
-import { awaitingHint, claudeExport, monthLabel, sortWatchlist, summaryStats, targetCurrency, visibleGames } from "../public/js/watchlist.js";
+import { awaitingHint, claudeExport, monthLabel, rankings, sortWatchlist, summaryStats, targetCurrency, visibleGames } from "../public/js/watchlist.js";
 
 const base = { type: "Base", scores: {}, plays: 0, status: "", avoidTheme: false, bggRating: null };
 const game = (name, extra = {}) => ({ ...base, name, ...extra });
@@ -182,4 +182,34 @@ test("Summary statistics never use predicted scores", () => {
     assert.deepEqual(s.new.histogram[0], [10, 0]); // the predicted 10 never lands in the histogram
     assert.equal(s.games.length, includeWatching ? 8 : 6);
   }
+});
+
+test("rankings place scored games by Tablescore, with ties sharing a place", () => {
+  const games = [
+    game("Brass", { id: 1, scores: vec([10, 10, 10, 10, 10, 10, 10]) }),
+    game("Avalon", { id: 2, scores: vec([10, 10, 10, 10, 10, 10, 10]) }),
+    game("Root", { id: 3, scores: vec([9, 4, 9, 10, 9, 9, 8]) }),
+    game("Unscored", { id: 4 }),
+  ];
+  const r = rankings(games, DEFAULT_SETTINGS);
+  assert.equal(r.total, 3);
+  assert.deepEqual(r.get(1), { place: 1, tied: true });
+  assert.deepEqual(r.get(2), { place: 1, tied: true });
+  assert.deepEqual(r.get(3), { place: 3, tied: false });
+  assert.equal(r.get(4), null);
+});
+
+test("rankings leave out expansions and games the main list hides", () => {
+  const scores = vec([9, 4, 9, 10, 9, 9, 8]);
+  const games = [
+    game("Dune", { id: 1, scores: vec([10, 10, 10, 10, 10, 10, 10]) }),
+    game("Dune: Rise of Ix", { id: 2, type: "Expansion", scores }),
+    game("Watched", { id: 3, watchStage: "reviews", scores }),
+    game("Root", { id: 4, scores }),
+  ];
+  const r = rankings(games, DEFAULT_SETTINGS);
+  assert.equal(r.total, 2);
+  assert.equal(r.get(2), null);
+  assert.equal(r.get(3), null);
+  assert.deepEqual(r.get(4), { place: 2, tied: false });
 });
