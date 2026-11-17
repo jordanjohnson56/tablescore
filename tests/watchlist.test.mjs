@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CRITERIA, DEFAULT_SETTINGS } from "../public/js/rubric.js";
-import { awaitingHint, claudeExport, monthLabel, rankings, sortWatchlist, summaryStats, targetCurrency, visibleGames } from "../public/js/watchlist.js";
+import { awaitingHint, bggUrl, bgoSearchUrl, claudeExport, monthLabel, rankings, sortWatchlist, summaryStats, targetCurrency, visibleGames } from "../public/js/watchlist.js";
 
 const base = { type: "Base", scores: {}, plays: 0, status: "", avoidTheme: false, bggRating: null };
 const game = (name, extra = {}) => ({ ...base, name, ...extra });
@@ -212,4 +212,12 @@ test("rankings leave out expansions and games the main list hides", () => {
   assert.equal(r.get(2), null);
   assert.equal(r.get(3), null);
   assert.deepEqual(r.get(4), { place: 2, tied: false });
+});
+
+test("outside links point at the BGG page and a Board Game Oracle search", () => {
+  assert.equal(bggUrl(224517), "https://boardgamegeek.com/boardgame/224517");
+  assert.equal(
+    bgoSearchUrl("Brass: Birmingham & Co"),
+    "https://www.boardgameoracle.com/boardgame/search?q=Brass%3A%20Birmingham%20%26%20Co",
+  );
 });

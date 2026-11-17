@@ -157,3 +157,17 @@ export function claudeExport(games, settings) {
   }
   return { text: lines.join("\n"), scored: scored.length, rest: rest.length, watching: watching.length };
 }
+
+/** A game's page on BoardGameGeek. */
+export function bggUrl(bggId) {
+  return `https://boardgamegeek.com/boardgame/${bggId}`;
+}
+
+/**
+ * Board Game Oracle (US) price search for a game. Its game pages use its own
+ * opaque ids, not BGG ids, so search by name is the one URL that lands on
+ * results; /boardgame/search?q= is the shape it serves (/search?q= 404s).
+ */
+export function bgoSearchUrl(name) {
+  return `https://www.boardgameoracle.com/boardgame/search?q=${encodeURIComponent(name)}`;
+}
