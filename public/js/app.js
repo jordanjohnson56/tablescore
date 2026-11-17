@@ -4,7 +4,7 @@ import {
 } from "./rubric.js";
 import {
   STAGES, STAGE_LABELS, PLATFORMS, DEFAULT_CURRENCY, targetCurrency, claudeExport, isDecided, isWatching, isHiddenType,
-  summaryStats, visibleGames, sortWatchlist, awaitingHint, monthLabel, rankings,
+  summaryStats, visibleGames, sortWatchlist, awaitingHint, monthLabel, rankings, bggUrl, bgoSearchUrl,
 } from "./watchlist.js";
 import { api } from "./api.js";
 
@@ -352,7 +352,7 @@ function renderScorer(id) {
         <div><dt>Weight</dt><dd>${formatNumber(g.bggWeight, 2)}</dd></div>
         <div><dt>Year</dt><dd>${g.year ?? "—"}</dd></div>
       </dl>
-      ${g.bggId ? `<p class="small"><a href="https://boardgamegeek.com/boardgame/${g.bggId}" target="_blank" rel="noopener">Open on BGG</a></p>` : ""}
+      ${gameLinksHtml(g.bggId, g.name)}
       ${watching ? "" : linkHtml}
       <div class="btn-row"><button class="btn danger" id="del" type="button">Delete game</button></div>
     </section>`;
@@ -376,7 +376,7 @@ function renderScorer(id) {
       ? `<div class="notice drift">
           <p>Rate it <b>${formatNumber(d)}</b> on BGG${g.bggRating != null ? ` (it has ${formatNumber(g.bggRating)})` : ""}.</p>
           <div class="btn-row">
-            <a class="btn primary" data-act="open" href="https://boardgamegeek.com/boardgame/${g.bggId}" target="_blank" rel="noopener">Copy ${formatNumber(d)} &amp; open BGG</a>
+            <a class="btn primary" data-act="open" href="${bggUrl(g.bggId)}" target="_blank" rel="noopener">Copy ${formatNumber(d)} &amp; open BGG</a>
             <button class="btn" type="button" data-act="done">I've rated it</button>
           </div>
         </div>`
@@ -645,6 +645,19 @@ function watchRowHtml(g, today) {
     ${awaitingHint(g, today) ? `<div class="notice"><span>Campaign ended ${esc(g.campaignEnd)}.</span>
       <button class="btn" type="button" data-act="awaiting">Move to Awaiting delivery?</button></div>` : ""}
   </li>`;
+}
+
+// ---------- outside links ----------
+
+const DICE_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><circle class="dot" cx="9" cy="9" r="1.3"/><circle class="dot" cx="15" cy="15" r="1.3"/><circle class="dot" cx="15" cy="9" r="1.3"/><circle class="dot" cx="9" cy="15" r="1.3"/></svg>`;
+const TAG_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12V4a1 1 0 0 1 1-1h8l9 9-9 9z"/><circle class="dot" cx="8" cy="8" r="1.5"/></svg>`;
+
+/** Full-width outline buttons to the game on BGG and its prices on Board Game Oracle. */
+function gameLinksHtml(bggId, name) {
+  const links = [];
+  if (bggId) links.push(`<a class="btn outline" href="${bggUrl(bggId)}" target="_blank" rel="noopener">${DICE_ICON}<span>Open on BGG</span></a>`);
+  if (name) links.push(`<a class="btn outline" href="${esc(bgoSearchUrl(name))}" target="_blank" rel="noopener">${TAG_ICON}<span>Prices on Board Game Oracle</span></a>`);
+  return links.length ? `<div class="link-stack">${links.join("")}</div>` : "";
 }
 
 // ---------- discover ----------
@@ -1156,7 +1169,7 @@ async function renderPrediction(kind, id, name) {
       ${running ? `<section class="card"><p><b>Claude is working on it.</b> This usually takes under a minute. You can leave this page; the prediction is saved when it's done.</p></section>` : ""}
       ${latest && !running ? predictionCardHtml(latest, game) : ""}
       ${!latest ? `<p class="small muted">Claude compares this game with every game you've scored, your taste profile and BGG's details, searches the web if it needs to, and predicts each of the seven criteria. The final score uses your weights.</p>` : ""}
-      ${bggId ? `<p class="small"><a href="https://boardgamegeek.com/boardgame/${bggId}" target="_blank" rel="noopener">Open on BGG</a></p>` : ""}
+      ${gameLinksHtml(bggId, game?.name || name)}
       ${canPredict ? `<div class="btn-row"><button class="btn primary" id="predict" type="button">${latest ? "Predict again" : "Predict my score"}</button></div>` : ""}
       ${!game && latest?.status === "done" ? `<div class="btn-row">
           <button class="btn" type="button" data-add-as="list">Add to list</button>
