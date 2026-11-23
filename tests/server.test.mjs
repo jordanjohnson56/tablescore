@@ -564,6 +564,27 @@ test("an old database opens with its games intact and the watch fields present a
   }
 });
 
+test("on open, a prediction on a game with a different BGG ID is detached from it, once", () => {
+  const file = join(mkdtempSync(join(tmpdir(), "ts-mig-")), "reused.db");
+  const store = openDb(file);
+  const g = store.createGame({ name: "Wrong game", bggId: 600 });
+  const wrong = store.createPrediction({ bggId: 500, gameId: g.id, name: "Brass: Extra", model: "m" });
+  const right = store.createPrediction({ bggId: 600, gameId: g.id, name: "Wrong game", model: "m" });
+  const local = store.createPrediction({ gameId: g.id, name: "No BGG", model: "m" });
+  store.db.close();
+  const gameIds = () => {
+    const db = new DatabaseSync(file);
+    const rows = db.prepare("SELECT id, game_id FROM predictions ORDER BY id").all();
+    db.close();
+    return rows.map((r) => [r.id, r.game_id]);
+  };
+  const expected = [[wrong.id, null], [right.id, g.id], [local.id, g.id]];
+  for (let open = 1; open <= 2; open++) {
+    openDb(file).db.close();
+    assert.deepEqual(gameIds(), expected);
+  }
+});
+
 const WATCHED = {
   watchStage: "campaign", campaignUrl: "https://www.kickstarter.com/projects/x/bookwyrm", platform: "kickstarter",
   campaignEnd: "2026-10-15", deliveryEst: "2027-09", predictedScore: 7.3, targetPrice: 45.5, targetCurrency: "EUR",

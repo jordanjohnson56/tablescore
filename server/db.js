@@ -116,6 +116,8 @@ export function openDb(file) {
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     -- Claude's predicted scores. Keyed by BGG ID so a game can be predicted
     -- without adding it; game_id covers games in the list that have no BGG ID.
+    -- A deleted game's predictions keep its game_id, and createGame never
+    -- gives a new game an id a prediction still holds.
     CREATE TABLE IF NOT EXISTS predictions (
       id INTEGER PRIMARY KEY,
       bgg_id INTEGER,
@@ -191,6 +193,12 @@ function migrate(db) {
   // BGG's thumbnail for a predicted game that isn't in the list.
   const predCols = new Set(db.prepare("PRAGMA table_info(predictions)").all().map((c) => c.name));
   if (!predCols.has("thumbnail")) db.exec("ALTER TABLE predictions ADD COLUMN thumbnail TEXT");
+  // Before createGame stopped reusing ids, a deleted game's predictions could
+  // land on the next game. Where the BGG IDs disagree that is provable (a
+  // game's BGG ID is only ever set from empty), so detach them; their BGG ID
+  // still finds them.
+  db.exec(`UPDATE predictions SET game_id = NULL WHERE bgg_id IS NOT NULL AND game_id IN
+    (SELECT id FROM games g WHERE g.bgg_id IS NOT NULL AND g.bgg_id != predictions.bgg_id)`);
 }
 
 export class Store {
@@ -241,8 +249,14 @@ export class Store {
     }
     if (!cols.name) throw new HttpError(400, "name is required");
     const names = Object.keys(cols);
+    // A deleted game's predictions keep its id, and SQLite would hand a deleted
+    // highest id to the next game, which would then show them as its own. So
+    // the new id is above every game id and every prediction's game_id. One
+    // statement, so the CLIs writing to the same file can't race it.
+    const nextId =
+      "(SELECT MAX(IFNULL((SELECT MAX(id) FROM games), 0), IFNULL((SELECT MAX(game_id) FROM predictions), 0)) + 1)";
     const { lastInsertRowid } = this.db
-      .prepare(`INSERT INTO games (${names.join(", ")}) VALUES (${names.map(() => "?").join(", ")})`)
+      .prepare(`INSERT INTO games (id, ${names.join(", ")}) VALUES (${nextId}, ${names.map(() => "?").join(", ")})`)
       .run(...Object.values(cols));
     return this.getGame(Number(lastInsertRowid));
   }

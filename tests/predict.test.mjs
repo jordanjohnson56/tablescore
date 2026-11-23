@@ -399,6 +399,77 @@ test("latest predictions: one per game, the newest finished one, joined to the l
   }
 });
 
+// ---------- a deleted game's id is never reused while a prediction holds it ----------
+
+test("a new game doesn't take the id of a deleted game whose prediction is still running", () => {
+  const store = openDb(":memory:");
+  const a = store.createGame({ name: "A" });
+  store.createPrediction({ gameId: a.id, name: "A", model: "m" });
+  store.deleteGame(a.id);
+  const b = store.createGame({ name: "B" });
+  assert.ok(b.id > a.id);
+  assert.deepEqual(store.listPredictions({ gameId: b.id }), []);
+  const latest = store.latestPredictions();
+  assert.equal(latest.length, 1);
+  assert.equal(latest[0].gameId, null);
+});
+
+test("a deleted game's prediction stays off the next game and attaches again when its BGG game is re-added", async () => {
+  const t = await startApp({ replies: [submitMsg()] });
+  try {
+    const a = t.store.createGame({ name: "Brass: Extra", bggId: 500 });
+    await t.settle((await t.call("POST", "/api/predictions", { gameId: a.id })).body.id);
+    assert.equal((await t.call("DELETE", `/api/games/${a.id}`, {})).status, 204);
+    const b = (await t.call("POST", "/api/games", { name: "Other", bggId: 600 })).body;
+    assert.deepEqual((await t.call("GET", `/api/predictions?gameId=${b.id}`)).body, []);
+    let latest = (await t.call("GET", "/api/predictions/latest")).body;
+    assert.equal(latest.length, 1);
+    assert.equal(latest[0].gameId, null);
+
+    const again = (await t.call("POST", "/api/games", { name: "Brass: Extra", bggId: 500 })).body;
+    latest = (await t.call("GET", "/api/predictions/latest")).body;
+    assert.equal(latest.length, 1);
+    assert.equal(latest[0].gameId, again.id);
+  } finally {
+    t.close();
+  }
+});
+
+test("accuracy doesn't pair a deleted game's prediction with the next game's Tablescore", async () => {
+  const t = await startApp({ replies: [submitMsg()] });
+  try {
+    const a = t.store.createGame({ name: "No BGG" });
+    await t.settle((await t.call("POST", "/api/predictions", { gameId: a.id })).body.id);
+    t.store.deleteGame(a.id);
+    const b = t.store.createGame({ name: "Another" });
+    await t.call("PATCH", `/api/games/${b.id}`, { scores: all(7) });
+    assert.ok(t.store.getGame(b.id).scoredAt);
+    assert.equal((await t.call("GET", "/api/predictions/accuracy")).body.n, 0);
+  } finally {
+    t.close();
+  }
+});
+
+test("over HTTP, a game added after deleting one with a prediction gets a different id", async () => {
+  const t = await startApp();
+  try {
+    const a = (await t.call("POST", "/api/games", { name: "A" })).body;
+    t.store.createPrediction({ gameId: a.id, name: "A", model: "m" });
+    assert.equal((await t.call("DELETE", `/api/games/${a.id}`, {})).status, 204);
+    const b = await t.call("POST", "/api/games", { name: "B" });
+    assert.equal(b.status, 201);
+    assert.notEqual(b.body.id, a.id);
+  } finally {
+    t.close();
+  }
+});
+
+test("with no predictions, game ids start at 1 as before", () => {
+  const store = openDb(":memory:");
+  assert.equal(store.createGame({ name: "First" }).id, 1);
+  assert.equal(store.createGame({ name: "Second" }).id, 2);
+});
+
 test("a prediction keeps BGG's thumbnail, and older ones get it backfilled once", async () => {
   const thing = THING.replace("<yearpublished", "<thumbnail>https://img.example/500.jpg</thumbnail><yearpublished");
   const t = await startApp({ replies: [submitMsg()], thing });
