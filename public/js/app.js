@@ -11,6 +11,7 @@ import { api } from "./api.js";
 import { latestOnly, SUPERSEDED } from "./latest.js";
 import { sharedPoll } from "./poll.js";
 import { applySaved, createSaveQueue, mergeGames } from "./saves.js";
+import { canRefresh, isStale, repaintsAfterRefresh, syncStep, syncToast } from "./refresh.js";
 
 const view = document.getElementById("view");
 let state = { settings: null, games: [], bgg: { configured: false }, claude: { configured: false } };
@@ -106,12 +107,20 @@ function setSaveState(text) {
   if (el) el.textContent = text;
 }
 window.addEventListener("pagehide", () => saves.flushAll({ keepalive: true }));
+// Coming back (into view, from the back/forward cache, or online): send what is waiting, then catch up.
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden") saves.flushAll({ keepalive: true });
-  else saves.retry();
+  if (document.visibilityState === "hidden") return saves.flushAll({ keepalive: true });
+  saves.retry();
+  resume();
 });
-window.addEventListener("pageshow", () => saves.retry());
-window.addEventListener("online", () => saves.retry());
+window.addEventListener("pageshow", (e) => {
+  saves.retry();
+  if (e.persisted) resume();
+});
+window.addEventListener("online", () => {
+  saves.retry();
+  resume();
+});
 
 // ---------- router ----------
 
@@ -141,8 +150,11 @@ function route() {
 window.addEventListener("hashchange", (e) => {
   // A prediction page opened from Discover goes back there.
   if (location.hash.startsWith("#/predict/")) predictBack = new URL(e.oldURL).hash.startsWith("#/discover") ? "#/discover" : null;
+  // Before the first load succeeds there is no state to show, so a tab tap tries the load again.
+  if (!booted) return void boot();
   route();
   window.scrollTo(0, 0);
+  if (refreshOwed) refresh({ force: true });
 });
 
 // ---------- list ----------
@@ -744,14 +756,14 @@ async function renderDiscover() {
         const rows = await searchBggLatest(q);
         if (rows === SUPERSEDED || mine !== seq) return;
         const shown = rows.filter((r) => !isHiddenType(r.type, state.settings));
+        // The server knows a game this page's state lacks (added elsewhere), so fetch the state again.
+        if (shown.some((r) => r.inList && !state.games.some((g) => g.bggId === r.bggId))) refresh({ force: true });
         results.innerHTML = shown.length
           ? shown.map((r) => `<li><div class="game-row">
               <div class="info"><div class="name">${esc(r.name)}${r.type === "Expansion" ? '<span class="tag">Exp</span>' : ""}</div>
               <div class="meta">${r.year ?? ""}</div></div>
               ${predictLinkHtml(r)}
-              ${r.inList
-                ? `<a class="btn" href="#/g/${state.games.find((g) => g.bggId === r.bggId)?.id}">Open</a>`
-                : `<button class="btn primary" data-add="${r.bggId}">Add</button>`}
+              ${discoverAction(r)}
             </div></li>`).join("")
           : `<li class="empty">No matches on BGG.</li>`;
       } catch (err) {
@@ -953,7 +965,51 @@ function renderSummary() {
 
 // ---------- settings ----------
 
+// One watcher follows a running BGG sync wherever the owner is, and fetches the state again when it
+// finishes, with a result or an error (a failed sync may already have saved the collection).
 let syncPoll;
+let syncSeen = null;
+
+/** Show the sync job on Settings, if Settings is open. */
+function paintSync(job) {
+  const btn = view.querySelector("#sync");
+  const el = view.querySelector("#syncstate");
+  if (!btn || !el) return;
+  btn.disabled = job.running || !state.bgg.username;
+  if (job.running) el.textContent = `${job.phase}${job.total ? ` (${job.done}/${job.total})` : ""}…`;
+  else if (job.error) el.innerHTML = `<span class="tag warn">Sync failed</span> ${esc(job.error)}`;
+  else if (job.result) el.textContent = `Last sync: ${job.result.collection} items, ${job.result.added} new, ${job.result.updated} updated, ${job.result.linked} linked, ${job.result.enriched} detailed.`;
+  else el.textContent = "";
+}
+
+async function checkSync() {
+  clearTimeout(syncPoll);
+  let job;
+  try {
+    job = await api.get("/api/bgg/sync");
+  } catch {
+    return; // server unreachable; the next resume or Settings visit looks again
+  }
+  paintSync(job);
+  const step = syncStep(syncSeen, job);
+  syncSeen = step.seen;
+  clearTimeout(syncPoll); // another check may have scheduled one while this one waited
+  if (job.running && !document.hidden) syncPoll = setTimeout(checkSync, 2000);
+  if (step.finished) {
+    if (!location.hash.startsWith("#/settings")) toast(syncToast(job), 5000);
+    refresh({ force: true });
+  }
+}
+
+/** Start a BGG sync and follow it. */
+async function startSync() {
+  const job = await api.post("/api/bgg/sync", {});
+  paintSync(job);
+  syncSeen = syncStep(syncSeen, job).seen;
+  clearTimeout(syncPoll);
+  syncPoll = setTimeout(checkSync, 1500);
+}
+
 function renderSettings() {
   const s = state.settings;
   view.innerHTML = `
@@ -1045,35 +1101,14 @@ function renderSettings() {
 
   const syncBtn = view.querySelector("#sync");
   if (!syncBtn) return;
-  const paint = (job) => {
-    const el = view.querySelector("#syncstate");
-    if (!el) return;
-    syncBtn.disabled = job.running || !state.bgg.username;
-    if (job.running) el.textContent = `${job.phase}${job.total ? ` (${job.done}/${job.total})` : ""}…`;
-    else if (job.error) el.innerHTML = `<span class="tag warn">Sync failed</span> ${esc(job.error)}`;
-    else if (job.result) el.textContent = `Last sync: ${job.result.collection} items, ${job.result.added} new, ${job.result.updated} updated, ${job.result.linked} linked, ${job.result.enriched} detailed.`;
-    else el.textContent = "";
-  };
-  const poll = async () => {
-    clearTimeout(syncPoll);
-    try {
-      const job = await api.get("/api/bgg/sync");
-      paint(job);
-      if (job.running && location.hash.startsWith("#/settings")) syncPoll = setTimeout(poll, 2000);
-      else if (job.result && !job.running) await reload();
-    } catch {
-      /* server unreachable; next click retries */
-    }
-  };
   syncBtn.addEventListener("click", async () => {
     try {
-      paint(await api.post("/api/bgg/sync", {}));
-      syncPoll = setTimeout(poll, 1500);
+      await startSync();
     } catch (err) {
       toast(err.message, 5000);
     }
   });
-  poll();
+  checkSync();
 }
 
 async function copyForClaude() {
@@ -1102,6 +1137,13 @@ function predictLinkHtml(r) {
   const g = state.games.find((x) => x.bggId === r.bggId);
   if (g && final(g) != null) return "";
   return `<a class="btn" href="${predictHref(g, r.bggId, r.name)}">Predict</a>`;
+}
+
+/** Open for a BGG search result already in the list, Add otherwise; a plain tag until the state has the game. */
+function discoverAction(r) {
+  if (!r.inList) return `<button class="btn primary" data-add="${r.bggId}">Add</button>`;
+  const g = state.games.find((x) => x.bggId === r.bggId);
+  return g ? `<a class="btn" href="#/g/${g.id}">Open</a>` : `<span class="tag">In list</span>`;
 }
 
 function predictHref(g, bggId, name) {
@@ -1578,11 +1620,11 @@ document.getElementById("more-copy").addEventListener("click", () => {
   closeMore();
   copyForClaude();
 });
-// Settings polls the running sync and shows its progress.
+// The sync watcher follows the sync; Settings shows its progress.
 document.getElementById("more-sync").addEventListener("click", async () => {
   closeMore();
   try {
-    await api.post("/api/bgg/sync", {});
+    await startSync();
     if (location.hash.startsWith("#/settings")) route();
     else location.hash = "#/settings";
   } catch (err) {
@@ -1592,19 +1634,94 @@ document.getElementById("more-sync").addEventListener("click", async () => {
 
 // ---------- boot ----------
 
-/** Fetch the state again. Games already loaded keep their objects, so an open page stays attached, and keep unsent edits. */
-async function reload() {
-  const fresh = await api.get("/api/state");
+let loadedAt = 0; // when the state was last fetched; 0 = never
+let booted = false; // the first fetch succeeded, so screens have real state to show
+let booting = null;
+let refreshing = null;
+let refreshOwed = false; // a refresh was skipped for an unsent edit or a focused field
+
+/** Fold fetched state in. Games already loaded keep their objects, so an open page stays attached, and keep unsent edits. */
+function takeState(fresh) {
   fresh.games = mergeGames(state.games, fresh.games, saves.unsent);
   state = fresh;
+  loadedAt = Date.now();
 }
 
-(async () => {
-  view.innerHTML = `<p class="empty">Loading…</p>`;
-  try {
-    await reload();
-    route();
-  } catch (e) {
-    view.innerHTML = `<p class="empty">Can't reach the Tablescore server (${esc(e.message)}). Check that it's running and you're on your tailnet.</p>`;
+/** Fetch the state again, without repainting. */
+async function reload() {
+  takeState(await api.get("/api/state"));
+}
+
+const refreshAllowed = () => canRefresh({ busy: saves.busy(), focused: document.activeElement });
+
+/**
+ * Fetch the state again if it is stale (or `force`), then repaint the open screen. Skipped, and owed
+ * to the next navigation or trigger, while the save queue is busy or a field has focus. It never
+ * runs when the queue drains, which would rebuild the scorer between two slider drags.
+ */
+function refresh({ force = false } = {}) {
+  if (refreshing) return refreshing;
+  if (!booted || (!force && !isStale(loadedAt, Date.now()))) return Promise.resolve();
+  if (!refreshAllowed()) {
+    refreshOwed = true;
+    return Promise.resolve();
   }
-})();
+  refreshing = (async () => {
+    let fresh;
+    try {
+      fresh = await api.get("/api/state");
+    } catch {
+      return; // unreachable; the next trigger tries again
+    }
+    // The owner may have started typing or editing while the fetch was out.
+    if (!refreshAllowed()) {
+      refreshOwed = true;
+      return;
+    }
+    takeState(fresh);
+    refreshOwed = false;
+    if (repaintsAfterRefresh(location.hash)) repaint();
+  })().finally(() => (refreshing = null));
+  return refreshing;
+}
+
+/** Render the open screen again from the current state, keeping the scroll position and open sections. */
+function repaint() {
+  const y = window.scrollY;
+  const open = [...view.querySelectorAll("details")].map((d) => d.open);
+  route();
+  view.querySelectorAll("details").forEach((d, i) => {
+    if (i < open.length) d.open = open[i];
+  });
+  window.scrollTo(0, y);
+}
+
+/** The app came back into view or online: load it if it never loaded, otherwise catch up. */
+function resume() {
+  if (!booted) return void boot();
+  refresh();
+  checkSync();
+}
+
+/** The first load. Until it succeeds no screen renders, and the error offers Try again. */
+function boot() {
+  if (booted) return Promise.resolve();
+  if (booting) return booting;
+  booting = (async () => {
+    view.innerHTML = `<p class="empty">Loading…</p>`;
+    try {
+      await reload();
+    } catch (e) {
+      view.innerHTML = `<p class="empty">Can't reach the Tablescore server (${esc(e.message)}). Check that it's running and you're on your tailnet.</p>
+        <div class="btn-row boot-retry"><button class="btn primary" id="boot-retry" type="button">Try again</button></div>`;
+      view.querySelector("#boot-retry").addEventListener("click", () => boot());
+      return;
+    }
+    booted = true;
+    route();
+    checkSync();
+  })().finally(() => (booting = null));
+  return booting;
+}
+
+boot();

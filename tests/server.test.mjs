@@ -362,6 +362,8 @@ test("sync adds new games, updates existing ones and leaves scores alone", async
     }
     assert.equal(job.error, null);
     assert.deepEqual(job.result, { collection: 2, added: 1, updated: 1, linked: 0, enriched: 2 });
+    assert.equal(job.running, false);
+    assert.ok(job.finishedAt, "a finished sync has a finishedAt");
     const catan = t.store.getByBggId(13);
     assert.equal(catan.name, "Catan (my name)");
     assert.equal(catan.plays, 9);
@@ -371,6 +373,27 @@ test("sync adds new games, updates existing ones and leaves scores alone", async
     assert.equal(catan.bggWeight, 2.35);
     assert.equal(catan.bestPlayers, "3");
     assert.equal(t.store.getByBggId(999).status, "Wishlist");
+  } finally {
+    t.close();
+  }
+});
+
+test("a sync that fails after saving the collection still finishes, with an error and a finishedAt", async () => {
+  const routes = { ...defaultRoutes(), thing: () => 400 };
+  const t = await startApp({ routes });
+  try {
+    await t.call("POST", "/api/bgg/sync", {});
+    let job;
+    for (let i = 0; i < 50; i++) {
+      job = (await t.call("GET", "/api/bgg/sync")).body;
+      if (!job.running) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.equal(job.running, false);
+    assert.match(job.error, /HTTP 400/);
+    assert.ok(job.finishedAt, "a failed sync has a finishedAt");
+    // The collection phase committed before the failure, so the client has to refetch state.
+    assert.equal(t.store.getByBggId(13).plays, 9);
   } finally {
     t.close();
   }
