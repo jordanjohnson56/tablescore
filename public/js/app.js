@@ -10,6 +10,7 @@ import {
 import { api } from "./api.js";
 import { latestOnly, SUPERSEDED } from "./latest.js";
 import { sharedPoll } from "./poll.js";
+import { applySaved, createSaveQueue, mergeGames } from "./saves.js";
 
 const view = document.getElementById("view");
 let state = { settings: null, games: [], bgg: { configured: false }, claude: { configured: false } };
@@ -67,42 +68,50 @@ const bggDrift = (g) => driftWith(g, state.settings);
 /** The game after g in the current list order that still needs a BGG rating. */
 const nextDrift = (g) => nextInList(filtered(), g, (x) => bggDrift(x) != null);
 
-// ---------- save queue: debounced PATCH per game ----------
+// ---------- save queue: debounced PATCH per game, kept and retried until it lands ----------
 
-const pending = new Map();
-function queueSave(id, patch) {
-  const p = pending.get(id) || { body: {}, timer: null };
-  for (const [k, v] of Object.entries(patch)) {
-    p.body[k] = k === "scores" ? { ...p.body.scores, ...v } : v;
-  }
-  clearTimeout(p.timer);
-  p.timer = setTimeout(() => flush(id), 450);
-  pending.set(id, p);
-  setSaveState("Saving…");
-}
-
-async function flush(id) {
-  const p = pending.get(id);
-  if (!p) return;
-  pending.delete(id);
-  try {
-    const saved = await api.patch(`/api/games/${id}`, p.body);
-    const i = state.games.findIndex((g) => g.id === id);
-    if (i >= 0) state.games[i] = { ...saved, scores: { ...saved.scores, ...pendingScores(id) } };
-    if (!pending.size) setSaveState("Saved");
-  } catch (e) {
-    setSaveState("Not saved");
-    toast(`Couldn't save: ${e.message}`, 5000);
-  }
-}
-const pendingScores = (id) => pending.get(id)?.body.scores || {};
+const SAVE_LABELS = { saved: "Saved", saving: "Saving…", error: "Not saved" };
+let saveFailed = false; // a failure was toasted, so recovery gets a toast too
+const saves = createSaveQueue({
+  patch: (id, body, opts) => api.patch(`/api/games/${id}`, body, opts),
+  // The open page holds this same object, so updating it in place keeps the page current.
+  apply: (id, saved, unsent) => {
+    const g = byId(id);
+    if (g) applySaved(g, saved, unsent);
+  },
+  onState: (s) => {
+    setSaveState(SAVE_LABELS[s]);
+    if (s === "error" && !saveFailed) {
+      saveFailed = true;
+      toast("Couldn't save. Will keep trying.", 5000);
+    } else if (s === "saved" && saveFailed) {
+      saveFailed = false;
+      toast("Saved");
+    }
+  },
+  // The field was dropped; show the stored value again.
+  onReject: async (id, err) => {
+    toast(`Couldn't save: ${err.message}`, 5000);
+    try {
+      await reload();
+      route();
+    } catch {
+      /* server unreachable; the page keeps what it has */
+    }
+  },
+});
+const queueSave = (id, patch) => saves.queue(id, patch);
 function setSaveState(text) {
-  const el = document.querySelector(".save-state");
+  const el = document.getElementById("save-state");
   if (el) el.textContent = text;
 }
-window.addEventListener("pagehide", () => {
-  for (const id of [...pending.keys()]) flush(id);
+window.addEventListener("pagehide", () => saves.flushAll({ keepalive: true }));
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") saves.flushAll({ keepalive: true });
+  else saves.retry();
 });
+window.addEventListener("pageshow", () => saves.retry());
+window.addEventListener("online", () => saves.retry());
 
 // ---------- router ----------
 
@@ -259,7 +268,7 @@ function renderScorer(id) {
         : `<a class="back" href="#/" aria-label="Back to games">‹</a>`}
       <div class="title">
         <div class="name ${g.avoidTheme ? "avoid-name" : ""}">${esc(g.name)}</div>
-        <div class="save-state">${esc(rescoreStatus(g.scores))}</div>
+        <div class="save-state" id="save-state">${esc(saves.busy() ? SAVE_LABELS[saves.state()] : rescoreStatus(g.scores))}</div>
         <div id="rank"></div>
       </div>
       <div class="final" id="final"></div>
@@ -450,7 +459,7 @@ function renderScorer(id) {
       b.disabled = true;
       b.textContent = "Linking…";
       try {
-        Object.assign(g, await api.post(`/api/games/${g.id}/link-bgg`, { bggId: Number(b.dataset.link) }));
+        applySaved(g, await api.post(`/api/games/${g.id}/link-bgg`, { bggId: Number(b.dataset.link) }), saves.unsent(g.id));
         renderScorer(g.id);
       } catch (err) {
         b.disabled = false;
@@ -463,7 +472,7 @@ function renderScorer(id) {
   view.querySelector("#del").addEventListener("click", async () => {
     if (!confirm(`Delete ${g.name} and its scores? This can't be undone.`)) return;
     try {
-      pending.delete(g.id);
+      saves.drop(g.id);
       await api.del(`/api/games/${g.id}`);
       state.games = state.games.filter((x) => x.id !== g.id);
       location.hash = "#/";
@@ -1583,8 +1592,11 @@ document.getElementById("more-sync").addEventListener("click", async () => {
 
 // ---------- boot ----------
 
+/** Fetch the state again. Games already loaded keep their objects, so an open page stays attached, and keep unsent edits. */
 async function reload() {
-  state = await api.get("/api/state");
+  const fresh = await api.get("/api/state");
+  fresh.games = mergeGames(state.games, fresh.games, saves.unsent);
+  state = fresh;
 }
 
 (async () => {
