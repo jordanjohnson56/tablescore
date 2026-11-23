@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { openDb } from "./db.js";
+import { openDb, parseBackupKeep } from "./db.js";
 import { BggClient } from "./bgg.js";
 import { createApp } from "./app.js";
 import { Predictor, DEFAULT_MODEL } from "./predict.js";
@@ -9,7 +9,8 @@ const env = process.env;
 const dataDir = env.DATA_DIR || "data";
 const port = Number(env.PORT || 8080);
 const host = env.HOST || "127.0.0.1";
-const keep = Number(env.BACKUP_KEEP || 14);
+const { keep, invalid: badKeep } = parseBackupKeep(env.BACKUP_KEEP);
+if (badKeep) console.error(`BACKUP_KEEP="${env.BACKUP_KEEP}" is not a whole number of 1 or more; keeping ${keep} backups.`);
 
 const store = openDb(join(dataDir, "tablescore.db"));
 const bgg = new BggClient({ token: env.BGG_TOKEN });

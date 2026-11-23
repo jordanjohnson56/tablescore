@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { strToU8, zipSync } from "fflate";
-import { openDb } from "../server/db.js";
+import { openDb, parseBackupKeep, Store } from "../server/db.js";
 import { BggClient, BggError } from "../server/bgg.js";
 import { createApp } from "../server/app.js";
 import { syncCollection } from "../server/sync.js";
@@ -730,6 +730,98 @@ test("backups keep only the newest N daily files", () => {
   ]);
   const copy = openDb(join(dir, "tablescore-2026-01-05.db"));
   assert.equal(copy.listGames()[0].name, "A");
+});
+
+test("BACKUP_KEEP accepts only a whole number of 1 or more", () => {
+  for (const raw of [undefined, null, "", "  "]) assert.deepEqual(parseBackupKeep(raw), { keep: 14, invalid: false }, String(raw));
+  for (const [raw, keep] of [["1", 1], ["14", 14], [" 30 ", 30]]) assert.deepEqual(parseBackupKeep(raw), { keep, invalid: false }, raw);
+  for (const raw of ["0", "-1", "two", "14d", "2.5", "1e2", "0x10", "Infinity", "99999999999999999999"]) {
+    assert.deepEqual(parseBackupKeep(raw), { keep: 14, invalid: true }, raw);
+  }
+});
+
+const day = (y, m, d) => new Date(Date.UTC(y, m - 1, d));
+const fakeStore = (run) => new Store({ prepare: () => ({ run }) });
+
+test("a backup refuses a keep that is not a whole number of 1 or more, touching nothing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ts-bk-"));
+  writeFileSync(join(dir, "tablescore-2026-01-01.db"), "a");
+  writeFileSync(join(dir, "tablescore-2026-01-02.db"), "b");
+  const store = openDb(":memory:");
+  for (const keep of [0, -1, NaN, 2.5, Infinity, "3", null]) {
+    assert.throws(() => store.backup(dir, keep, day(2026, 1, 3)), RangeError, String(keep));
+    assert.deepEqual(readdirSync(dir).sort(), ["tablescore-2026-01-01.db", "tablescore-2026-01-02.db"]);
+  }
+});
+
+test("a backup with keep 1 keeps exactly the newest", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ts-bk-"));
+  const store = openDb(":memory:");
+  for (let d = 1; d <= 3; d++) store.backup(dir, 1, day(2026, 1, d));
+  assert.deepEqual(readdirSync(dir), ["tablescore-2026-01-03.db"]);
+});
+
+test("a backup never deletes the file it just wrote, even when later-dated backups exist", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ts-bk-"));
+  writeFileSync(join(dir, "tablescore-2027-01-01.db"), "a");
+  writeFileSync(join(dir, "tablescore-2027-01-02.db"), "b");
+  const file = openDb(":memory:").backup(dir, 1, day(2026, 1, 5));
+  assert.equal(file, join(dir, "tablescore-2026-01-05.db"));
+  assert.deepEqual(readdirSync(dir).sort(), ["tablescore-2026-01-05.db", "tablescore-2027-01-02.db"]);
+});
+
+test("a failed snapshot keeps today's earlier backup and prunes nothing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ts-bk-"));
+  const store = openDb(":memory:");
+  store.createGame({ name: "A" });
+  store.backup(dir, 14, day(2026, 1, 1));
+  const file = store.backup(dir, 14, day(2026, 1, 2));
+  const before = readFileSync(file);
+  assert.throws(() => fakeStore(() => { throw new Error("disk full"); }).backup(dir, 1, day(2026, 1, 2)), /disk full/);
+  assert.deepEqual(readFileSync(file), before);
+  assert.deepEqual(readdirSync(dir).sort(), ["tablescore-2026-01-01.db", "tablescore-2026-01-02.db"]);
+});
+
+test("a snapshot that fails its check is rejected and leaves no temporary file", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ts-bk-"));
+  const store = openDb(":memory:");
+  store.createGame({ name: "A" });
+  store.backup(dir, 14, day(2026, 1, 1));
+  const file = store.backup(dir, 14, day(2026, 1, 2));
+  const before = readFileSync(file);
+  assert.throws(() => fakeStore((path) => writeFileSync(path, "not a database")).backup(dir, 1, day(2026, 1, 2)));
+  assert.deepEqual(readFileSync(file), before);
+  assert.deepEqual(readdirSync(dir).sort(), ["tablescore-2026-01-01.db", "tablescore-2026-01-02.db"]);
+});
+
+test("a second backup on the same day replaces the first", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ts-bk-"));
+  const store = openDb(":memory:");
+  store.createGame({ name: "A" });
+  store.backup(dir, 14, day(2026, 1, 1));
+  store.createGame({ name: "B" });
+  const file = store.backup(dir, 14, day(2026, 1, 1));
+  assert.deepEqual(readdirSync(dir), ["tablescore-2026-01-01.db"]);
+  assert.deepEqual(openDb(file).listGames().map((g) => g.name).sort(), ["A", "B"]);
+});
+
+test("a backup sweeps temporary files left by an interrupted run", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ts-bk-"));
+  writeFileSync(join(dir, "tablescore-2025-12-31.db.tmp"), "junk");
+  writeFileSync(join(dir, "tablescore-2026-01-01.db.tmp"), "junk");
+  writeFileSync(join(dir, "tablescore-2026-01-01.db.tmp-journal"), "junk");
+  openDb(":memory:").backup(dir, 14, day(2026, 1, 1));
+  assert.deepEqual(readdirSync(dir), ["tablescore-2026-01-01.db"]);
+});
+
+test("a backup of a file-backed store leaves only the backup file", () => {
+  const live = mkdtempSync(join(tmpdir(), "ts-live-"));
+  const dir = mkdtempSync(join(tmpdir(), "ts-bk-"));
+  const store = openDb(join(live, "live.db"));
+  store.createGame({ name: "A" });
+  const file = store.backup(dir, 14, day(2026, 1, 1));
+  assert.deepEqual(readdirSync(dir), ["tablescore-2026-01-01.db"]);
+  assert.equal(openDb(file).listGames()[0].name, "A");
 });
 
 test("import explains a folder, missing path or non-xlsx file instead of crashing", async () => {

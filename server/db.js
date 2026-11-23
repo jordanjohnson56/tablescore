@@ -1,7 +1,7 @@
 // SQLite storage. One file holds every game, its rubric scores and the settings.
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, readdirSync, rmSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { CRITERIA, DEFAULT_SETTINGS, finalScore } from "../public/js/rubric.js";
 import { GAME_TYPES, PLATFORMS, STAGE_KEYS, STATUSES } from "../public/js/watchlist.js";
 
@@ -686,20 +686,61 @@ export class Store {
     }
   }
 
-  /** Daily snapshot into dir, keeping the newest `keep` files. */
+  /**
+   * Daily backup into dir, then keeps the newest `keep` backups (a whole number of 1 or more).
+   * The snapshot goes to a temporary file, is checked and synced, and only then replaces
+   * today's backup, so a failure throws and leaves every existing backup in place.
+   * The file just written is never deleted.
+   */
   backup(dir, keep = 14, now = new Date()) {
+    if (!Number.isInteger(keep) || keep < 1) throw new RangeError("keep must be an integer of 1 or more");
     mkdirSync(dir, { recursive: true });
     const file = join(dir, `tablescore-${now.toISOString().slice(0, 10)}.db`);
-    rmSync(file, { force: true });
-    this.db.prepare("VACUUM INTO ?").run(file);
+    const tmp = `${file}.tmp`;
+    for (const f of readdirSync(dir)) {
+      if (/^tablescore-\d{4}-\d{2}-\d{2}\.db\.tmp(-journal|-wal|-shm)?$/.test(f)) rmSync(join(dir, f), { force: true });
+    }
+    try {
+      this.db.prepare("VACUUM INTO ?").run(tmp);
+      const check = new DatabaseSync(tmp, { readOnly: true });
+      try {
+        const rows = check.prepare("PRAGMA quick_check").all();
+        if (rows.length !== 1 || Object.values(rows[0])[0] !== "ok") throw new Error(`backup check failed: ${JSON.stringify(rows)}`);
+      } finally {
+        check.close();
+      }
+      const fd = openSync(tmp, "r+");
+      try {
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(tmp, file);
+    } catch (e) {
+      for (const suffix of ["", "-journal", "-wal", "-shm"]) rmSync(tmp + suffix, { force: true });
+      throw e;
+    }
     const old = readdirSync(dir)
       .filter((f) => /^tablescore-\d{4}-\d{2}-\d{2}\.db$/.test(f))
       .sort()
       .reverse()
-      .slice(keep);
+      .slice(keep)
+      .filter((f) => f !== basename(file));
     for (const f of old) rmSync(join(dir, f));
     return file;
   }
+}
+
+/**
+ * Reads BACKUP_KEEP: a whole number of 1 or more in plain digits. Unset or blank gives
+ * the fallback; anything else gives the fallback with invalid set, for a start-up warning.
+ */
+export function parseBackupKeep(raw, fallback = 14) {
+  const s = raw == null ? "" : String(raw).trim();
+  if (s === "") return { keep: fallback, invalid: false };
+  const n = Number(s);
+  if (!/^\d+$/.test(s) || n < 1 || !Number.isSafeInteger(n)) return { keep: fallback, invalid: true };
+  return { keep: n, invalid: false };
 }
 
 export class HttpError extends Error {
