@@ -136,14 +136,49 @@ Once a week (by default), Tablescore asks Claude for games you should be looking
 
 ## Data and backups
 
-Everything lives in `data/tablescore.db`. On start and every 24 h, the server writes `data/backups/tablescore-YYYY-MM-DD.db` and keeps the newest `BACKUP_KEEP` (default 14). `BACKUP_KEEP` must be a whole number of 1 or more; anything else is logged at start and 14 is used. Copying `data/` somewhere else is your off-box backup. **Settings → Export JSON** downloads everything, and **Copy scores for Claude** puts a plain-text summary on the clipboard for asking about recommendations.
+Everything lives in `data/tablescore.db`. On start and every 24 h, the server writes a snapshot, `data/backups/tablescore-YYYY-MM-DD.db`, and keeps the newest `BACKUP_KEEP` (default 14). `BACKUP_KEEP` must be a whole number of 1 or more; anything else is logged at start and 14 is used. Each snapshot is one complete file, checked before it replaces that day's earlier one.
+
+**Off-box backup:** copy `data/backups/` somewhere else, and keep `.env` separately. Don't copy `data/tablescore.db` while the server runs: recent edits sit in `tablescore.db-wal` beside it until SQLite folds them in, so a copy of the database alone can be missing them or be torn mid-write.
+
+**Settings → Export JSON** downloads your settings and every game with its scores, notes and watch fields. It leaves out Claude's predictions, recommendation Runs and the Not interested list, and nothing imports it, so it is not a backup. **Copy scores for Claude** puts a plain-text summary on the clipboard for asking about recommendations.
+
+### Restore from a snapshot
+
+Check a snapshot first. This changes nothing and is safe while the server runs:
+
+```sh
+docker compose run --rm tablescore node server/restore.js --check 2026-11-20
+```
+
+It prints how many games (scored and watched), predictions, Runs and Not interested games the snapshot holds. Run it with no date to list the snapshots, newest first. To restore:
+
+```sh
+docker compose stop
+docker compose run --rm tablescore node server/restore.js 2026-11-20
+docker compose up -d
+```
+
+Use `run`, not `exec`: `exec` needs the server up, and the restore needs it stopped. If your image was built before `server/restore.js` existed, `docker compose build` first. A date means that day's snapshot in `data/backups/`; you can give a path inside the container instead, such as `/data/backups/tablescore-2026-11-20.db`.
+
+Without Docker, stop the server (Ctrl-C), then run `npm run restore -- 2026-11-20` from the checkout, with `DATA_DIR` set if your data isn't in `./data`. Add `--check` to only check.
+
+What a restore does:
+
+- It verifies a copy of the snapshot (SQLite's integrity check, and the games and settings tables present) before touching anything, and refuses a missing, truncated or non-Tablescore file, or the live database itself, with nothing changed. The snapshot file is never modified.
+- It refuses, with nothing changed, if the live database is open in another process, which means the server is still running.
+- It moves `tablescore.db`, and any `tablescore.db-wal` and `tablescore.db-shm`, into `data/replaced/<time>/` together, then puts the checked copy in place and brings an old snapshot's tables up to date. Nothing is deleted. To undo, restore `data/replaced/<time>/tablescore.db` the same way; delete the folder once you're happy.
+- A server stopped with `docker compose stop` or Ctrl-C closes the database cleanly and leaves only `tablescore.db`. One that was killed leaves a `-wal` holding edits that aren't in `tablescore.db` yet. Before moving the old database aside, the restore folds its own `-wal` back into it, as a clean stop would, so the copy in `data/replaced/` is complete on its own. A snapshot must never sit beside a stale `-wal`: SQLite would read the old edits into it, giving back the old data or a corrupt file.
+
+After the restore, the server writes today's snapshot again from the restored data when it starts. A prediction or Run that was in progress when the snapshot was taken shows as failed. Because the recommendation schedule is read from the database, restoring an older snapshot can make a Run due at the next 04:00. The next `sync-watchlist` commits the restored Watchlist.
+
+**Manual fallback**, if the script can't run: stop the server; move `tablescore.db`, `tablescore.db-wal` and `tablescore.db-shm` into a new folder together; copy the snapshot to `data/tablescore.db`; start the server. Do the copy as your own user, not with `sudo`: the container runs as uid 1000, and a database owned by root can't be written. The Docker steps above avoid this.
 
 ## Develop
 
 ```sh
 npm ci
-npm test                     # rubric math, BGG parsing (fixtures), API, import, backups
+npm test                     # rubric math, BGG parsing (fixtures), API, import, backups, restore
 DATA_DIR=./data PORT=8080 npm start
 ```
 
-Layout: `server/` (Express API, SQLite store, BGG client, sync, xlsx import, watchlist export) and `public/` (static app; `public/js/rubric.js` holds the criteria text and score math).
+Layout: `server/` (Express API, SQLite store, BGG client, sync, xlsx import, watchlist export, restore) and `public/` (static app; `public/js/rubric.js` holds the criteria text and score math).

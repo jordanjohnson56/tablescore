@@ -119,6 +119,10 @@ const BGG_FIELDS = {
   thumbnail: "thumbnail",
 };
 
+// A daily backup's file name in the backups folder: tablescore-YYYY-MM-DD.db.
+export const SNAPSHOT_NAME = /^tablescore-(\d{4}-\d{2}-\d{2})\.db$/;
+export const snapshotName = (day) => `tablescore-${day}.db`;
+
 export function openDb(file) {
   if (file !== ":memory:") mkdirSync(dirname(file), { recursive: true });
   const db = new DatabaseSync(file);
@@ -700,7 +704,7 @@ export class Store {
   backup(dir, keep = 14, now = new Date()) {
     if (!Number.isInteger(keep) || keep < 1) throw new RangeError("keep must be an integer of 1 or more");
     mkdirSync(dir, { recursive: true });
-    const file = join(dir, `tablescore-${now.toISOString().slice(0, 10)}.db`);
+    const file = join(dir, snapshotName(now.toISOString().slice(0, 10)));
     const tmp = `${file}.tmp`;
     for (const f of readdirSync(dir)) {
       if (/^tablescore-\d{4}-\d{2}-\d{2}\.db\.tmp(-journal|-wal|-shm)?$/.test(f)) rmSync(join(dir, f), { force: true });
@@ -726,7 +730,7 @@ export class Store {
       throw e;
     }
     const old = readdirSync(dir)
-      .filter((f) => /^tablescore-\d{4}-\d{2}-\d{2}\.db$/.test(f))
+      .filter((f) => SNAPSHOT_NAME.test(f))
       .sort()
       .reverse()
       .slice(keep)
