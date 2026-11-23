@@ -242,6 +242,11 @@ export class Store {
     this.db = db;
   }
 
+  /** Close the database. SQLite checkpoints the WAL and removes -wal and -shm on the last close. */
+  close() {
+    this.db.close();
+  }
+
   getSettings() {
     const rows = this.db.prepare("SELECT key, value FROM settings").all();
     const s = structuredClone(DEFAULT_SETTINGS);

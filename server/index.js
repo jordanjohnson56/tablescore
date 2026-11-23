@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { openDb, parseBackupKeep } from "./db.js";
 import { BggClient } from "./bgg.js";
 import { createApp } from "./app.js";
+import { createShutdown } from "./shutdown.js";
 import { Predictor, DEFAULT_MODEL } from "./predict.js";
 import Anthropic from "@anthropic-ai/sdk";
 
@@ -33,12 +34,17 @@ function backup() {
   }
 }
 backup();
-setInterval(backup, 24 * 60 * 60 * 1000).unref();
+const backupTimer = setInterval(backup, 24 * 60 * 60 * 1000);
+backupTimer.unref();
 
-app.listen(port, host, () => {
+const server = app.listen(port, host, () => {
   console.log(`Tablescore listening on http://${host}:${port}`);
   if (!bgg.configured) console.log("BGG_TOKEN not set: BGG search and sync are disabled.");
   if (!predictor.configured) console.log("ANTHROPIC_API_KEY not set: Claude predictions are disabled.");
   const next = bgg.configured && predictor.configured ? app.scheduler.nextRunAt : null;
   console.log(next ? `Next recommendation run: ${next.toLocaleString()} (${env.TZ || "server local time"})` : "Scheduled recommendations are off.");
 });
+
+const shutdown = createShutdown({ server, scheduler: app.scheduler, store, timers: [backupTimer] });
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
