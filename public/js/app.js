@@ -12,6 +12,7 @@ import { latestOnly, SUPERSEDED } from "./latest.js";
 import { sharedPoll } from "./poll.js";
 import { applySaved, createSaveQueue, mergeGames } from "./saves.js";
 import { canRefresh, isStale, repaintsAfterRefresh, syncStep, syncToast } from "./refresh.js";
+import { MERGED, createScrollMemory, goesBack } from "./nav.js";
 
 const view = document.getElementById("view");
 let state = { settings: null, games: [], bgg: { configured: false }, claude: { configured: false } };
@@ -126,11 +127,10 @@ window.addEventListener("online", () => {
 
 // Each tab's renderer, matched by hash prefix; anything else is the games list.
 const TABS = { watchlist: renderWatchlist, discover: renderDiscover, summary: renderSummary, settings: renderSettings, games: renderList };
-// Screens that were merged into Discover; old links and bookmarks land there.
-const MERGED = ["#/add", "#/predictions"];
 
 function route() {
   const hash = location.hash || "#/";
+  // Screens that were merged into Discover; old links and bookmarks land there.
   if (MERGED.some((h) => hash.startsWith(h))) return void location.replace("#/discover");
   closeMore();
   // A prediction page sits under Discover, wherever it was opened from.
@@ -147,14 +147,72 @@ function route() {
   if (p) return renderPrediction(p[1], Number(p[2]), p[3] ? decodeURIComponent(p[3]) : "");
   return TABS[tab]();
 }
+
+/**
+ * Draw the open screen and scroll to `y`, putting back the `<details>` open flags in `open` if given.
+ * The one place the page scrolls after route(): a navigation passes the y from scroll memory, a
+ * repaint in place passes the y it had.
+ */
+function show(y, open = null) {
+  route();
+  if (open) {
+    view.querySelectorAll("details").forEach((d, i) => {
+      if (i < open.length) d.open = open[i];
+    });
+  }
+  window.scrollTo(0, y);
+}
+
+// The Games list, Watchlist and Summary keep their position while a game or prediction page is
+// open, so Back (the arrow, the system gesture or the tab) returns to the same place.
+const scrollMemory = createScrollMemory();
+// The app sets every scroll position itself; the browser restoring one first would spoil the y read on leaving.
+try {
+  history.scrollRestoration = "manual";
+} catch {
+  /* not supported; the y is set after every draw anyway */
+}
+
+/**
+ * Record on the current history entry the hash beneath it (null when unknown), once. A pushed entry
+ * arrives without state; one reached by Back or Forward keeps its stamp. goesBack() reads it.
+ */
+function stampEntry(from) {
+  if (history.state?.from !== undefined) return;
+  try {
+    history.replaceState({ ...history.state, from }, "");
+  } catch {
+    /* rate limited; the arrow then pushes, as a plain link */
+  }
+}
+
+/** Go back to `href` when it is the entry beneath, otherwise open it as a new entry. */
+function backOr(href) {
+  if (goesBack(history.state, href)) history.back();
+  else location.hash = href;
+}
+
 window.addEventListener("hashchange", (e) => {
+  const from = new URL(e.oldURL).hash;
+  stampEntry(from);
   // A prediction page opened from Discover goes back there.
-  if (location.hash.startsWith("#/predict/")) predictBack = new URL(e.oldURL).hash.startsWith("#/discover") ? "#/discover" : null;
+  if (location.hash.startsWith("#/predict/")) predictBack = from.startsWith("#/discover") ? "#/discover" : null;
   // Before the first load succeeds there is no state to show, so a tab tap tries the load again.
   if (!booted) return void boot();
-  route();
-  window.scrollTo(0, 0);
+  scrollMemory.leave(from, location.hash, window.scrollY);
+  show(scrollMemory.arrive(from, location.hash));
+  // The repaint after an owed refresh keeps whatever position show() just set.
   if (refreshOwed) refresh({ force: true });
+});
+
+// The back arrow on a game or prediction page goes back when the entry beneath is the screen it
+// names, so returning adds no history; otherwise it opens its href as before.
+view.addEventListener("click", (e) => {
+  const a = e.target.closest("a.back");
+  if (!a || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+  if (!goesBack(history.state, a.getAttribute("href"))) return;
+  e.preventDefault();
+  history.back();
 });
 
 // ---------- list ----------
@@ -487,7 +545,7 @@ function renderScorer(id) {
       saves.drop(g.id);
       await api.del(`/api/games/${g.id}`);
       state.games = state.games.filter((x) => x.id !== g.id);
-      location.hash = "#/";
+      backOr("#/");
       toast(`Deleted ${g.name}`);
     } catch (e) {
       toast(`Couldn't delete: ${e.message}`, 5000);
@@ -1687,13 +1745,7 @@ function refresh({ force = false } = {}) {
 
 /** Render the open screen again from the current state, keeping the scroll position and open sections. */
 function repaint() {
-  const y = window.scrollY;
-  const open = [...view.querySelectorAll("details")].map((d) => d.open);
-  route();
-  view.querySelectorAll("details").forEach((d, i) => {
-    if (i < open.length) d.open = open[i];
-  });
-  window.scrollTo(0, y);
+  show(window.scrollY, [...view.querySelectorAll("details")].map((d) => d.open));
 }
 
 /** The app came back into view or online: load it if it never loaded, otherwise catch up. */
@@ -1718,10 +1770,11 @@ function boot() {
       return;
     }
     booted = true;
-    route();
+    show(0);
     checkSync();
   })().finally(() => (booting = null));
   return booting;
 }
 
+stampEntry(null);
 boot();
