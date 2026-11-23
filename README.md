@@ -97,7 +97,61 @@ It pulls the private repo (the routine commits its `state.json` there), exports 
   30 3 * * * $HOME/tablescore/scripts/sync-watchlist.sh >>$HOME/tablescore-watchlist-sync.log 2>&1
   ```
 
+  On a host without cron, use a systemd timer instead; see below.
+
 Without Docker, inside the tablescore checkout with Node installed, `npm run export-watchlist -- <path>` writes the export to a file (`-` writes it to stdout); commit it yourself.
+
+#### Sync on a systemd timer
+
+A systemd user timer does the same job as the cron line. This setup pushes with a deploy key: an SSH key with no passphrase that can write to the watchlist repo and nothing else on your account. The sync then needs no SSH agent, and your own key keeps its passphrase. The private repo's remote must be an SSH one (`git@github.com:...`).
+
+1. Make the key and register it on the private repo with write access:
+
+   ```sh
+   ssh-keygen -t ed25519 -N "" -C "tablescore-watchlist-sync deploy key" -f ~/.ssh/tablescore-watchlist-deploy
+   gh repo deploy-key add ~/.ssh/tablescore-watchlist-deploy.pub -R <owner>/<watchlist-repo> --allow-write --title "watchlist sync timer"
+   ```
+
+2. Write `~/.config/systemd/user/tablescore-watchlist-sync.service`. `%h` is your home directory; change the `ExecStart` path if the checkout isn't at `~/tablescore`.
+
+   ```ini
+   [Unit]
+   Description=Sync the tablescore watchlist export to its private repo
+
+   [Service]
+   Type=oneshot
+   Environment="GIT_SSH_COMMAND=ssh -i %h/.ssh/tablescore-watchlist-deploy -o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes"
+   ExecStart=%h/tablescore/scripts/sync-watchlist.sh
+   ```
+
+   `IdentitiesOnly` and `IdentityAgent=none` keep ssh to the deploy key, and `BatchMode` makes it fail at once rather than wait for a prompt.
+
+3. Write `~/.config/systemd/user/tablescore-watchlist-sync.timer`:
+
+   ```ini
+   [Unit]
+   Description=Daily tablescore watchlist sync
+
+   [Timer]
+   OnCalendar=*-*-* 03:30:00
+   Persistent=true
+
+   [Install]
+   WantedBy=timers.target
+   ```
+
+4. Enable the timer, then run the service once and read its log to check the whole path:
+
+   ```sh
+   systemctl --user daemon-reload
+   systemctl --user enable --now tablescore-watchlist-sync.timer
+   systemctl --user start tablescore-watchlist-sync.service
+   journalctl --user -u tablescore-watchlist-sync.service -n 20
+   ```
+
+The deploy key is used only by the timer; running the script by hand still uses your own key. A user timer runs only while you are logged in, and `Persistent=true` catches up a missed run at the next login. `loginctl enable-linger $USER` lets it run while you are logged out, along with every other user timer you have.
+
+To undo it, disable the timer and delete the two unit files, remove the key from the repo (`gh repo deploy-key list -R <owner>/<watchlist-repo>`, then `gh repo deploy-key delete <id> -R <owner>/<watchlist-repo>`) and delete the two key files.
 
 ### Import watched games
 
