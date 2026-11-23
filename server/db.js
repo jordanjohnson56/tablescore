@@ -3,7 +3,7 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { CRITERIA, DEFAULT_SETTINGS, finalScore } from "../public/js/rubric.js";
-import { PLATFORMS, STAGE_KEYS } from "../public/js/watchlist.js";
+import { GAME_TYPES, PLATFORMS, STAGE_KEYS, STATUSES } from "../public/js/watchlist.js";
 
 const SCORE_COLS = CRITERIA.map((c) => `s_${c.key}`);
 
@@ -37,7 +37,12 @@ export const WATCH_FIELDS = {
 // message a 400 carries otherwise.
 // One decimal at most, allowing for float error (7.3 * 10 isn't exactly 73).
 const oneDecimal = (v) => Math.abs(v * 10 - Math.round(v * 10)) < 1e-9;
-const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v) && new Date(`${v}T00:00:00Z`).toISOString().startsWith(v);
+// A real calendar day: 2026-02-30 rolls over to March, and 2026-13-01 is Invalid Date.
+const isDate = (v) => {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
+  const d = new Date(`${v}T00:00:00Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().startsWith(v);
+};
 const WATCH_RULES = {
   watchStage: [(v) => STAGE_KEYS.includes(v), `watchStage must be one of ${STAGE_KEYS.join(", ")} or null`],
   campaignUrl: [(v) => typeof v === "string" && /^https?:\/\/\S+$/.test(v), "campaignUrl must be an http(s) URL or null"],
@@ -61,6 +66,37 @@ export function checkWatchFields(fields) {
     const v = fields[k] === "" ? null : fields[k];
     if (v !== null && !ok(v)) throw new HttpError(400, msg);
     out[k] = v;
+  }
+  return out;
+}
+
+// One check per user field, as for watch fields, but null is never allowed:
+// every user column is NOT NULL.
+const isText = (max) => (v) => typeof v === "string" && v.length <= max;
+const isFlag = (v) => typeof v === "boolean";
+const USER_RULES = {
+  name: [(v) => isText(200)(v) && v.trim() !== "", "name must be text of 1 to 200 characters"],
+  type: [(v) => GAME_TYPES.includes(v), `type must be one of ${GAME_TYPES.join(", ")}`],
+  status: [(v) => STATUSES.includes(v), `status must be one of ${STATUSES.filter(Boolean).join(", ")} or empty`],
+  plays: [(v) => Number.isInteger(v) && v >= 0, "plays must be a whole number from 0"],
+  avoidTheme: [isFlag, "avoidTheme must be true or false"],
+  wontScore: [isFlag, "wontScore must be true or false"],
+  calibration: [isFlag, "calibration must be true or false"],
+  notes: [isText(10000), "notes must be text of at most 10000 characters"],
+  bestPlayers: [isText(40), "bestPlayers must be text of at most 40 characters"],
+};
+
+/**
+ * Validate user fields in a patch or new game from the API and return their
+ * normalized values (name trimmed). Throws a 400 HttpError on a bad value.
+ * Keys that aren't user fields are ignored.
+ */
+export function checkUserFields(fields) {
+  const out = {};
+  for (const [k, [ok, msg]] of Object.entries(USER_RULES)) {
+    if (fields[k] === undefined) continue;
+    if (!ok(fields[k])) throw new HttpError(400, msg);
+    out[k] = k === "name" ? fields[k].trim() : fields[k];
   }
   return out;
 }
@@ -266,7 +302,9 @@ export class Store {
     const sets = [];
     const vals = [];
     const watch = checkWatchFields(patch);
+    const user = checkUserFields(patch);
     for (const [k, v] of Object.entries(patch)) {
+      if (v === undefined) continue; // an internal caller's absent field
       if (k in watch) {
         sets.push(`${WATCH_FIELDS[k][0]} = ?`);
         vals.push(watch[k]);
@@ -279,10 +317,9 @@ export class Store {
           sets.push(`s_${ck} = ?`);
           vals.push(cv);
         }
-      } else if (USER_FIELDS[k]) {
-        if (k === "name" && !String(v).trim()) throw new HttpError(400, "name is required");
+      } else if (k in user) {
         sets.push(`${USER_FIELDS[k]} = ?`);
-        vals.push(toSql(v));
+        vals.push(toSql(user[k]));
       } else {
         throw new HttpError(400, `field ${k} is not editable`);
       }

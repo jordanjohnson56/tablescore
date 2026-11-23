@@ -1,10 +1,10 @@
 import {
   CRITERIA, BAND_LABELS, RECOMMEND_FREQUENCIES, bandIndex, finalScore, formatNumber, rawAverage, scaleEntry, scoredCount,
-  rescoreStatus, isProvisional, weightTotal,
+  rescoreStatus, isProvisional, weightTotal, weightsProblem,
 } from "./rubric.js";
 import {
   STAGES, STAGE_LABELS, PLATFORMS, DEFAULT_CURRENCY, targetCurrency, claudeExport, isDecided, isWatching, isHiddenType,
-  summaryStats, visibleGames, sortWatchlist, awaitingHint, monthLabel, rankings, bggUrl, bgoSearchUrl,
+  summaryStats, visibleGames, sortWatchlist, awaitingHint, monthLabel, rankings, bggUrl, bgoSearchUrl, STATUSES,
 } from "./watchlist.js";
 import { api } from "./api.js";
 
@@ -330,12 +330,12 @@ function renderScorer(id) {
       <label class="field"><span>Logged plays</span>
         <div class="stepper">
           <button class="btn" type="button" data-step="-1" aria-label="One fewer play">−</button>
-          <input type="number" id="plays" min="0" inputmode="numeric" value="${g.plays}">
+          <input type="number" id="plays" min="0" inputmode="numeric" value="${esc(g.plays)}">
           <button class="btn" type="button" data-step="1" aria-label="One more play">+</button>
         </div>
       </label>
       <label class="field"><span>Status</span>
-        <select id="status">${["Owned", "Preordered", "Prev. owned", "Wishlist", "Want to play", "Want", ""]
+        <select id="status">${STATUSES
           .map((s) => `<option value="${esc(s)}" ${g.status === s ? "selected" : ""}>${s || "Not in collection"}</option>`).join("")}</select>
       </label>
       <label class="toggle"><input type="checkbox" id="avoid" ${g.avoidTheme ? "checked" : ""}> Avoid theme (demons, spirits, horror)</label>
@@ -376,7 +376,7 @@ function renderScorer(id) {
       ? `<div class="notice drift">
           <p>Rate it <b>${formatNumber(d)}</b> on BGG${g.bggRating != null ? ` (it has ${formatNumber(g.bggRating)})` : ""}.</p>
           <div class="btn-row">
-            <a class="btn primary" data-act="open" href="${bggUrl(g.bggId)}" target="_blank" rel="noopener">Copy ${formatNumber(d)} &amp; open BGG</a>
+            <a class="btn primary" data-act="open" href="${esc(bggUrl(g.bggId))}" target="_blank" rel="noopener">Copy ${formatNumber(d)} &amp; open BGG</a>
             <button class="btn" type="button" data-act="done">I've rated it</button>
           </div>
         </div>`
@@ -655,7 +655,7 @@ const TAG_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12V4a1
 /** Full-width outline buttons to the game on BGG and its prices on Board Game Oracle. */
 function gameLinksHtml(bggId, name) {
   const links = [];
-  if (bggId) links.push(`<a class="btn outline" href="${bggUrl(bggId)}" target="_blank" rel="noopener">${DICE_ICON}<span>Open on BGG</span></a>`);
+  if (bggId) links.push(`<a class="btn outline" href="${esc(bggUrl(bggId))}" target="_blank" rel="noopener">${DICE_ICON}<span>Open on BGG</span></a>`);
   if (name) links.push(`<a class="btn outline" href="${esc(bgoSearchUrl(name))}" target="_blank" rel="noopener">${TAG_ICON}<span>Prices on Board Game Oracle</span></a>`);
   return links.length ? `<div class="link-stack">${links.join("")}</div>` : "";
 }
@@ -1030,6 +1030,8 @@ function renderSettings() {
   form.addEventListener("input", total);
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
+    const problem = weightsProblem(Object.fromEntries(CRITERIA.map((c) => [c.key, Number(form[c.key].value)])));
+    if (problem) return toast(problem, 5000);
     if (total() !== 100 && !confirm("Weights don't total 100. Scores still work as a weighted average. Save anyway?")) return;
     try {
       state.settings = await api.put("/api/settings", {

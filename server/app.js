@@ -1,16 +1,54 @@
 import express from "express";
 import { fileURLToPath } from "node:url";
-import { HttpError } from "./db.js";
+import { HttpError, checkUserFields } from "./db.js";
 import { BggError } from "./bgg.js";
 import { syncCollection, addFromBgg, linkToBgg } from "./sync.js";
 import { watchlistExport } from "./export-watchlist.js";
 import { Predictor, PredictError, MAX_NOMINEES, buildSystem, buildTarget } from "./predict.js";
 import { RecommendScheduler, SHOWN, runRecommendations } from "./recommend.js";
-import { CRITERIA, RECOMMEND_FREQUENCIES, finalScore } from "../public/js/rubric.js";
+import { CRITERIA, RECOMMEND_FREQUENCIES, finalScore, weightsProblem } from "../public/js/rubric.js";
 
 const PUBLIC_DIR = fileURLToPath(new URL("../public", import.meta.url));
 
 const TASTE_PROFILE_LIMIT = 4000;
+
+// One check per setting: true if the value is allowed, plus the message a 400
+// carries otherwise (a function of the value when it depends on it).
+const SETTINGS_RULES = {
+  weights: [(v) => !weightsProblem(v), weightsProblem],
+  stretch: [(v) => typeof v === "number" && v > 0 && v <= 5, "stretch must be a number between 0 and 5"],
+  hideExpansions: [(v) => typeof v === "boolean", "hideExpansions must be true or false"],
+  includeWatching: [(v) => typeof v === "boolean", "includeWatching must be true or false"],
+  tasteProfile: [
+    (v) => typeof v === "string" && v.length <= TASTE_PROFILE_LIMIT,
+    `tasteProfile must be text of at most ${TASTE_PROFILE_LIMIT} characters`,
+  ],
+  recommendFrequency: [
+    (v) => RECOMMEND_FREQUENCIES.some((f) => f.key === v),
+    `recommendFrequency must be one of ${RECOMMEND_FREQUENCIES.map((f) => f.key).join(", ")}`,
+  ],
+  recommendNominees: [
+    (v) => Number.isInteger(v) && v >= SHOWN && v <= MAX_NOMINEES,
+    `recommendNominees must be a whole number from ${SHOWN} to ${MAX_NOMINEES}`,
+  ],
+};
+
+/**
+ * Validate a settings patch and return the settings to store. Throws a 400
+ * HttpError on a bad value. Weights keep only the seven criteria.
+ */
+function checkSettings(body) {
+  const out = {};
+  for (const [k, [ok, msg]] of Object.entries(SETTINGS_RULES)) {
+    const v = body[k];
+    if (v === undefined) continue;
+    if (!ok(v)) throw new HttpError(400, typeof msg === "function" ? msg(v) : msg);
+    out[k] = k === "weights" ? Object.fromEntries(CRITERIA.map((c) => [c.key, v[c.key]])) : v;
+  }
+  return out;
+}
+
+const isBggId = (v) => Number.isInteger(v) && v > 0;
 
 export function createApp({ store, bgg, bggUsername, predictor = new Predictor(), now = () => new Date(), schedulerTickMs } = {}) {
   const app = express();
@@ -69,37 +107,16 @@ export function createApp({ store, bgg, bggUsername, predictor = new Predictor()
   });
 
   app.put("/api/settings", (req, res) => {
-    const { weights, stretch, hideExpansions, includeWatching, tasteProfile, recommendFrequency, recommendNominees } = req.body;
-    if (weights !== undefined) {
-      const ok = CRITERIA.every((c) => typeof weights[c.key] === "number" && weights[c.key] >= 0);
-      if (!ok) throw new HttpError(400, "weights needs a non-negative number for every criterion");
-    }
-    if (stretch !== undefined && !(typeof stretch === "number" && stretch > 0 && stretch <= 5)) {
-      throw new HttpError(400, "stretch must be a number between 0 and 5");
-    }
-    if (hideExpansions !== undefined && typeof hideExpansions !== "boolean") {
-      throw new HttpError(400, "hideExpansions must be true or false");
-    }
-    if (includeWatching !== undefined && typeof includeWatching !== "boolean") {
-      throw new HttpError(400, "includeWatching must be true or false");
-    }
-    if (tasteProfile !== undefined && !(typeof tasteProfile === "string" && tasteProfile.length <= TASTE_PROFILE_LIMIT)) {
-      throw new HttpError(400, `tasteProfile must be text of at most ${TASTE_PROFILE_LIMIT} characters`);
-    }
-    if (recommendFrequency !== undefined && !RECOMMEND_FREQUENCIES.some((f) => f.key === recommendFrequency)) {
-      throw new HttpError(400, `recommendFrequency must be one of ${RECOMMEND_FREQUENCIES.map((f) => f.key).join(", ")}`);
-    }
-    if (recommendNominees !== undefined && !(Number.isInteger(recommendNominees) && recommendNominees >= SHOWN && recommendNominees <= MAX_NOMINEES)) {
-      throw new HttpError(400, `recommendNominees must be a whole number from ${SHOWN} to ${MAX_NOMINEES}`);
-    }
-    res.json(store.setSettings({ weights, stretch, hideExpansions, includeWatching, tasteProfile, recommendFrequency, recommendNominees }));
+    res.json(store.setSettings(checkSettings(req.body)));
   });
 
   app.post("/api/games", (req, res) => {
-    const { name, bggId, type = "Base", status = "", watchStage } = req.body;
-    if (!name?.trim()) throw new HttpError(400, "name is required");
+    const { name, bggId = null, type = "Base", status = "", watchStage } = req.body;
+    if (name === undefined) throw new HttpError(400, "name is required");
+    const user = checkUserFields({ name, type, status });
+    if (bggId !== null && !isBggId(bggId)) throw new HttpError(400, "bggId must be a positive integer or null");
     if (bggId && store.getByBggId(bggId)) throw new HttpError(409, "that BGG game is already in your list");
-    res.status(201).json(store.createGame({ name: name.trim(), bggId: bggId || null, type, status, watchStage }));
+    res.status(201).json(store.createGame({ ...user, bggId, watchStage }));
   });
 
   app.post("/api/games/from-bgg", async (req, res) => {

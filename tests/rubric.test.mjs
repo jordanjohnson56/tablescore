@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   CRITERIA, finalScore, rawAverage, rescoreStatus, bandIndex, spread, DEFAULT_SETTINGS, weightTotal,
+  weightsProblem,
 } from "../public/js/rubric.js";
 
 const vec = (xs) => Object.fromEntries(CRITERIA.map((c, i) => [c.key, xs[i]]));
@@ -54,6 +55,24 @@ test("weights need not total 100 for the math to stay an average", () => {
   const s = { ...sample };
   const doubled = { ...DEFAULT_SETTINGS, weights: Object.fromEntries(Object.entries(DEFAULT_SETTINGS.weights).map(([k, v]) => [k, v * 2])) };
   assert.equal(finalScore(s, doubled), finalScore(s));
+});
+
+test("weightsProblem accepts any total above 0 and names what is wrong otherwise", () => {
+  const w = DEFAULT_SETTINGS.weights;
+  assert.equal(weightsProblem(w), null);
+  assert.equal(weightsProblem({ ...w, desire: 30 }), null); // total 90
+  assert.equal(weightsProblem({ ...w, desire: 12.5 }), null);
+  assert.equal(weightsProblem({ ...w, desire: 1000 }), null);
+  const zeros = Object.fromEntries(CRITERIA.map((c) => [c.key, 0]));
+  assert.match(weightsProblem(zeros), /above 0/);
+  for (const bad of [null, undefined, "40", 5, [], [40, 15]]) assert.match(weightsProblem(bad), /weights/, String(bad));
+  const { theme, ...missing } = w;
+  assert.match(weightsProblem(missing), /theme/);
+  assert.match(weightsProblem({ ...w, art: -1 }), /art/);
+  assert.match(weightsProblem({ ...w, art: 1001 }), /art/);
+  assert.match(weightsProblem({ ...w, art: Infinity }), /art/);
+  assert.match(weightsProblem({ ...w, art: NaN }), /art/);
+  assert.match(weightsProblem({ ...w, art: "10" }), /art/);
 });
 
 test("band boundaries follow the Legend", () => {

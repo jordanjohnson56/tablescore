@@ -25,6 +25,16 @@ export const PLATFORMS = [
   { key: "other", label: "Other" },
 ];
 
+/** A game's type. Anything but Expansion would escape the Rank and Hide expansions filters. */
+export const GAME_TYPES = ["Base", "Expansion"];
+
+/**
+ * Every Status the game page offers and BGG sync writes, in the game page's
+ * order; "" is a game not in the collection. Sync writes "Want" for BGG's
+ * want and want-to-buy flags.
+ */
+export const STATUSES = ["Owned", "Preordered", "Prev. owned", "Wishlist", "Want to play", "Want", ""];
+
 /** The currency of a target price that has none. The stored currency stays null. */
 export const DEFAULT_CURRENCY = "USD";
 

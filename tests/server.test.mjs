@@ -13,6 +13,8 @@ import { readWorkbook, importInto } from "../server/import-xlsx.js";
 import { readXlsx } from "../server/xlsx.js";
 import { watchlistExport, writeWatchlist } from "../server/export-watchlist.js";
 import { importWatchlist, readWatchlistFile } from "../server/import-watchlist.js";
+import { GAME_TYPES, STATUSES } from "../public/js/watchlist.js";
+import { DEFAULT_SETTINGS } from "../public/js/rubric.js";
 
 // ---------- synthetic BGG responses (shapes copied from the XML API2 docs) ----------
 
@@ -117,7 +119,7 @@ async function startApp({ withBgg = true, file = ":memory:" } = {}) {
     const text = await res.text();
     return { status: res.status, body: text ? JSON.parse(text) : null };
   };
-  return { store, calls, call, close: () => (server.close(), store.db.close()) };
+  return { store, calls, call, base, close: () => (server.close(), store.db.close()) };
 }
 
 // ---------- BGG client ----------
@@ -508,6 +510,173 @@ test("hideExpansions setting persists and is validated", async () => {
     assert.equal(r.body.stretch, 1.25);
     assert.equal((await t.call("PUT", "/api/settings", { hideExpansions: "yes" })).status, 400);
     assert.equal((await t.call("PUT", "/api/settings", { stretch: 1.5 })).body.hideExpansions, true);
+  } finally {
+    t.close();
+  }
+});
+
+// ---------- input validation ----------
+
+test("PUT /api/settings rejects weights that are missing, malformed, out of range or total 0, and saves nothing", async () => {
+  const t = await startApp();
+  try {
+    const w = DEFAULT_SETTINGS.weights;
+    const { theme, ...missing } = w;
+    const bad = [
+      Object.fromEntries(Object.keys(w).map((k) => [k, 0])),
+      null,
+      "40,15,10,10,10,10,5",
+      [40, 15, 10, 10, 10, 10, 5],
+      missing,
+      { ...w, art: -1 },
+      { ...w, art: 1001 },
+      { ...w, art: "10" },
+    ];
+    for (const weights of bad) {
+      const r = await t.call("PUT", "/api/settings", { weights, stretch: 2 });
+      assert.equal(r.status, 400, JSON.stringify(weights));
+      assert.match(r.body.error, /weights/);
+    }
+    // JSON.parse reads 1e999 as Infinity, which JSON.stringify can't send.
+    const raw = await fetch(`${t.base}/api/settings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: `{"weights":{"desire":1e999,"table":15,"depth":10,"interaction":10,"replay":10,"art":10,"theme":5}}`,
+    });
+    assert.equal(raw.status, 400);
+    assert.match((await raw.json()).error, /weights/);
+    const { settings } = (await t.call("GET", "/api/state")).body;
+    assert.deepEqual(settings.weights, w);
+    assert.equal(settings.stretch, 1.25);
+  } finally {
+    t.close();
+  }
+});
+
+test("PUT /api/settings keeps weights that total other than 100, and only the seven criteria", async () => {
+  const t = await startApp();
+  try {
+    const weights = { ...DEFAULT_SETTINGS.weights, desire: 30 };
+    const r = await t.call("PUT", "/api/settings", { weights: { ...weights, bogus: 7 } });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body.weights, weights);
+    assert.deepEqual((await t.call("GET", "/api/state")).body.settings.weights, weights);
+  } finally {
+    t.close();
+  }
+});
+
+test("PATCH rejects each bad game field with a 400 naming it, and saves nothing", async () => {
+  const t = await startApp();
+  try {
+    const { body: g } = await t.call("POST", "/api/games", { name: "Bookwyrm" });
+    const bad = [
+      [{ campaignEnd: "2026-13-01" }, /campaignEnd/],
+      [{ campaignEnd: "2026-00-10" }, /campaignEnd/],
+      [{ campaignEnd: "2026-01-32" }, /campaignEnd/],
+      [{ campaignEnd: "2026-01-00" }, /campaignEnd/],
+      [{ notes: null }, /notes/],
+      [{ notes: 5 }, /notes/],
+      [{ notes: "x".repeat(10001) }, /notes/],
+      [{ name: null }, /name/],
+      [{ name: 5 }, /name/],
+      [{ name: "  " }, /name/],
+      [{ name: "x".repeat(201) }, /name/],
+      [{ plays: "3" }, /plays/],
+      [{ plays: -1 }, /plays/],
+      [{ plays: 1.5 }, /plays/],
+      [{ plays: null }, /plays/],
+      [{ type: "expansion" }, /type/],
+      [{ type: null }, /type/],
+      [{ status: "Sold" }, /status/],
+      [{ status: null }, /status/],
+      [{ avoidTheme: "false" }, /avoidTheme/],
+      [{ wontScore: 1 }, /wontScore/],
+      [{ calibration: null }, /calibration/],
+      [{ bestPlayers: null }, /bestPlayers/],
+      [{ bestPlayers: "x".repeat(41) }, /bestPlayers/],
+      [{ notes: { a: 1 } }, /notes/],
+      [{ plays: [1] }, /plays/],
+    ];
+    for (const [patch, msg] of bad) {
+      const r = await t.call("PATCH", `/api/games/${g.id}`, { plays: 7, ...patch, wontScore: patch.wontScore ?? true });
+      assert.equal(r.status, 400, JSON.stringify(patch));
+      assert.match(r.body.error, msg, JSON.stringify(patch));
+    }
+    const after = t.store.getGame(g.id);
+    assert.equal(after.plays, 0);
+    assert.equal(after.wontScore, false);
+    assert.equal(after.name, "Bookwyrm");
+  } finally {
+    t.close();
+  }
+});
+
+test("PATCH accepts every status and type, whole plays, booleans, and trims the name", async () => {
+  const t = await startApp();
+  try {
+    const { body: g } = await t.call("POST", "/api/games", { name: "Bookwyrm" });
+    for (const status of STATUSES) {
+      const r = await t.call("PATCH", `/api/games/${g.id}`, { status });
+      assert.equal(r.status, 200, status);
+      assert.equal(r.body.status, status);
+    }
+    for (const type of GAME_TYPES) assert.equal((await t.call("PATCH", `/api/games/${g.id}`, { type })).body.type, type);
+    const r = await t.call("PATCH", `/api/games/${g.id}`, {
+      name: "  Bookwyrm Deluxe ", plays: 0, notes: "", bestPlayers: "3-4", avoidTheme: false, calibration: true,
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.name, "Bookwyrm Deluxe");
+    assert.equal(r.body.plays, 0);
+    assert.equal(r.body.calibration, true);
+    assert.equal(r.body.bestPlayers, "3-4");
+  } finally {
+    t.close();
+  }
+});
+
+test("a game already holding a value the rules refuse can still have its other fields saved", async () => {
+  const t = await startApp();
+  try {
+    // Stored before validation, or by sync and the import CLIs, which createGame doesn't check.
+    const g = t.store.createGame({ name: "Old", status: "For trade", type: "boardgame", plays: 2 });
+    const r = await t.call("PATCH", `/api/games/${g.id}`, { notes: "still saves", scores: { desire: 8 } });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.status, "For trade");
+    assert.equal(r.body.notes, "still saves");
+  } finally {
+    t.close();
+  }
+});
+
+test("POST /api/games rejects a bad name, type, status or bggId with a 400 and adds nothing", async () => {
+  const t = await startApp();
+  try {
+    const bad = [
+      [{ name: 5 }, /name/],
+      [{ name: "  " }, /name/],
+      [{}, /name/],
+      [{ name: "Root", type: null }, /type/],
+      [{ name: "Root", type: "Expansions" }, /type/],
+      [{ name: "Root", status: null }, /status/],
+      [{ name: "Root", bggId: "abc" }, /bggId/],
+      [{ name: "Root", bggId: "13" }, /bggId/],
+      [{ name: "Root", bggId: 1.5 }, /bggId/],
+      [{ name: "Root", bggId: -4 }, /bggId/],
+      [{ name: "Root", bggId: {} }, /bggId/],
+    ];
+    for (const [body, msg] of bad) {
+      const r = await t.call("POST", "/api/games", body);
+      assert.equal(r.status, 400, JSON.stringify(body));
+      assert.match(r.body.error, msg, JSON.stringify(body));
+    }
+    assert.equal(t.store.listGames().length, 0);
+    const ok = await t.call("POST", "/api/games", { name: " Root ", bggId: null, type: "Expansion", status: "Want" });
+    assert.equal(ok.status, 201);
+    assert.equal(ok.body.name, "Root");
+    assert.equal(ok.body.type, "Expansion");
+    assert.equal((await t.call("POST", "/api/games", { name: "Catan", bggId: 13 })).status, 201);
+    assert.equal((await t.call("POST", "/api/games", { name: "Catan again", bggId: 13 })).status, 409);
   } finally {
     t.close();
   }
