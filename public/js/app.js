@@ -8,6 +8,7 @@ import {
 } from "./watchlist.js";
 import { api } from "./api.js";
 import { latestOnly, SUPERSEDED } from "./latest.js";
+import { sharedPoll } from "./poll.js";
 
 const view = document.getElementById("view");
 let state = { settings: null, games: [], bgg: { configured: false }, claude: { configured: false } };
@@ -844,18 +845,20 @@ async function renderDiscover() {
 // ---------- recommendations ----------
 
 const recommendationsOn = () => state.claude.configured && state.bgg.configured;
-let recPoll;
+const recPoll = sharedPoll(15000);
 
 /** Loads the picks into a Discover section (or a Settings card) and keeps them fresh while a run is going. */
 async function bindRecommendations(sec, { onChange } = {}) {
-  clearInterval(recPoll);
+  const me = {};
+  recPoll.claim(me);
+  const live = () => view.contains(sec);
   const list = sec.querySelector("#recs");
   const when = sec.querySelector("#rec-when");
   const refresh = sec.querySelector("#rec-refresh");
   let data = null;
 
   const draw = () => {
-    if (!view.contains(sec)) return clearInterval(recPoll);
+    if (!live()) return;
     const running = data?.running;
     refresh.disabled = !!running;
     refresh.dataset.label ??= refresh.textContent;
@@ -872,23 +875,22 @@ async function bindRecommendations(sec, { onChange } = {}) {
     try {
       data = await api.get("/api/recommendations");
     } catch (err) {
+      if (!live()) return recPoll.stop(me);
       if (!data) list.innerHTML = `<li class="empty">${esc(err.message)}</li>`;
       return;
     }
+    if (!live()) return recPoll.stop(me);
     draw();
-    if (data.running && !recPoll) recPoll = setInterval(load, 15000);
-    if (!data.running) {
-      clearInterval(recPoll);
-      recPoll = null;
-    }
+    data.running ? recPoll.start(me, load) : recPoll.stop(me);
   };
 
   refresh.addEventListener("click", async () => {
     refresh.disabled = true;
     try {
       data = await api.post("/api/recommendations/refresh", {});
+      if (!live()) return;
       draw();
-      recPoll = setInterval(load, 15000);
+      recPoll.start(me, load);
     } catch (err) {
       refresh.disabled = false;
       toast(err.message, 5000);
