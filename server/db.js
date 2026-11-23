@@ -412,27 +412,65 @@ export class Store {
   /**
    * Predicted vs actual for every game scored in the app after a prediction:
    * the latest finished prediction made before the game's first full score.
+   * Besides the error on the final it reports bias (positive = Claude scores
+   * higher), the error on each criterion and by Claude's confidence, and two
+   * free baselines to compare with, each worked out without the judged game.
    */
   predictionAccuracy() {
     const settings = this.getSettings();
-    const pairs = [];
-    for (const row of this.db.prepare("SELECT * FROM games WHERE scored_at IS NOT NULL").all()) {
+    const games = this.db.prepare("SELECT * FROM games").all().map((row) => {
       const game = toGame(row);
-      const actual = finalScore(game.scores, settings);
-      if (actual == null) continue;
-      const before = this.db
-        .prepare(
-          `SELECT * FROM predictions WHERE status = 'done' AND created_at < ? AND (bgg_id = ? OR game_id = ?)
-           ORDER BY created_at DESC, id DESC LIMIT 1`,
-        )
-        .get(row.scored_at, game.bggId, game.id);
+      return { game, scoredAt: row.scored_at, tablescore: finalScore(game.scores, settings) };
+    });
+    const withScore = games.filter((g) => g.tablescore != null);
+    // A prediction is taken by game id only when it names no other BGG game, so
+    // one left on a reused id by a deleted BGG game can't pair with this one.
+    const latestBefore = this.db.prepare(
+      `SELECT * FROM predictions WHERE status = 'done' AND created_at < ?
+         AND (bgg_id = ? OR (game_id = ? AND bgg_id IS NULL))
+       ORDER BY created_at DESC, id DESC LIMIT 1`,
+    );
+    const pairs = [];
+    for (const { game, scoredAt, tablescore: actual } of games) {
+      if (!scoredAt || actual == null) continue;
+      const before = latestBefore.get(scoredAt, game.bggId, game.id);
       if (!before) continue;
       const p = toPrediction(before, settings);
-      pairs.push({ gameId: game.id, name: game.name, predictionId: p.id, predicted: p.final, actual, error: Math.round((p.final - actual) * 10) / 10 });
+      if (p.final == null) continue;
+      const others = withScore.filter((g) => g.game.id !== game.id);
+      pairs.push({
+        gameId: game.id,
+        name: game.name,
+        predictionId: p.id,
+        predicted: p.final,
+        actual,
+        error: round1(p.final - actual),
+        confidence: p.confidence,
+        criteria: Object.fromEntries(CRITERIA.map((c) => [c.key, round1(p.scores[c.key] - game.scores[c.key])])),
+        baselines: { mean: meanBaseline(others), bggAvg: bggAvgBaseline(others, game.bggAvg) },
+      });
     }
-    const n = pairs.length;
-    const meanAbsError = n ? Math.round((pairs.reduce((t, x) => t + Math.abs(x.predicted - x.actual), 0) / n) * 100) / 100 : null;
-    return { n, meanAbsError, pairs };
+    const finalErrors = (list) => list.map((x) => x.predicted - x.actual);
+    const baseline = (kind) => {
+      const covered = pairs.filter((x) => x.baselines[kind] != null);
+      return {
+        ...summarise(covered.map((x) => x.baselines[kind] - x.actual)),
+        claudeMeanAbsError: summarise(finalErrors(covered)).meanAbsError,
+      };
+    };
+    const all = summarise(finalErrors(pairs));
+    return {
+      n: all.n,
+      meanAbsError: all.meanAbsError,
+      bias: all.bias,
+      criteria: CRITERIA.map((c) => ({ key: c.key, ...summarise(pairs.map((x) => x.criteria[c.key])) })),
+      byConfidence: CONFIDENCES.map((confidence) => ({
+        confidence,
+        ...summarise(finalErrors(pairs.filter((x) => x.confidence === confidence))),
+      })),
+      baselines: { mean: baseline("mean"), bggAvg: baseline("bggAvg") },
+      pairs,
+    };
   }
 
   // ---------- recommendations ----------
@@ -674,6 +712,56 @@ function toRecommendation(r) {
     rank: r.rank,
     dropped: r.dropped,
   };
+}
+
+// ---------- prediction accuracy ----------
+
+const CONFIDENCES = ["high", "medium", "low"];
+/** The BGG average baseline needs at least this many other games to fit its line. */
+const BASELINE_MIN_GAMES = 10;
+
+const round1 = (x) => Math.round(x * 10) / 10 || 0; // `|| 0` turns -0 into 0
+const round2 = (x) => Math.round(x * 100) / 100 || 0;
+
+/** Mean absolute and mean signed error, to two decimals; null means when there are none. */
+function summarise(errors) {
+  const n = errors.length;
+  if (!n) return { n, meanAbsError: null, bias: null };
+  return {
+    n,
+    meanAbsError: round2(errors.reduce((t, e) => t + Math.abs(e), 0) / n),
+    bias: round2(errors.reduce((t, e) => t + e, 0) / n),
+  };
+}
+
+/** Guessing the mean Tablescore of the other games every time. */
+function meanBaseline(others) {
+  if (!others.length) return null;
+  return round1(others.reduce((t, g) => t + g.tablescore, 0) / others.length);
+}
+
+/** A least-squares line from BGG average to Tablescore over the other games, read at this game's BGG average. */
+function bggAvgBaseline(others, bggAvg) {
+  if (bggAvg == null) return null;
+  const line = fitLine(others.filter((g) => g.game.bggAvg != null).map((g) => [g.game.bggAvg, g.tablescore]));
+  if (!line) return null;
+  return round1(Math.max(0, Math.min(10, line.a + line.b * bggAvg)));
+}
+
+/** Tablescore = a + b × x, or null with too few points or every x the same. */
+function fitLine(points) {
+  if (points.length < BASELINE_MIN_GAMES) return null;
+  const mx = points.reduce((t, [x]) => t + x, 0) / points.length;
+  const my = points.reduce((t, [, y]) => t + y, 0) / points.length;
+  let sxx = 0;
+  let sxy = 0;
+  for (const [x, y] of points) {
+    sxx += (x - mx) ** 2;
+    sxy += (x - mx) * (y - my);
+  }
+  if (sxx === 0) return null;
+  const b = sxy / sxx;
+  return { a: my - b * mx, b };
 }
 
 /** The final score is worked out with the current weights, like a game's. */

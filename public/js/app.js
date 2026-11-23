@@ -1435,6 +1435,43 @@ async function bindRecommendSettings() {
   bindRecommendations(sec, { onChange: (d) => d.running || loadRuns() });
 }
 
+/** A signed figure, + for positive: how far Claude's predicted score sits above or below. */
+const signed = (x, digits = 1) => (x == null ? "—" : `${x > 0 ? "+" : ""}${formatNumber(x, digits)}`);
+const gamesLabel = (n) => `${n} ${n === 1 ? "game" : "games"}`;
+
+/** Settings → Accuracy: the headline with bias, the baselines, the criterion and confidence tables, then each game. */
+function accuracyHtml(acc) {
+  if (!acc.n) return "No games scored after a prediction yet. Once you score a game Claude predicted, it shows up here.";
+  const lean = acc.bias > 0 ? `Claude runs <b>${formatNumber(acc.bias, 2)} high</b>.`
+    : acc.bias < 0 ? `Claude runs <b>${formatNumber(-acc.bias, 2)} low</b>.`
+    : "Claude runs neither high nor low.";
+  const { mean, bggAvg } = acc.baselines;
+  const sameGames = (b) => (b.n === acc.n ? `${gamesLabel(b.n)}` : `${gamesLabel(b.n)}; Claude ${formatNumber(b.claudeMeanAbsError, 2)} on the same ${b.n}`);
+  const baselines = [
+    mean.n ? `<p>Guessing your average Tablescore every time: off by ${formatNumber(mean.meanAbsError, 2)} (${sameGames(mean)}).</p>` : "",
+    bggAvg.n ? `<p>A straight line from BGG's average: off by ${formatNumber(bggAvg.meanAbsError, 2)} (${sameGames(bggAvg)}).</p>` : "",
+  ].join("");
+  const name = Object.fromEntries(CRITERIA.map((c) => [c.key, c.name]));
+  return `
+    <p>Off by <b>${formatNumber(acc.meanAbsError, 2)}</b> on average across ${gamesLabel(acc.n)} you scored after a prediction. ${lean}</p>
+    ${baselines}
+    <h4>By criterion</h4>
+    <table>
+      <thead><tr><th>Criterion</th><th class="num">Weight</th><th class="num">Bias</th><th class="num">Off by</th><th class="num">n</th></tr></thead>
+      <tbody>${acc.criteria.map((c) => `<tr><td>${esc(name[c.key])}</td><td class="num">${state.settings.weights[c.key]}%</td>
+        <td class="num">${signed(c.bias, 2)}</td><td class="num">${formatNumber(c.meanAbsError, 2)}</td><td class="num">${c.n}</td></tr>`).join("")}</tbody>
+    </table>
+    <h4>By confidence</h4>
+    <table>
+      <thead><tr><th>Confidence</th><th class="num">n</th><th class="num">Off by</th><th class="num">Bias</th></tr></thead>
+      <tbody>${acc.byConfidence.map((c) => `<tr><td>${c.confidence[0].toUpperCase()}${c.confidence.slice(1)}</td>
+        <td class="num">${c.n}</td><td class="num">${formatNumber(c.meanAbsError, 2)}</td><td class="num">${signed(c.bias, 2)}</td></tr>`).join("")}</tbody>
+    </table>
+    <h4>By game</h4>
+    <table><tbody>${acc.pairs.map((x) => `<tr><td><a href="#/g/${x.gameId}">${esc(x.name)}</a></td>
+      <td class="num">${formatNumber(x.predicted)} → ${formatNumber(x.actual)}</td><td class="num">${signed(x.error)}</td></tr>`).join("")}</tbody></table>`;
+}
+
 async function bindClaudeSettings() {
   const save = view.querySelector("#taste-save");
   if (!save) return;
@@ -1450,11 +1487,7 @@ async function bindClaudeSettings() {
   const box = view.querySelector("#accuracy");
   try {
     const acc = await api.get("/api/predictions/accuracy");
-    box.innerHTML = acc.n
-      ? `<p>Off by <b>${formatNumber(acc.meanAbsError, 2)}</b> on average across ${acc.n} ${acc.n === 1 ? "game" : "games"} you scored after a prediction.</p>
-         <table><tbody>${acc.pairs.map((x) => `<tr><td><a href="#/g/${x.gameId}">${esc(x.name)}</a></td>
-           <td class="num">${formatNumber(x.predicted)} → ${formatNumber(x.actual)}</td><td class="num">${x.error > 0 ? "+" : ""}${formatNumber(x.error)}</td></tr>`).join("")}</tbody></table>`
-      : "No games scored after a prediction yet. Once you score a game Claude predicted, it shows up here.";
+    box.innerHTML = accuracyHtml(acc);
   } catch (err) {
     box.textContent = err.message;
   }

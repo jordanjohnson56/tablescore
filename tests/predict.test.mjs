@@ -6,7 +6,8 @@ import { createApp } from "../server/app.js";
 import { Predictor, buildSystem, buildTarget, parseSubmission } from "../server/predict.js";
 import { DEFAULT_SETTINGS } from "../public/js/rubric.js";
 
-const all = (v) => ({ desire: v, table: v, depth: v, interaction: v, replay: v, art: v, theme: v });
+const CRITERIA_COLS = "s_desire, s_table, s_depth, s_interaction, s_replay, s_art, s_theme";
+const all = (v) =>({ desire: v, table: v, depth: v, interaction: v, replay: v, art: v, theme: v });
 
 // ---------- fakes ----------
 
@@ -351,6 +352,21 @@ test("accuracy pairs a game's score with the last prediction made before it was 
     assert.equal(acc.pairs[0].actual, 7);
     assert.equal(acc.pairs[0].error, 1.4);
     assert.equal(acc.meanAbsError, 1.4);
+    assert.equal(acc.bias, 1.4);
+    const crit = Object.fromEntries(acc.criteria.map((c) => [c.key, c]));
+    assert.deepEqual(acc.criteria.map((c) => c.key), ["desire", "table", "depth", "interaction", "replay", "art", "theme"]);
+    assert.deepEqual(crit.desire, { key: "desire", n: 1, meanAbsError: 2, bias: 2 });
+    assert.equal(crit.art.bias, -1);
+    assert.equal(crit.table.bias, 0);
+    assert.deepEqual(acc.pairs[0].criteria, { desire: 2, table: 0, depth: 1, interaction: 2, replay: 1, art: -1, theme: 0 });
+    assert.equal(acc.pairs[0].confidence, "medium");
+    assert.deepEqual(acc.byConfidence.map((c) => c.confidence), ["high", "medium", "low"]);
+    assert.deepEqual(acc.byConfidence[1], { confidence: "medium", n: 1, meanAbsError: 1.4, bias: 1.4 });
+    assert.deepEqual(acc.byConfidence[0], { confidence: "high", n: 0, meanAbsError: null, bias: null });
+    assert.equal(acc.baselines.mean.n, 0);
+    assert.equal(acc.baselines.mean.meanAbsError, null);
+    assert.equal(acc.baselines.mean.claudeMeanAbsError, null);
+    assert.deepEqual(acc.pairs[0].baselines, { mean: null, bggAvg: null });
 
     // Re-scoring later doesn't move the first-scored time.
     await t.call("PATCH", `/api/games/${g.id}`, { scores: { desire: 8 } });
@@ -358,6 +374,134 @@ test("accuracy pairs a game's score with the last prediction made before it was 
   } finally {
     t.close();
   }
+});
+
+/**
+ * A finished prediction from submission()'s scores (Tablescore 8.4), backdated
+ * so it is always made before the game is scored.
+ */
+function addPrediction(store, target, overrides = {}) {
+  const p = store.createPrediction({ name: "Predicted", model: "m", ...target });
+  store.finishPrediction(p.id, {
+    name: p.name, scoredGames: 1, scores: submission().scores, confidence: "medium", avoidTheme: false,
+    avoidThemeReason: "", rationale: "", twoPlayer: "", sources: [], ...overrides,
+  });
+  store.db.prepare("UPDATE predictions SET created_at = '2020-01-01T00:00:00.000Z' WHERE id = ?").run(p.id);
+  return p.id;
+}
+
+/** Every bias in an accuracy report, so a test can check none is -0. */
+function allBiases(acc) {
+  return [acc.bias, ...acc.criteria.map((c) => c.bias), ...acc.byConfidence.map((c) => c.bias),
+    acc.baselines.mean.bias, acc.baselines.bggAvg.bias];
+}
+
+test("accuracy: signed and absolute error differ, and the mean baseline judges each game against the others", () => {
+  const store = openDb(":memory:");
+  const a = store.createGame({ name: "A" });
+  const b = store.createGame({ name: "B" });
+  addPrediction(store, { gameId: a.id });
+  addPrediction(store, { gameId: b.id }, { confidence: "high" });
+  store.updateGame(a.id, { scores: { ...all(7), desire: 6 } }); // 7.0
+  store.updateGame(b.id, { scores: all(9) }); // 10.0
+
+  const acc = store.predictionAccuracy();
+  assert.equal(acc.n, 2);
+  assert.equal(acc.meanAbsError, 1.5);
+  assert.equal(acc.bias, -0.1);
+  const crit = Object.fromEntries(acc.criteria.map((c) => [c.key, c]));
+  assert.deepEqual(crit.desire, { key: "desire", n: 2, meanAbsError: 1.5, bias: 0.5 });
+  assert.deepEqual(crit.art, { key: "art", n: 2, meanAbsError: 2, bias: -2 });
+  assert.deepEqual(crit.theme, { key: "theme", n: 2, meanAbsError: 1, bias: -1 });
+  assert.deepEqual(acc.byConfidence[0], { confidence: "high", n: 1, meanAbsError: 1.6, bias: -1.6 });
+  assert.deepEqual(acc.byConfidence[1], { confidence: "medium", n: 1, meanAbsError: 1.4, bias: 1.4 });
+  assert.deepEqual(acc.byConfidence[2], { confidence: "low", n: 0, meanAbsError: null, bias: null });
+  assert.deepEqual(acc.baselines.mean, { n: 2, meanAbsError: 3, bias: 0, claudeMeanAbsError: 1.5 });
+  assert.deepEqual(acc.baselines.bggAvg, { n: 0, meanAbsError: null, bias: null, claudeMeanAbsError: null });
+  const byName = Object.fromEntries(acc.pairs.map((x) => [x.name, x]));
+  assert.equal(byName.A.baselines.mean, 10);
+  assert.equal(byName.B.baselines.mean, 7);
+  for (const x of allBiases(acc)) assert.ok(!Object.is(x, -0));
+});
+
+/** Ten games whose Tablescores sit on an exact line against their BGG averages. */
+function lineOfGames(store, count = 10) {
+  const levels = [1, 3, 5, 7, 9, 1, 3, 5, 7, 9]; // Tablescores 0, 2.5, 5, 7.5, 10
+  for (let i = 0; i < count; i++) store.createGame({ name: `Fit ${i}`, bggAvg: levels[i], scores: all(levels[i]) });
+}
+
+test("accuracy: the BGG average baseline is a line fitted without the judged game", () => {
+  const store = openDb(":memory:");
+  lineOfGames(store);
+  const t = store.createGame({ name: "Target", bggAvg: 7 });
+  addPrediction(store, { gameId: t.id });
+  store.updateGame(t.id, { scores: all(9) }); // 10.0
+
+  const acc = store.predictionAccuracy();
+  assert.equal(acc.n, 1);
+  assert.equal(acc.pairs[0].baselines.bggAvg, 7.5);
+  assert.deepEqual(acc.baselines.bggAvg, { n: 1, meanAbsError: 2.5, bias: -2.5, claudeMeanAbsError: 1.6 });
+  assert.equal(acc.pairs[0].baselines.mean, 5);
+  assert.equal(acc.baselines.mean.meanAbsError, 5);
+});
+
+test("accuracy: the BGG average baseline is left out with too few games or no BGG average, but the pair still counts", () => {
+  const few = openDb(":memory:");
+  lineOfGames(few, 9);
+  const t = few.createGame({ name: "Target", bggAvg: 7 });
+  addPrediction(few, { gameId: t.id });
+  few.updateGame(t.id, { scores: all(9) });
+  let acc = few.predictionAccuracy();
+  assert.equal(acc.n, 1);
+  assert.equal(acc.meanAbsError, 1.6);
+  assert.equal(acc.pairs[0].baselines.bggAvg, null);
+  assert.deepEqual(acc.baselines.bggAvg, { n: 0, meanAbsError: null, bias: null, claudeMeanAbsError: null });
+
+  const noAvg = openDb(":memory:");
+  lineOfGames(noAvg);
+  const u = noAvg.createGame({ name: "Target" });
+  addPrediction(noAvg, { gameId: u.id });
+  noAvg.updateGame(u.id, { scores: all(9) });
+  acc = noAvg.predictionAccuracy();
+  assert.equal(acc.n, 1);
+  assert.equal(acc.baselines.bggAvg.n, 0);
+
+  // Equal BGG averages give no line.
+  const flat = openDb(":memory:");
+  for (let i = 0; i < 10; i++) flat.createGame({ name: `Fit ${i}`, bggAvg: 7, scores: all(i % 10) });
+  const v = flat.createGame({ name: "Target", bggAvg: 7 });
+  addPrediction(flat, { gameId: v.id });
+  flat.updateGame(v.id, { scores: all(9) });
+  assert.equal(flat.predictionAccuracy().baselines.bggAvg.n, 0);
+});
+
+test("accuracy skips a finished prediction with no scores instead of counting it as an error", () => {
+  const store = openDb(":memory:");
+  const g = store.createGame({ name: "A", bggId: 500 });
+  store.db.prepare("INSERT INTO predictions (bgg_id, name, model, status, created_at) VALUES (500, 'Blank', 'm', 'done', '2020-01-01T00:00:00.000Z')").run();
+  store.updateGame(g.id, { scores: all(7) });
+  const acc = store.predictionAccuracy();
+  assert.equal(acc.n, 0);
+  assert.equal(acc.meanAbsError, null);
+  assert.equal(acc.bias, null);
+});
+
+test("accuracy only takes a prediction by game id when it names no other BGG game", () => {
+  // Left over from before ids stopped being reused: a deleted BGG game's
+  // prediction sitting on a game with no BGG ID, which the clean-up at open
+  // can't prove wrong.
+  const store = openDb(":memory:");
+  const g = store.createGame({ name: "No BGG" });
+  store.db.prepare(`INSERT INTO predictions (bgg_id, game_id, name, model, status, created_at, ${CRITERIA_COLS})
+    VALUES (777, ?, 'Gone', 'm', 'done', '2020-01-01T00:00:00.000Z', 1, 1, 1, 1, 1, 1, 1)`).run(g.id);
+  store.updateGame(g.id, { scores: all(7) });
+  assert.equal(store.predictionAccuracy().n, 0);
+
+  // Its own prediction, made by game id, still pairs.
+  addPrediction(store, { gameId: g.id });
+  const acc = store.predictionAccuracy();
+  assert.equal(acc.n, 1);
+  assert.equal(acc.pairs[0].predicted, 8.4);
 });
 
 test("predictions left running by a restart are marked failed", () => {
