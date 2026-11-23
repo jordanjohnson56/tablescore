@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { strToU8, zipSync } from "fflate";
 import { openDb } from "../server/db.js";
-import { BggClient } from "../server/bgg.js";
+import { BggClient, BggError } from "../server/bgg.js";
 import { createApp } from "../server/app.js";
 import { syncCollection } from "../server/sync.js";
 import { readWorkbook, importInto } from "../server/import-xlsx.js";
@@ -71,17 +71,22 @@ const SEARCH = `<?xml version="1.0" encoding="utf-8"?>
   <item type="boardgameexpansion" id="926"><name type="primary" value="Catan: Seafarers"/><yearpublished value="1997"/></item>
 </items>`;
 
-function fakeBgg(routes) {
+/**
+ * A fake BGG answering by endpoint. A route returns a body, a bare status, or
+ * { status, body }, and may throw to stand for a network failure.
+ */
+function fakeBgg(routes, options = {}) {
   const calls = [];
   const fetchImpl = async (url, opts) => {
-    calls.push({ url, auth: opts.headers.Authorization });
+    calls.push({ url, auth: opts.headers.Authorization, signal: opts.signal });
     const u = new URL(url);
     const key = u.pathname.split("/").pop();
-    const body = routes[key](u.searchParams, calls.length);
+    const body = await routes[key](u.searchParams, calls.length);
     if (typeof body === "number") return new Response("", { status: body });
+    if (typeof body === "object") return new Response(body.body ?? "", { status: body.status });
     return new Response(body, { status: 200 });
   };
-  const client = new BggClient({ token: "tok", fetchImpl, spacingMs: 0, retryMs: 0, sleep: async () => {} });
+  const client = new BggClient({ token: "tok", fetchImpl, spacingMs: 0, retryMs: 0, sleep: async () => {}, ...options });
   return { client, calls };
 }
 
@@ -101,9 +106,9 @@ const defaultRoutes = () => {
   };
 };
 
-async function startApp({ withBgg = true, file = ":memory:" } = {}) {
+async function startApp({ withBgg = true, file = ":memory:", routes = defaultRoutes() } = {}) {
   const store = openDb(file);
-  const { client, calls } = fakeBgg(defaultRoutes());
+  const { client, calls } = fakeBgg(routes);
   const bgg = withBgg ? client : new BggClient({});
   const app = createApp({ store, bgg, bggUsername: "tester" });
   const server = await new Promise((r) => {
@@ -158,6 +163,122 @@ test("things batches ids 20 at a time", async () => {
 
 test("a missing token fails clearly without calling BGG", async () => {
   await assert.rejects(new BggClient({}).search("catan"), /BGG_TOKEN/);
+});
+
+test("overlapping requests start a full spacing apart, in arrival order", async () => {
+  const sleeps = [];
+  const { client } = fakeBgg({ hot: () => "<items></items>" }, { spacingMs: 5000, now: () => 100000, sleep: async (ms) => void sleeps.push(ms) });
+  await Promise.all([client.hot(), client.hot(), client.hot()]);
+  assert.deepEqual(sleeps, [5000, 10000]);
+});
+
+test("a 429 pushes back the next request of every caller", async () => {
+  const sleeps = [];
+  let hits = 0;
+  const routes = { ...defaultRoutes(), hot: () => (++hits === 1 ? 429 : "<items></items>") };
+  const { client } = fakeBgg(routes, { spacingMs: 1000, retryMs: 5000, now: () => 100000, sleep: async (ms) => void sleeps.push(ms) });
+  await client.get("hot", {}); // 429, then OK
+  sleeps.length = 0;
+  await client.search("catan"); // another caller
+  assert.ok(sleeps[0] >= 10000, `the next caller waited ${sleeps[0]} ms`);
+});
+
+test("a collection still queued after the last retry fails instead of reading as empty", async () => {
+  const { client, calls } = fakeBgg({ collection: () => 202 }, { maxRetries: 3 });
+  await assert.rejects(client.collection("tester"), (e) => e instanceof BggError && /still preparing/.test(e.message));
+  assert.equal(calls.length, 4);
+  const onlyExp = fakeBgg({ collection: (p) => (p.get("subtype") === "boardgameexpansion" ? 202 : COLLECTION_BASE) }, { maxRetries: 2 });
+  await assert.rejects(onlyExp.client.collection("tester"), /still preparing/);
+});
+
+test("a 429 after the last retry says BGG is rate limiting", async () => {
+  const { client } = fakeBgg({ hot: () => 429 }, { maxRetries: 1 });
+  await assert.rejects(client.get("hot", {}), (e) => e instanceof BggError && /rate limit/i.test(e.message));
+});
+
+test("BGG's own error text comes through in every shape", async () => {
+  const element = `<?xml version="1.0" encoding="utf-8"?><errors><error><message>Invalid username specified</message></error></errors>`;
+  const attribute = `<error message="Invalid username specified"/>`;
+  for (const body of [element, attribute, { status: 400, body: element }, { status: 400, body: attribute }]) {
+    const { client } = fakeBgg({ collection: () => body });
+    await assert.rejects(client.collection("nobody"), (e) => e instanceof BggError && /Invalid username specified/.test(e.message));
+  }
+  const two = `<errors><error><message>First</message></error><error><message>Second</message></error></errors>`;
+  await assert.rejects(fakeBgg({ hot: () => two }).client.get("hot", {}), /First/);
+  await assert.rejects(fakeBgg({ hot: () => "<errors></errors>" }).client.get("hot", {}), /unknown error/);
+  await assert.rejects(fakeBgg({ hot: () => ({ status: 404, body: "<html>nope</html>" }) }).client.get("hot", {}), /HTTP 404/);
+});
+
+test("a success with no items root is refused, while an empty items root is an empty list", async () => {
+  await assert.rejects(fakeBgg({ hot: () => "<something/>" }).client.hot(), (e) => e instanceof BggError);
+  await assert.rejects(fakeBgg({ hot: () => "" }).client.hot(), (e) => e instanceof BggError);
+  const { client } = fakeBgg({ collection: () => COLLECTION_EXP });
+  assert.deepEqual(await client.collection("tester"), []);
+});
+
+test("network failures and timeouts become BggErrors after one more try", async () => {
+  const failing = fakeBgg({
+    search: () => {
+      throw new TypeError("fetch failed");
+    },
+  });
+  await assert.rejects(failing.client.search("catan"), (e) => e instanceof BggError && /Couldn't reach BGG/.test(e.message));
+  assert.equal(failing.calls.length, 2);
+  assert.ok(failing.calls[0].signal instanceof AbortSignal, "each attempt has a timeout signal");
+
+  const slow = fakeBgg(
+    {
+      search: () => {
+        throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+      },
+    },
+    { timeoutMs: 15000 },
+  );
+  await assert.rejects(slow.client.search("catan"), (e) => e instanceof BggError && /didn't answer within 15 s/.test(e.message));
+
+  let hits = 0;
+  const once = fakeBgg({
+    search: () => {
+      if (++hits === 1) throw new TypeError("fetch failed");
+      return SEARCH;
+    },
+  });
+  assert.equal((await once.client.search("catan")).length, 2);
+  assert.equal(once.calls.length, 2);
+
+  const flaky = fakeBgg({ hot: (_p, n) => (n === 1 ? 503 : "<items></items>") });
+  assert.deepEqual(await flaky.client.hot(), []);
+  assert.equal(flaky.calls.length, 2);
+});
+
+test("searches are cached per trimmed, lower-cased query, and failures are not", async () => {
+  let fail = true;
+  const { client, calls } = fakeBgg({
+    search: () => {
+      if (fail) return { status: 500, body: "" };
+      return SEARCH;
+    },
+  });
+  await assert.rejects(client.search("Catan"), /HTTP 500/);
+  fail = false;
+  const [a, b] = await Promise.all([client.search("Catan"), client.search(" catan ")]);
+  assert.deepEqual(a, b);
+  assert.equal(calls.length, 3); // two failed attempts, then one shared search
+  a.pop();
+  assert.equal((await client.search("CATAN")).length, 2, "callers get their own copy");
+  assert.equal(calls.length, 3);
+});
+
+test("a cached search expires after its time", async () => {
+  let t = 0;
+  const { client, calls } = fakeBgg({ search: () => SEARCH }, { now: () => t, searchCacheMs: 1000 });
+  await client.search("catan");
+  t = 999;
+  await client.search("catan");
+  assert.equal(calls.length, 1);
+  t = 1000;
+  await client.search("catan");
+  assert.equal(calls.length, 2);
 });
 
 // ---------- API ----------
@@ -446,6 +567,64 @@ test("add from BGG fills in details and is idempotent", async () => {
     const s = await t.call("GET", "/api/bgg/search?q=catan");
     assert.equal(s.body.length, 2);
     assert.equal(s.body[1].type, "Expansion");
+  } finally {
+    t.close();
+  }
+});
+
+/** Start a sync through the API and wait for the job to stop. */
+async function syncJob(t) {
+  assert.equal((await t.call("POST", "/api/bgg/sync", {})).status, 202);
+  for (let i = 0; i < 100; i++) {
+    const job = (await t.call("GET", "/api/bgg/sync")).body;
+    if (!job.running) return job;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  throw new Error("sync never finished");
+}
+
+test("a sync whose collection BGG is still preparing fails and writes nothing", async () => {
+  for (const collection of [() => 202, (p) => (p.get("subtype") === "boardgameexpansion" ? 202 : COLLECTION_BASE)]) {
+    const t = await startApp({ routes: { ...defaultRoutes(), collection } });
+    try {
+      const catan = t.store.createGame({ name: "Catan", bggId: 13, plays: 1 });
+      const job = await syncJob(t);
+      assert.match(job.error, /still preparing the collection/);
+      assert.equal(job.result, null);
+      assert.equal(t.store.listGames().length, 1);
+      assert.deepEqual(t.store.getGame(catan.id), catan);
+    } finally {
+      t.close();
+    }
+  }
+});
+
+test("a BGG network failure in Discover search answers 502 with a message", async () => {
+  const routes = {
+    ...defaultRoutes(),
+    search: () => {
+      throw new TypeError("fetch failed");
+    },
+  };
+  const t = await startApp({ routes });
+  try {
+    const r = await t.call("GET", "/api/bgg/search?q=catan");
+    assert.equal(r.status, 502);
+    assert.match(r.body.error, /Couldn't reach BGG/);
+  } finally {
+    t.close();
+  }
+});
+
+test("a repeated Discover search comes from the cache and still marks games in your list", async () => {
+  const t = await startApp();
+  try {
+    const first = await t.call("GET", "/api/bgg/search?q=Catan");
+    assert.equal(first.body[0].inList, false);
+    t.store.createGame({ name: "Catan", bggId: 13 });
+    const second = await t.call("GET", "/api/bgg/search?q=%20catan%20");
+    assert.equal(second.body[0].inList, true);
+    assert.equal(t.calls.filter((c) => c.url.includes("/search?")).length, 1);
   } finally {
     t.close();
   }

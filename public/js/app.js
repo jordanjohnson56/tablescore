@@ -7,6 +7,7 @@ import {
   summaryStats, visibleGames, sortWatchlist, awaitingHint, monthLabel, rankings, bggUrl, bgoSearchUrl, STATUSES,
 } from "./watchlist.js";
 import { api } from "./api.js";
+import { latestOnly, SUPERSEDED } from "./latest.js";
 
 const view = document.getElementById("view");
 let state = { settings: null, games: [], bgg: { configured: false }, claude: { configured: false } };
@@ -683,6 +684,9 @@ function bindClearButton(input) {
   sync();
 }
 
+/** Discover's BGG search: one request in flight, and only the newest query waits behind it. Shared across renders. */
+const searchBggLatest = latestOnly((q) => api.get(`/api/bgg/search?q=${encodeURIComponent(q)}`));
+
 /**
  * Add and Predicted in one screen: with an empty search box it lists every
  * prediction; while typing it shows matching predictions, then BGG results.
@@ -759,6 +763,7 @@ async function renderDiscover() {
     const q = prefs.discoverQ.trim();
     if (!bggOn || q.length < 2) {
       seq++;
+      searchBggLatest.drop();
       results.innerHTML = "";
       return;
     }
@@ -766,8 +771,8 @@ async function renderDiscover() {
       const mine = ++seq;
       results.innerHTML = `<li class="empty">Searching…</li>`;
       try {
-        const rows = await api.get(`/api/bgg/search?q=${encodeURIComponent(q)}`);
-        if (mine !== seq) return;
+        const rows = await searchBggLatest(q);
+        if (rows === SUPERSEDED || mine !== seq) return;
         const shown = rows.filter((r) => !isHiddenType(r.type, state.settings));
         results.innerHTML = shown.length
           ? shown.map((r) => `<li><div class="game-row">

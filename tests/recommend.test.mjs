@@ -84,12 +84,13 @@ const hotXml = (items) =>
   `<items>${items.map((i, n) => `<item id="${i.id}" rank="${n + 1}"><thumbnail value="https://img/${i.id}.jpg"/><name value="${i.name}"/><yearpublished value="${i.year || 2025}"/></item>`).join("")}</items>`;
 
 /** A fake BGG holding `things` (by id). Search matches by a case-insensitive substring. */
-function fakeBgg(things, { hot = [], failHot = false } = {}) {
+function fakeBgg(things, { hot = [], failHot = false, failSearch = [] } = {}) {
   const calls = [];
   const fetchImpl = async (url) => {
     const u = new URL(url);
     const path = u.pathname.split("/").pop();
     calls.push(`${path}?${u.searchParams}`);
+    if (path === "search" && failSearch.includes(u.searchParams.get("query"))) throw new TypeError("fetch failed");
     if (path === "hot") return new Response(failHot ? "oops" : hotXml(hot), { status: failHot ? 500 : 200 });
     if (path === "thing") {
       const ids = u.searchParams.get("id").split(",").map(Number);
@@ -347,6 +348,27 @@ test("a run that can't fill 5 picks fails and keeps the last good set", async ()
     assert.equal(runs[0].status, "failed");
     assert.equal(runs[0].reused, 4);
     assert.match(runs[0].nominees.find((n) => n.name === "Slay the Spire: The Board Game").dropped, /prediction failed: Claude declined/);
+  } finally {
+    t.close();
+  }
+});
+
+test("a nominee whose BGG lookup failed is recorded as such, and the short run says so", async () => {
+  const five = ["Arcs", "Nucleum", "Hegemony", "Voidfall", "Kutna Hora"];
+  const predictions = Object.fromEntries(five.map((n, i) => [n, { score: 9 - i }]));
+  const nominees = [...five, "Totally Made Up"].map((n) => nominee(n));
+  const t = await startApp({ claude: { nominees, predictions }, bgg: { failSearch: ["Kutna Hora"] } });
+  try {
+    await t.call("POST", "/api/recommendations/refresh", {});
+    const view = await t.settle();
+    assert.equal(view.lastRun.status, "failed");
+    assert.match(view.lastRun.error, /Only 4 of 5/);
+    assert.match(view.lastRun.error, /BGG lookup failed for 1 nominee/);
+    const runs = (await t.call("GET", "/api/recommendations/runs")).body;
+    const dropped = (name) => runs[0].nominees.find((n) => n.name === name).dropped;
+    assert.ok(dropped("Kutna Hora").startsWith(`${DROP.bggFailed}: `), dropped("Kutna Hora"));
+    assert.match(dropped("Kutna Hora"), /Couldn't reach BGG/);
+    assert.equal(dropped("Totally Made Up"), DROP.unmatched);
   } finally {
     t.close();
   }

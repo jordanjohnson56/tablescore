@@ -15,6 +15,7 @@ export const MAX_FAILED_RUNS = 2; // failed runs in a row that pause the schedul
 
 export const DROP = {
   unmatched: "not found on BGG",
+  bggFailed: "BGG lookup failed",
   duplicate: "same game as an earlier nominee",
   inList: "already in your list",
   dismissed: "marked not interested",
@@ -144,6 +145,7 @@ export async function runRecommendations({ store, bgg, predictor, predict, trigg
     const since = new Date(now().getTime() - REUSE_DAYS * 86400000).toISOString();
     const candidates = [];
     const seen = new Set();
+    let bggFailures = 0;
     for (const n of nominated.nominees) {
       const entry = { name: n.name, year: n.year, bggId: n.bggId, type: n.expansion ? "Expansion" : "Base", reason: n.reason };
       let details = null;
@@ -151,6 +153,9 @@ export async function runRecommendations({ store, bgg, predictor, predict, trigg
         details = await matchNominee(bgg, n, log);
       } catch (e) {
         log.error(`BGG lookup for "${n.name}" failed:`, e.message);
+        bggFailures++;
+        store.addRecommendation(run.id, { ...entry, dropped: `${DROP.bggFailed}: ${e.message}` });
+        continue;
       }
       if (!details || seen.has(details.bggId)) {
         store.addRecommendation(run.id, { ...entry, dropped: details ? DROP.duplicate : DROP.unmatched });
@@ -200,7 +205,8 @@ export async function runRecommendations({ store, bgg, predictor, predict, trigg
     }
     if (rank < SHOWN) {
       const why = capped ? " because the daily prediction cap was reached" : "";
-      throw new PredictError(`Only ${rank} of ${SHOWN} recommendations could be made${why}. The last good set is kept.`);
+      const lost = bggFailures ? ` BGG lookup failed for ${bggFailures} nominee${bggFailures === 1 ? "" : "s"}.` : "";
+      throw new PredictError(`Only ${rank} of ${SHOWN} recommendations could be made${why}.${lost} The last good set is kept.`);
     }
     return store.finishRecommendationRun(run.id, { usage, ...counts });
   } catch (e) {
