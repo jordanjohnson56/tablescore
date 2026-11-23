@@ -4,7 +4,7 @@ import {
 } from "./rubric.js";
 import {
   STAGES, STAGE_LABELS, PLATFORMS, DEFAULT_CURRENCY, targetCurrency, claudeExport, isDecided, isWatching, isHiddenType,
-  summaryStats, visibleGames, sortWatchlist, awaitingHint, monthLabel, rankings, bggUrl, bgoSearchUrl, STATUSES,
+  summaryStats, visibleGames, sortWatchlist, watchHints, predictionToUse, monthLabel, rankings, bggUrl, bgoSearchUrl, STATUSES,
   bggDrift as driftWith, LIST_FILTERS, LIST_SORTS, listGames, nextInList, rowNumber,
 } from "./watchlist.js";
 import { api } from "./api.js";
@@ -619,7 +619,8 @@ function bindWatch(g) {
 
 // ---------- watchlist ----------
 
-let decidedOpen = false;
+// Null until the owner toggles Decided this session; until then it opens when a Decided game has a hint.
+let decidedOpen = null;
 const todayIso = () => new Date().toLocaleDateString("en-CA"); // local YYYY-MM-DD
 
 function priceLabel(g) {
@@ -637,19 +638,23 @@ function renderWatchlist() {
   const active = list.filter((g) => !isDecided(g));
   const decided = list.filter(isDecided);
   const today = todayIso();
+  const openDecided = decidedOpen ?? decided.some((g) => rowHints(g, today).length > 0);
   view.innerHTML = `
     <h1>Watchlist</h1>
     ${list.length ? "" : `<p class="empty">No watched games. Open a game and choose Start watching.</p>`}
     <ul class="list" id="watch-active">${active.map((g) => watchRowHtml(g, today)).join("")}</ul>
-    ${decided.length ? `<details class="decided" ${decidedOpen ? "open" : ""}><summary>Decided (${decided.length})</summary>
+    ${decided.length ? `<details class="decided" ${openDecided ? "open" : ""}><summary>Decided (${decided.length})</summary>
       <ul class="list">${decided.map((g) => watchRowHtml(g, today)).join("")}</ul></details>` : ""}`;
-  view.querySelector(".decided")?.addEventListener("toggle", (e) => (decidedOpen = e.target.open));
+  // Opening it from the markup fires a toggle too; only the owner's toggles are remembered.
+  view.querySelector(".decided")?.addEventListener("toggle", (e) => {
+    if (decidedOpen != null || e.target.open !== openDecided) decidedOpen = e.target.open;
+  });
 
   // Same saves as the game page: a stage change re-sorts the list, a price doesn't.
   view.querySelectorAll(".watch-row").forEach((row) => {
     const g = byId(Number(row.dataset.id));
     row.querySelector("[data-w=stage]").addEventListener("change", (e) => setStage(g, e.target.value, renderWatchlist));
-    row.querySelector("[data-act=awaiting]")?.addEventListener("click", () => setStage(g, "awaiting", renderWatchlist));
+    row.querySelectorAll("[data-hint]").forEach((b) => b.addEventListener("click", () => tapHint(b.dataset.hint, Number(row.dataset.id))));
     row.querySelector("[data-w=price]").addEventListener("change", (e) => {
       const v = e.target.value.trim() === "" ? null : Number(e.target.value);
       const patch = { targetPrice: v };
@@ -658,6 +663,30 @@ function renderWatchlist() {
       row.querySelector(".details").textContent = watchDetails(g);
     });
   });
+}
+
+/** A row's hints; a new prediction is only worth offering when the server can make one. */
+const rowHints = (g, today) => watchHints(g, today).filter((h) => h.kind !== "repredict" || state.claude.configured);
+
+/** Act on a hint's button. The game is looked up at tap time, so a reload since the render can't leave it stale. */
+function tapHint(kind, id) {
+  const g = byId(id);
+  if (!g) return;
+  if (kind === "campaignEnded") return setStage(g, "awaiting", renderWatchlist);
+  if (kind === "deliveryPassed") return setStage(g, "delivered", renderWatchlist);
+  if (kind === "owned") {
+    const score = watchHints(g, todayIso()).some((h) => h.kind === "owned" && h.score);
+    if (score) return setStage(g, null, () => (location.hash = `#/g/${g.id}`));
+    setStage(g, null, renderWatchlist);
+    toast(`Stopped watching ${g.name}. It's in Games now.`);
+  }
+}
+
+function hintHtml(g, h) {
+  const action = h.kind === "repredict"
+    ? `<a class="btn" href="#/predict/game/${g.id}">${esc(h.button)}</a>`
+    : `<button class="btn" type="button" data-hint="${h.kind}">${esc(h.button)}</button>`;
+  return `<div class="notice"><span>${esc(h.text)}</span>${action}</div>`;
 }
 
 /** "· Oct 2027 · $45.00": the row details after the stage. */
@@ -683,8 +712,7 @@ function watchRowHtml(g, today) {
       <label class="price"><input type="number" data-w="price" min="0" step="0.01" inputmode="decimal" placeholder="Target"
         aria-label="Target price for ${esc(g.name)}" value="${g.targetPrice ?? ""}"><span>${esc(targetCurrency(g))}</span></label>
     </div>
-    ${awaitingHint(g, today) ? `<div class="notice"><span>Campaign ended ${esc(g.campaignEnd)}.</span>
-      <button class="btn" type="button" data-act="awaiting">Move to Awaiting delivery?</button></div>` : ""}
+    ${rowHints(g, today).map((h) => hintHtml(g, h)).join("")}
   </li>`;
 }
 
@@ -1233,9 +1261,12 @@ async function renderPrediction(kind, id, name) {
   const here = location.hash;
   const body = view.querySelector("#pbody");
 
+  let shown = [];
   const paint = (list) => {
     if (location.hash !== here) return;
+    shown = list;
     const [latest, ...older] = list;
+    const use = game ? predictionToUse(game, latest) : null;
     const scored = game && final(game) != null;
     const running = latest?.status === "running";
     const canPredict = state.claude.configured && !scored && !running;
@@ -1249,6 +1280,7 @@ async function renderPrediction(kind, id, name) {
       ${latest && !running ? predictionCardHtml(latest, game) : ""}
       ${!latest ? `<p class="small muted">Claude compares this game with every game you've scored, your taste profile and BGG's details, searches the web if it needs to, and predicts each of the seven criteria. The final score uses your weights.</p>` : ""}
       ${gameLinksHtml(bggId, game?.name || name)}
+      ${use != null ? `<div class="btn-row"><button class="btn" id="use-prediction" type="button">Use ${formatNumber(use)} as the Predicted score${game.predictedScore != null ? ` (now ${formatNumber(game.predictedScore)})` : ""}</button></div>` : ""}
       ${canPredict ? `<div class="btn-row"><button class="btn primary" id="predict" type="button">${latest ? "Predict again" : "Predict my score"}</button></div>` : ""}
       ${!game && latest?.status === "done" ? `<div class="btn-row">
           <button class="btn" type="button" data-add-as="list">Add to list</button>
@@ -1258,6 +1290,7 @@ async function renderPrediction(kind, id, name) {
           <ul class="plain">${older.map((p) => `<li>${esc(dateLabel(p.createdAt))}: ${p.status === "done" ? `<b>${formatNumber(p.final)}</b> (${esc(p.confidence)} confidence)` : `<span class="muted">${esc(p.status)}${p.error ? `: ${esc(p.error)}` : ""}</span>`}</li>`).join("")}</ul>
         </details>` : ""}`;
     body.querySelector("#predict")?.addEventListener("click", start);
+    body.querySelector("#use-prediction")?.addEventListener("click", () => usePrediction(use));
     body.querySelectorAll("[data-add-as]").forEach((b) => b.addEventListener("click", () => addPredicted(b, id)));
     if (running) predictPoll = setTimeout(load, 3000);
   };
@@ -1273,6 +1306,14 @@ async function renderPrediction(kind, id, name) {
       if (location.hash === here) body.innerHTML = `<p class="empty">${esc(e.message)}</p>`;
     }
   };
+
+  // The owner's own Predicted score stays until they choose a prediction over it.
+  function usePrediction(score) {
+    game.predictedScore = score;
+    queueSave(game.id, { predictedScore: score });
+    paint(shown);
+    toast(`Predicted score is now ${formatNumber(score)}.`);
+  }
 
   async function start(e) {
     e.target.disabled = true;

@@ -2,8 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CRITERIA, DEFAULT_SETTINGS } from "../public/js/rubric.js";
 import {
-  LIST_FILTERS, LIST_SORTS, awaitingHint, bggDrift, bggUrl, bgoSearchUrl, claudeExport, listGames, matchesFilter, monthLabel,
-  nextInList, rankings, rowNumber, sortWatchlist, summaryStats, targetCurrency, visibleGames,
+  LIST_FILTERS, LIST_SORTS, bggDrift, bggUrl, bgoSearchUrl, claudeExport, listGames, matchesFilter, monthLabel,
+  nextInList, predictionToUse, rankings, rowNumber, sortWatchlist, summaryStats, targetCurrency, visibleGames, watchHints,
 } from "../public/js/watchlist.js";
 
 const base = { type: "Base", scores: {}, plays: 0, status: "", avoidTheme: false, bggRating: null };
@@ -116,18 +116,116 @@ test("within a stage, the Watchlist goes by estimated delivery month, games with
   assert.deepEqual(order(games), ["Live", "Soon", "Alpha", "Bravo", "Later", "Apple", "Zebra"]);
 });
 
-// ---------- "Move to Awaiting delivery?" hint ----------
+// ---------- Watchlist hints ----------
 
-test("the Awaiting delivery hint shows only for a Campaign live game whose end date has passed", () => {
+const kinds = (g, today) => watchHints(g, today).map((h) => h.kind);
+const FULL = vec([9, 9, 9, 9, 9, 9, 9]);
+
+test("the campaign ended hint shows only for a Campaign live game whose end date has passed", () => {
   const today = "2026-10-21";
-  const hint = (watchStage, campaignEnd) => awaitingHint(game("Kings Gambit", { watchStage, campaignEnd }), today);
-  assert.equal(hint("campaign", "2026-10-20"), true);
-  assert.equal(hint("campaign", "2026-10-21"), false, "the campaign is still live on its end date");
-  assert.equal(hint("campaign", "2026-10-30"), false);
-  assert.equal(hint("campaign", null), false);
-  assert.equal(hint("awaiting", "2026-10-20"), false);
-  assert.equal(hint("pass", "2026-10-20"), false);
-  assert.equal(hint(null, "2026-10-20"), false);
+  const hint = (watchStage, campaignEnd) => kinds(game("Kings Gambit", { watchStage, campaignEnd }), today);
+  assert.deepEqual(hint("campaign", "2026-10-20"), ["campaignEnded"]);
+  assert.deepEqual(hint("campaign", "2026-10-21"), [], "the campaign is still live on its end date");
+  assert.deepEqual(hint("campaign", "2026-10-30"), []);
+  assert.deepEqual(hint("campaign", null), []);
+  assert.deepEqual(hint("awaiting", "2026-10-20"), []);
+  assert.deepEqual(hint("pass", "2026-10-20"), []);
+  assert.deepEqual(hint(null, "2026-10-20"), []);
+  assert.deepEqual(watchHints(game("Kings Gambit", { watchStage: "campaign", campaignEnd: "2026-10-20" }), today), [
+    { kind: "campaignEnded", text: "Campaign ended 2026-10-20.", button: "Move to Awaiting delivery?" },
+  ]);
+});
+
+test("the delivery passed hint shows at Awaiting delivery once the estimated month is over", () => {
+  const today = "2026-10-21";
+  const hint = (watchStage, deliveryEst) => kinds(game("Bookwyrm", { watchStage, deliveryEst }), today);
+  assert.deepEqual(hint("awaiting", "2026-09"), ["deliveryPassed"]);
+  assert.deepEqual(hint("awaiting", "2026-10"), [], "a game due this month is not late yet");
+  assert.deepEqual(hint("awaiting", "2026-11"), []);
+  assert.deepEqual(hint("awaiting", null), []);
+  for (const stage of ["campaign", "delivered", "reviews", "buy"]) assert.ok(!hint(stage, "2026-09").includes("deliveryPassed"), stage);
+  assert.deepEqual(watchHints(game("Bookwyrm", { watchStage: "awaiting", deliveryEst: "2026-09" }), today), [
+    { kind: "deliveryPassed", text: "Estimated delivery Sep 2026 has passed.", button: "Move to Delivered?" },
+  ]);
+});
+
+test("the delivery passed hint crosses the year boundary on the first of the month", () => {
+  const g = game("Bookwyrm", { watchStage: "awaiting", deliveryEst: "2026-12" });
+  assert.deepEqual(kinds(g, "2026-12-31"), []);
+  assert.deepEqual(kinds(g, "2027-01-01"), ["deliveryPassed"]);
+});
+
+test("an owned or played watched game offers to stop watching, and to score it when there is something to score", () => {
+  const today = "2026-10-21";
+  const hint = (extra) => watchHints(game("Excursions", { watchStage: "reviews", ...extra }), today);
+  assert.deepEqual(hint({ status: "Owned" }), [
+    { kind: "owned", text: "You own it now.", button: "Stop watching", score: false },
+  ]);
+  assert.deepEqual(hint({ plays: 2 }), [
+    { kind: "owned", text: "You've logged 2 plays.", button: "Stop watching and score it", score: true },
+  ]);
+  assert.equal(hint({ plays: 1 })[0].text, "You've logged 1 play.");
+  assert.deepEqual(hint({ status: "Owned", plays: 2 })[0].text, "You own it and have logged 2 plays.");
+  assert.equal(hint({ plays: 2, scores: FULL })[0].button, "Stop watching");
+  assert.equal(hint({ plays: 2, wontScore: true })[0].button, "Stop watching");
+  assert.equal(hint({ plays: 2, scores: vec([9, 9, 9, null, null, null, null]) })[0].button, "Stop watching and score it");
+});
+
+test("the owned hint shows at every watch stage and is then the only hint", () => {
+  const today = "2026-10-21";
+  for (const watchStage of ["campaign", "awaiting", "delivered", "reviews", "buy", "pass"]) {
+    assert.deepEqual(kinds(game("Excursions", { watchStage, status: "Owned" }), today), ["owned"], watchStage);
+  }
+  assert.deepEqual(kinds(game("Late", { watchStage: "campaign", campaignEnd: "2026-10-01", status: "Owned" }), today), ["owned"]);
+  assert.deepEqual(kinds(game("Late", { watchStage: "awaiting", deliveryEst: "2026-01", plays: 1 }), today), ["owned"]);
+});
+
+test("a status other than Owned with no plays is not owning it", () => {
+  for (const status of ["Wishlist", "Preordered", "Prev. owned", "Want to play", ""]) {
+    assert.deepEqual(kinds(game("Bookwyrm", { watchStage: "buy", status }), "2026-10-21"), [], status);
+  }
+});
+
+test("a Reviews out game without a full score offers a new prediction", () => {
+  const today = "2026-10-21";
+  const hint = (extra) => watchHints(game("Excursions", { watchStage: "reviews", predictedScore: null, ...extra }), today);
+  assert.deepEqual(hint({ predictedScore: 7.2 }), [
+    { kind: "repredict", text: "Reviews are out. Predicted 7.2 may predate them.", button: "Predict again" },
+  ]);
+  assert.deepEqual(hint({}), [
+    { kind: "repredict", text: "Reviews are out. No Predicted score yet.", button: "Predict my score" },
+  ]);
+  assert.deepEqual(hint({ predictedScore: 7, scores: FULL }), []);
+  for (const watchStage of ["delivered", "buy"]) assert.deepEqual(kinds(game("Excursions", { watchStage, predictedScore: 7 }), today), [], watchStage);
+});
+
+test("a game that isn't Watching gets no hints, even when owned and played", () => {
+  assert.deepEqual(watchHints(game("Brass", { watchStage: null, status: "Owned", plays: 4 }), "2026-10-21"), []);
+  assert.deepEqual(watchHints(game("Brass", { status: "Owned", plays: 4 }), "2026-10-21"), []);
+});
+
+test("watchHints leaves the game alone", () => {
+  const g = game("Excursions", { watchStage: "reviews", predictedScore: 7.2, status: "Owned", plays: 2, scores: vec([9, 9, 9, null, null, null, null]) });
+  const before = structuredClone(g);
+  watchHints(g, "2026-10-21");
+  assert.deepEqual(g, before);
+});
+
+// ---------- "Use it as the Predicted score" ----------
+
+test("a finished prediction for a watched game is offered as its Predicted score when it differs", () => {
+  const done = (final) => ({ status: "done", final });
+  const watched = (predictedScore) => game("Excursions", { watchStage: "reviews", predictedScore });
+  assert.equal(predictionToUse(watched(7.2), done(7.9)), 7.9);
+  assert.equal(predictionToUse(watched(null), done(7.9)), 7.9);
+  assert.equal(predictionToUse(watched(7.9), done(7.9)), null, "already the Predicted score");
+  assert.equal(predictionToUse(watched(7.2), done(7.94)), 7.9, "rounded to one decimal, as the server stores it");
+  assert.equal(predictionToUse(watched(7.9), done(7.94)), null);
+  assert.equal(predictionToUse(watched(7.2), { status: "running", final: null }), null);
+  assert.equal(predictionToUse(watched(7.2), { status: "error", final: null }), null);
+  assert.equal(predictionToUse(watched(7.2), done(null)), null);
+  assert.equal(predictionToUse(watched(7.2), undefined), null);
+  assert.equal(predictionToUse(game("Brass", { predictedScore: null }), done(7.9)), null, "not Watching");
 });
 
 test("a target price with no currency is in USD", () => {

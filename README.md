@@ -76,6 +76,8 @@ The **Watchlist** tab follows crowdfunded games you aren't backing, so you can w
 
 A watched game moves through these **watch stages**, only when you change them: Campaign live → Awaiting delivery → Delivered → Reviews out → Buy or Pass. Buy and Pass are **Decided** and sit in a collapsed section. The watch stage is separate from status, so a BGG sync never touches it.
 
+A watched game's row shows a hint, with one button, when something has probably changed: you own it or have logged plays (stop watching, and score it if there's something to score), its campaign has ended (move to Awaiting delivery), its estimated delivery month has passed (move to Delivered), or it's at Reviews out without a full score (predict again). Nothing changes until you tap. A Claude prediction fills a watched game's predicted score only when it has none; after that, the prediction page offers **Use 7.9 as the Predicted score** for a newer prediction.
+
 Watched games stay out of the main list, Summary and Claude export. **Settings → Include watched games in the list and Claude export** shows them in the list and the export, labeled *predicted*. Summary statistics never use predicted scores.
 
 ### Export to the private repo

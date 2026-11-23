@@ -1,8 +1,9 @@
 // Which games the main list, Summary and exports show, the Games list's filter,
-// sort, row number and BGG drift rules, and the "Copy scores for Claude" text.
+// sort, row number and BGG drift rules, the Watchlist's hints, and the "Copy
+// scores for Claude" text.
 // Pure module: no DOM, so the browser, server and tests share it.
 
-import { CRITERIA, finalScore, formatNumber, spread } from "./rubric.js";
+import { CRITERIA, finalScore, formatNumber, scoredCount, spread } from "./rubric.js";
 
 // A game's real rubric score under these settings (null until fully scored).
 const scoreWith = (settings) => (g) => finalScore(g.scores, settings);
@@ -63,13 +64,64 @@ export function sortWatchlist(games) {
     .sort((a, b) => stageRank(a) - stageRank(b) || byDelivery(a, b) || a.name.localeCompare(b.name));
 }
 
+// ---------- Watchlist hints ----------
+// A hint suggests what to do with a watched game; it never does it. Nothing
+// changes a watch stage, or a Predicted score, until the owner taps.
+
+// Same test as rawAverage, so no settings are needed.
+const fullyScored = (game) => scoredCount(game.scores) === CRITERIA.length;
+const playsLabel = (n) => `${n} ${n === 1 ? "play" : "plays"}`;
+
 /**
- * True when a Campaign live game's end date has passed, so the Watchlist offers
- * "Move to Awaiting delivery?". today is "YYYY-MM-DD"; the end date itself is
- * still live. Nothing changes a stage automatically.
+ * The hints the Watchlist row shows for a game, as [{ kind, text, button }];
+ * empty for a game that isn't Watching. today is local "YYYY-MM-DD".
+ *
+ * - owned: Owned on BGG or has plays, at any watch stage. The owner should stop
+ *   watching; `score` is true when there is something to score next (plays,
+ *   not fully scored, not Won't score). When it applies it is the only hint.
+ * - campaignEnded: Campaign live and the end date is before today (the end
+ *   date itself is still live). Offers Awaiting delivery.
+ * - deliveryPassed: Awaiting delivery and the estimated month is before this
+ *   month. Offers Delivered.
+ * - repredict: Reviews out and not fully scored, so the Predicted score may
+ *   predate the reviews. A game records no date for its Predicted score, so
+ *   this stays for as long as the game is at Reviews out.
  */
-export function awaitingHint(game, today) {
-  return game.watchStage === "campaign" && Boolean(game.campaignEnd) && game.campaignEnd < today;
+export function watchHints(game, today) {
+  if (!isWatching(game)) return [];
+  const plays = game.plays || 0;
+  const owns = game.status === "Owned";
+  if (owns || plays > 0) {
+    const score = plays > 0 && !fullyScored(game) && !game.wontScore;
+    const text = owns && plays > 0 ? `You own it and have logged ${playsLabel(plays)}.`
+      : owns ? "You own it now." : `You've logged ${playsLabel(plays)}.`;
+    return [{ kind: "owned", text, button: score ? "Stop watching and score it" : "Stop watching", score }];
+  }
+  const hints = [];
+  if (game.watchStage === "campaign" && game.campaignEnd && game.campaignEnd < today) {
+    hints.push({ kind: "campaignEnded", text: `Campaign ended ${game.campaignEnd}.`, button: "Move to Awaiting delivery?" });
+  }
+  if (game.watchStage === "awaiting" && game.deliveryEst && game.deliveryEst < today.slice(0, 7)) {
+    hints.push({ kind: "deliveryPassed", text: `Estimated delivery ${monthLabel(game.deliveryEst)} has passed.`, button: "Move to Delivered?" });
+  }
+  if (game.watchStage === "reviews" && !fullyScored(game)) {
+    hints.push(game.predictedScore != null
+      ? { kind: "repredict", text: `Reviews are out. Predicted ${formatNumber(game.predictedScore)} may predate them.`, button: "Predict again" }
+      : { kind: "repredict", text: "Reviews are out. No Predicted score yet.", button: "Predict my score" });
+  }
+  return hints;
+}
+
+/**
+ * The score the prediction page offers to use as a watched game's Predicted
+ * score: a finished prediction's final, at one decimal, when it differs from
+ * the Predicted score. Otherwise null. The server fills the Predicted score
+ * only when it is empty, so this is how a newer prediction replaces it.
+ */
+export function predictionToUse(game, prediction) {
+  if (!isWatching(game) || prediction?.status !== "done" || prediction.final == null) return null;
+  const score = Number(formatNumber(prediction.final));
+  return score === game.predictedScore ? null : score;
 }
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
