@@ -253,7 +253,7 @@ export class Store {
     const stmt = this.db.prepare(
       "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     );
-    for (const key of ["weights", "stretch", "hideExpansions", "includeWatching", "tasteProfile", "recommendFrequency", "recommendNominees"]) {
+    for (const key of ["weights", "stretch", "hideExpansions", "includeWatching", "tasteProfile", "recommendFrequency", "recommendNominees", "dailyPredictionCap"]) {
       if (patch[key] !== undefined) stmt.run(key, JSON.stringify(patch[key]));
     }
     return this.getSettings();
@@ -570,6 +570,18 @@ export class Store {
       .map(toRecommendation);
   }
 
+  /**
+   * How many of the newest finished runs failed in a row, counting at most
+   * `limit`. A run still going doesn't count either way.
+   */
+  failedRunStreak(limit = 2) {
+    const rows = this.db
+      .prepare("SELECT status FROM recommendation_runs WHERE status != 'running' ORDER BY started_at DESC, id DESC LIMIT ?")
+      .all(limit);
+    const ok = rows.findIndex((r) => r.status !== "failed");
+    return ok === -1 ? rows.length : ok;
+  }
+
   /** The newest finished run, or null. */
   lastRecommendationRun(status = "done") {
     const row = this.db
@@ -617,6 +629,18 @@ export class Store {
       )
       .all(runs)
       .map((r) => ({ bggId: r.bgg_id, name: r.name }));
+  }
+
+  /**
+   * Claude conversations started at or after `since` (an ISO time), for the
+   * daily prediction cap: every prediction row, whatever its status, plus one
+   * per run for its nomination. `oldest` is the earliest of their start times.
+   */
+  claudeUsageSince(since) {
+    const p = this.db.prepare("SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM predictions WHERE created_at >= ?").get(since);
+    const r = this.db.prepare("SELECT COUNT(*) AS n, MIN(started_at) AS oldest FROM recommendation_runs WHERE started_at >= ?").get(since);
+    const oldest = [p.oldest, r.oldest].filter(Boolean).sort()[0] ?? null;
+    return { used: p.n + r.n, oldest };
   }
 
   /** The newest finished prediction for a BGG ID made after `since` (an ISO time), or null. */

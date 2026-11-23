@@ -3,7 +3,7 @@
 // schedule (see RecommendScheduler) or when the user asks for a refresh.
 import { RECOMMEND_FREQUENCIES, finalScore } from "../public/js/rubric.js";
 import { isWatching } from "../public/js/watchlist.js";
-import { PredictError, scoreContext, tasteProfile } from "./predict.js";
+import { CapError, PredictError, scoreContext, tasteProfile } from "./predict.js";
 import { BggError } from "./bgg.js";
 
 export const SHOWN = 5; // picks shown
@@ -11,6 +11,7 @@ export const MAX_EXPANSIONS = 1; // among the shown picks
 export const REUSE_DAYS = 30; // a prediction younger than this is reused instead of made again
 export const EXPANSION_BASE_MIN = 8; // only expansions of base games scored this high are allowed
 const RUN_HOUR = 4; // scheduled runs happen at this hour, local time
+export const MAX_FAILED_RUNS = 2; // failed runs in a row that pause the schedule until one succeeds
 
 export const DROP = {
   unmatched: "not found on BGG",
@@ -20,6 +21,7 @@ export const DROP = {
   expansionBase: "expansion of a game you haven't scored 8+",
   avoidTheme: "a theme you avoid",
   failed: "prediction failed",
+  cap: "daily prediction cap reached",
   expansionLimit: "second expansion",
   notTop: "not in the top 5",
 };
@@ -121,6 +123,7 @@ export async function runRecommendations({ store, bgg, predictor, predict, trigg
   const run = store.createRecommendationRun({ model: predictor.model, trigger, startedAt: now().toISOString() });
   const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, searches: 0 };
   const counts = { predicted: 0, reused: 0 };
+  let capped = false;
   try {
     const settings = store.getSettings();
     const games = store.listGames();
@@ -168,8 +171,9 @@ export async function runRecommendations({ store, bgg, predictor, predict, trigg
           counts.predicted++;
           addUsage(usage, prediction.usage);
         } catch (e) {
-          log.error(`prediction for "${details.name}" failed:`, e.message);
-          store.addRecommendation(run.id, { ...entry, dropped: `${DROP.failed}: ${e.message}` });
+          if (e instanceof CapError) capped = true;
+          else log.error(`prediction for "${details.name}" failed:`, e.message);
+          store.addRecommendation(run.id, { ...entry, dropped: e instanceof CapError ? DROP.cap : `${DROP.failed}: ${e.message}` });
           continue;
         }
       }
@@ -195,7 +199,8 @@ export async function runRecommendations({ store, bgg, predictor, predict, trigg
       store.addRecommendation(run.id, { ...c, rank: ++rank });
     }
     if (rank < SHOWN) {
-      throw new PredictError(`Only ${rank} of ${SHOWN} recommendations could be made. The last good set is kept.`);
+      const why = capped ? " because the daily prediction cap was reached" : "";
+      throw new PredictError(`Only ${rank} of ${SHOWN} recommendations could be made${why}. The last good set is kept.`);
     }
     return store.finishRecommendationRun(run.id, { usage, ...counts });
   } catch (e) {
@@ -254,7 +259,9 @@ export function nextRunAt(frequency, lastStartedAt, now, floor = null) {
 
 /**
  * Fires the scheduled run. Checks every `tickMs` whether one is due. `run`
- * returns false when it can't start one (no keys, or a run already going).
+ * returns false when it can't start one (no keys, a run already going, or
+ * too little left under the daily prediction cap). Paused after
+ * MAX_FAILED_RUNS failed runs in a row, until a run succeeds.
  */
 export class RecommendScheduler {
   constructor({ store, run, tickMs = 5 * 60 * 1000, now = () => new Date(), timers = globalThis }) {
@@ -266,7 +273,13 @@ export class RecommendScheduler {
     this.timer = null;
   }
 
+  /** True when the newest MAX_FAILED_RUNS finished runs all failed: no scheduled run is due until one succeeds. */
+  get paused() {
+    return this.store.failedRunStreak(MAX_FAILED_RUNS) >= MAX_FAILED_RUNS;
+  }
+
   get nextRunAt() {
+    if (this.paused) return null;
     const settings = this.store.getSettings();
     const failed = this.store.lastRecommendationRun("failed");
     const now = this.now();

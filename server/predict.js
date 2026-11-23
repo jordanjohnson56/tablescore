@@ -16,6 +16,8 @@ const MAX_CALLS = 6;
 const FALLBACK_MODELS = new Set(["claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5", "claude-fable-5-1"]);
 
 export class PredictError extends Error {}
+/** A prediction not started because the daily prediction cap is reached. */
+export class CapError extends PredictError {}
 
 const SUBMIT_TOOL = {
   name: "submit_prediction",

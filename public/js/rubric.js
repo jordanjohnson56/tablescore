@@ -136,6 +136,8 @@ export const DEFAULT_SETTINGS = {
   // How often Claude refreshes the recommendations, and how many games it nominates per run.
   recommendFrequency: "weekly",
   recommendNominees: 10,
+  // The most Claude conversations (predictions plus each run's nomination) started in any 24 hours.
+  dailyPredictionCap: 30,
 };
 
 export const RECOMMEND_FREQUENCIES = [

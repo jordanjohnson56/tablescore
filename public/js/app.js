@@ -914,6 +914,7 @@ function recWhenHtml(d) {
   else if (d.run) parts.push(`Updated ${dateLabel(d.run.finishedAt)}`);
   if (d.lastRun?.status === "failed" && !d.running) parts.push(`<span class="tag warn">Last refresh failed</span> ${esc(d.lastRun.error || "")}`);
   if (d.nextRunAt) parts.push(`next ${dateLabel(d.nextRunAt)}`);
+  else if (d.paused) parts.push(`<span class="tag warn">Scheduled runs are paused after 2 failed runs in a row.</span> Refresh to try again; a successful run resumes the schedule.`);
   else parts.push("scheduled runs are off");
   return parts.join(" · ");
 }
@@ -1346,11 +1347,15 @@ function recommendSettingsHtml() {
   }
   return `<section class="card" id="recsec">
     <h2 style="margin-top:0">Recommendations</h2>
-    <p class="small muted">Claude nominates games you don't have, each gets a prediction, and the five highest show on Discover. A run is about ${s.recommendNominees} predictions' worth of tokens.</p>
+    <p class="small muted">Claude nominates games you don't have, each gets a prediction, and the five highest show on Discover. A run is about ${s.recommendNominees} predictions' worth of tokens, and counts toward the daily prediction cap below.</p>
     <label class="field"><span>How often</span>
       <select id="rec-freq">${RECOMMEND_FREQUENCIES.map((f) => `<option value="${f.key}" ${s.recommendFrequency === f.key ? "selected" : ""}>${f.label}</option>`).join("")}</select></label>
     <label class="field"><span>Games Claude nominates per run (5–20)</span>
       <input type="number" id="rec-count" min="5" max="20" step="1" inputmode="numeric" value="${s.recommendNominees}"></label>
+    <label class="field"><span>Daily prediction cap (5–100)</span>
+      <input type="number" id="rec-cap" min="5" max="100" step="1" inputmode="numeric" value="${s.dailyPredictionCap}"></label>
+    <p class="small muted">The most Claude conversations started in any 24 hours: each prediction, manual or in a run, and each run's nomination counts as one. A run needs 5 left to start.</p>
+    <p class="small muted" id="rec-budget"></p>
     <p class="small muted">Scheduled runs start at 4 am server time. More nominees cost more and give the top five more to choose from.</p>
     <div class="btn-row"><button class="btn primary" id="rec-refresh" type="button">Refresh now</button></div>
     <p class="small muted" id="rec-when"></p>
@@ -1389,6 +1394,11 @@ async function bindRecommendSettings() {
     if (!Number.isInteger(n) || n < 5 || n > 20) return toast("Nominees must be a whole number from 5 to 20", 4000);
     save({ recommendNominees: n }, "Nominee count saved");
   });
+  sec.querySelector("#rec-cap").addEventListener("change", (e) => {
+    const n = Number(e.target.value);
+    if (!Number.isInteger(n) || n < 5 || n > 100) return toast("The daily prediction cap must be a whole number from 5 to 100", 4000);
+    save({ dailyPredictionCap: n }, "Daily prediction cap saved");
+  });
 
   const dismissed = sec.querySelector("#rec-dismissed");
   const drawDismissed = (rows) => {
@@ -1413,6 +1423,9 @@ async function bindRecommendSettings() {
     try {
       const [rows, view] = await Promise.all([api.get("/api/recommendations/runs"), api.get("/api/recommendations")]);
       sec.querySelector("#rec-when").innerHTML = recWhenHtml(view);
+      const b = view.budget;
+      sec.querySelector("#rec-budget").textContent =
+        `Predictions in the last 24 hours: ${b.used} of ${b.cap}` + (!b.left && b.freesAt ? `. The next one frees up ${new Date(b.freesAt).toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" })}.` : "");
       runs.innerHTML = rows.length
         ? `<table><tbody>${rows.slice(0, 20).map((r) => {
             const cost = runCost(r);

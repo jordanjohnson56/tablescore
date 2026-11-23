@@ -233,7 +233,10 @@ test("predict a BGG game: a job that finishes with scores, a final and sources",
   try {
     t.store.createGame({ name: "Brass", bggId: 100, plays: 10, scores: all(10) });
     const { body: state } = await t.call("GET", "/api/state");
-    assert.deepEqual(state.claude, { configured: true, model: "claude-opus-5-5", running: null, recommending: false });
+    assert.deepEqual(state.claude, {
+      configured: true, model: "claude-opus-5-5", running: null, recommending: false,
+      budget: { used: 0, cap: 30, left: 30, freesAt: null },
+    });
 
     const r = await t.call("POST", "/api/predictions", { bggId: 500, name: "Brass: Extra" });
     assert.equal(r.status, 202);
@@ -637,6 +640,57 @@ test("the taste profile is a setting with a length limit", async () => {
     assert.equal(ok.body.tasteProfile, "Shared maps, cute art for my wife.");
     assert.equal((await t.call("PUT", "/api/settings", { tasteProfile: "x".repeat(4001) })).status, 400);
     assert.equal((await t.call("PUT", "/api/settings", { tasteProfile: 5 })).status, 400);
+  } finally {
+    t.close();
+  }
+});
+
+// ---------- daily prediction cap ----------
+
+test("a manual prediction over the daily cap gets a 429, makes no row and doesn't block the next one", async () => {
+  const t = await startApp({ replies: [submitMsg()] });
+  try {
+    assert.equal((await t.call("PUT", "/api/settings", { dailyPredictionCap: 5 })).status, 200);
+    // Failed predictions spent tokens too, so they count.
+    for (let i = 0; i < 5; i++) {
+      const p = t.store.createPrediction({ bggId: 900 + i, name: `G${i}`, model: "m" });
+      if (i % 2) t.store.failPrediction(p.id, "boom");
+    }
+    const count = () => t.store.db.prepare("SELECT COUNT(*) AS n FROM predictions").get().n;
+    const refused = await t.call("POST", "/api/predictions", { bggId: 500 });
+    assert.equal(refused.status, 429);
+    assert.equal(refused.body.error, "Daily prediction cap reached (5 in 24 hours). Raise it in Settings or try again later.");
+    assert.equal(count(), 5);
+    const { budget } = (await t.call("GET", "/api/state")).body.claude;
+    assert.equal(budget.used, 5);
+    assert.equal(budget.left, 0);
+    assert.ok(budget.freesAt);
+
+    // Lowering the cap below what is used never shows a negative number left.
+    t.store.setSettings({ dailyPredictionCap: 5 });
+    t.store.createPrediction({ bggId: 950, name: "Extra", model: "m" });
+    assert.equal((await t.call("GET", "/api/state")).body.claude.budget.left, 0);
+
+    // Once those rows are older than 24 hours, the cap is free again.
+    t.store.db.prepare("UPDATE predictions SET created_at = ?").run(new Date(Date.now() - 25 * 3600000).toISOString());
+    const ok = await t.call("POST", "/api/predictions", { bggId: 500 });
+    assert.equal(ok.status, 202);
+    assert.equal((await t.settle(ok.body.id)).status, "done");
+  } finally {
+    t.close();
+  }
+});
+
+test("the daily prediction cap is a whole-number setting from 5 to 100", async () => {
+  const t = await startApp();
+  try {
+    assert.equal((await t.call("GET", "/api/state")).body.settings.dailyPredictionCap, 30);
+    for (const bad of [4, 101, 7.5, "30"]) {
+      assert.equal((await t.call("PUT", "/api/settings", { dailyPredictionCap: bad })).status, 400, `rejects ${bad}`);
+    }
+    assert.equal((await t.call("PUT", "/api/settings", { dailyPredictionCap: 5 })).body.dailyPredictionCap, 5);
+    assert.equal((await t.call("PUT", "/api/settings", { dailyPredictionCap: 100 })).body.dailyPredictionCap, 100);
+    assert.equal((await t.call("GET", "/api/state")).body.claude.budget.cap, 100);
   } finally {
     t.close();
   }
