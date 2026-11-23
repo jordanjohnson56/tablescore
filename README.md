@@ -86,12 +86,12 @@ A monthly cloud routine checks on watched games. It can't reach this server, so 
 ~/tablescore/scripts/sync-watchlist.sh
 ```
 
-It pulls the private repo (the routine commits its `state.json` there), exports the watchlist from the running container, and commits and pushes `watchlist.json` only if a game or setting changed; a new `exportedAt` alone doesn't count, except once the committed one is 30 days old (`REFRESH_DAYS`), so the routine, which calls an export over 45 days old stale, doesn't warn just because nothing changed. It runs from any directory and needs only Docker and git on the host, not Node. It stops with an error, leaving the repo alone, if the container is down or the export doesn't look right.
+It pulls the private repo (the routine commits its `state.json` there), exports the watchlist from the running container, and commits and pushes `watchlist.json` only if a game or setting changed; a new `exportedAt` alone doesn't count, except once the committed one is 30 days old (`REFRESH_DAYS`), so the routine, which calls an export over 45 days old stale, doesn't warn just because nothing changed. It compares the export with the last commit, not the file on disk, and pushes whenever the clone has unpushed commits, so a failed commit or push is picked up by the next run. A run that starts while another is going stops with an error. It runs from any directory and needs only Docker and git on the host, not Node. It stops with an error, leaving the repo alone, if the container is down or the export doesn't look right. Any non-zero exit means the private repo may be behind.
 
 - The clone defaults to `~/tablescore-watchlist`. If yours is elsewhere, set `WATCHLIST_REPO` in `.env` once (or in the environment, or pass the path as the first argument).
 - Set `DOCKER="sudo docker"` if your user isn't in the `docker` group.
 - To type just `sync-watchlist`, link it onto your PATH: `ln -s ~/tablescore/scripts/sync-watchlist.sh ~/.local/bin/sync-watchlist`.
-- To never think about it, run it from cron (`crontab -e`), e.g. daily at 3:30am. Cron has no SSH agent, so the private repo's remote needs a key without a passphrase or an HTTPS credential helper:
+- To never think about it, run it from cron (`crontab -e`), e.g. daily at 3:30am. Each run starts with a timestamp line, so the log shows when a run failed. Cron has no SSH agent, so the private repo's remote needs a key without a passphrase or an HTTPS credential helper:
 
   ```
   30 3 * * * $HOME/tablescore/scripts/sync-watchlist.sh >>$HOME/tablescore-watchlist-sync.log 2>&1
