@@ -5,6 +5,7 @@ import {
 import {
   STAGES, STAGE_LABELS, PLATFORMS, DEFAULT_CURRENCY, targetCurrency, claudeExport, isDecided, isWatching, isHiddenType,
   summaryStats, visibleGames, sortWatchlist, awaitingHint, monthLabel, rankings, bggUrl, bgoSearchUrl, STATUSES,
+  bggDrift as driftWith, LIST_FILTERS, LIST_SORTS, listGames, nextInList, rowNumber,
 } from "./watchlist.js";
 import { api } from "./api.js";
 import { latestOnly, SUPERSEDED } from "./latest.js";
@@ -61,20 +62,10 @@ function metaDetails(g) {
 }
 
 /** Score to type into BGG, if it differs from what BGG currently has. */
-function bggDrift(g) {
-  const f = final(g);
-  if (f == null || !g.bggId) return null;
-  if (g.bggRating != null && Math.abs(g.bggRating - f) < 0.05) return null;
-  return f;
-}
+const bggDrift = (g) => driftWith(g, state.settings);
 
 /** The game after g in the current list order that still needs a BGG rating. */
-function nextDrift(g) {
-  const list = filtered();
-  const i = list.findIndex((x) => x.id === g.id);
-  const order = [...list.slice(i + 1), ...list.slice(0, Math.max(i, 0))];
-  return order.find((x) => x.id !== g.id && bggDrift(x) != null) || null;
-}
+const nextDrift = (g) => nextInList(filtered(), g, (x) => bggDrift(x) != null);
 
 // ---------- save queue: debounced PATCH per game ----------
 
@@ -147,51 +138,20 @@ window.addEventListener("hashchange", (e) => {
 
 // ---------- list ----------
 
-const FILTERS = [
-  ["all", "All"],
-  ["todo", "To score"],
-  ["scored", "Scored"],
-  ["owned", "Owned"],
-  ["wishlist", "Wishlist"],
-  ["update", "Update BGG"],
-  ["avoid", "Avoid theme"],
-];
-
-function filtered() {
-  const q = prefs.q.trim().toLowerCase();
-  const tests = {
-    all: () => true,
-    // Nothing to score until the game has been played at least once, and never if marked Won't score.
-    todo: (g) => final(g) == null && g.plays > 0 && !g.wontScore,
-    scored: (g) => final(g) != null,
-    owned: (g) => g.status === "Owned",
-    wishlist: (g) => g.status === "Wishlist" || g.status === "Want" || g.status === "Want to play",
-    update: (g) => bggDrift(g) != null,
-    avoid: (g) => g.avoidTheme,
-  };
-  const list = shownGames().filter((g) => (tests[prefs.filter] || tests.all)(g) && (!q || g.name.toLowerCase().includes(q)));
-  const sorters = {
-    score: (a, b) => (final(b) ?? -1) - (final(a) ?? -1) || (b.bggRating ?? -1) - (a.bggRating ?? -1),
-    name: (a, b) => a.name.localeCompare(b.name),
-    plays: (a, b) => b.plays - a.plays,
-    recent: (a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""),
-  };
-  return list.sort(sorters[prefs.sort] || sorters.score);
-}
+const filtered = () => listGames(state.games, state.settings, prefs);
 
 function renderList() {
-  if (!FILTERS.some(([v]) => v === prefs.filter)) prefs.filter = "all";
+  if (!LIST_FILTERS.some((f) => f.key === prefs.filter)) prefs.filter = "all";
   view.innerHTML = `
     <div class="toolbar">
       <div class="toolbar-row">
         <input type="search" id="q" placeholder="Search ${shownGames().length} games" value="${esc(prefs.q)}" aria-label="Search games">
         <select id="sort" aria-label="Sort">
-          ${[["score", "Score"], ["name", "Name"], ["plays", "Plays"], ["recent", "Recent"]]
-            .map(([v, l]) => `<option value="${v}" ${prefs.sort === v ? "selected" : ""}>${l}</option>`).join("")}
+          ${LIST_SORTS.map(({ key, label }) => `<option value="${key}" ${prefs.sort === key ? "selected" : ""}>${label}</option>`).join("")}
         </select>
       </div>
       <div class="chips" role="group" aria-label="Filter">
-        ${FILTERS.map(([v, l]) => `<button class="chip" data-f="${v}" aria-pressed="${prefs.filter === v}">${l}</button>`).join("")}
+        ${LIST_FILTERS.map(({ key, label }) => `<button class="chip" data-f="${key}" aria-pressed="${prefs.filter === key}">${label}</button>`).join("")}
       </div>
       <p class="list-count muted" id="count" aria-live="polite"></p>
     </div>
@@ -265,13 +225,13 @@ function rowHtml(g, ranks) {
     g.avoidTheme ? `<span class="tag danger">Avoid</span>` : "",
     bggDrift(g) != null ? `<span class="tag warn" title="BGG rating differs">BGG</span>` : "",
   ].join("");
-  const badge = f != null
-    ? `<div class="num">${formatNumber(f)}</div><div class="lbl">score</div>`
-    : isWatching(g)
-      ? `<div class="num predicted">${formatNumber(g.predictedScore)}</div><div class="lbl">predicted</div>`
-      : g.bggRating != null
-        ? `<div class="num old">${formatNumber(g.bggRating)}</div><div class="lbl">old</div>`
-        : `<div class="num old">—</div>`;
+  const num = rowNumber(g, state.settings);
+  const badge = {
+    score: () => `<div class="num">${formatNumber(num.value)}</div><div class="lbl">score</div>`,
+    predicted: () => `<div class="num predicted">${formatNumber(num.value)}</div><div class="lbl">predicted</div>`,
+    bgg: () => `<div class="num old">${formatNumber(num.value)}</div><div class="lbl">old</div>`,
+    none: () => `<div class="num old">—</div>`,
+  }[num.kind]();
   return `<li class="${g.avoidTheme ? "avoid" : ""}"><a class="game-row" href="#/g/${g.id}">
     ${rankedThumbHtml(g, ranks)}
     <div class="info"><div class="name">${esc(g.name)}</div><div class="meta">${metaHtml(g, tags)}</div></div>

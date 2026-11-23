@@ -1,5 +1,6 @@
-// Which games the main list, Summary and exports show, and the "Copy scores for
-// Claude" text. Pure module: no DOM, so the browser, server and tests share it.
+// Which games the main list, Summary and exports show, the Games list's filter,
+// sort, row number and BGG drift rules, and the "Copy scores for Claude" text.
+// Pure module: no DOM, so the browser, server and tests share it.
 
 import { CRITERIA, finalScore, formatNumber, spread } from "./rubric.js";
 
@@ -91,6 +92,96 @@ export function isHiddenType(type, settings) {
  */
 export function visibleGames(games, settings) {
   return games.filter((g) => (settings.includeWatching || !isWatching(g)) && !isHiddenType(g.type, settings));
+}
+
+/**
+ * The Tablescore to type into BGG, or null when there is nothing to update: the
+ * game has no Tablescore or no BGG ID, or its BGG rating is within 0.05.
+ */
+export function bggDrift(game, settings) {
+  const f = scoreWith(settings)(game);
+  if (f == null || !game.bggId) return null;
+  if (game.bggRating != null && Math.abs(game.bggRating - f) < 0.05) return null;
+  return f;
+}
+
+/** The Games list's filter chips, in order. Keys are saved in prefs, so they must not change. */
+export const LIST_FILTERS = [
+  { key: "all", label: "All" },
+  { key: "todo", label: "To score" },
+  { key: "scored", label: "Scored" },
+  { key: "owned", label: "Owned" },
+  { key: "wishlist", label: "Wishlist" },
+  { key: "update", label: "Update BGG" },
+  { key: "avoid", label: "Avoid theme" },
+];
+
+/** The Games list's sorts, in order. Keys are saved in prefs, so they must not change. */
+export const LIST_SORTS = [
+  { key: "score", label: "Score" },
+  { key: "name", label: "Name" },
+  { key: "plays", label: "Plays" },
+  { key: "recent", label: "Recent" },
+];
+
+const FILTER_TESTS = {
+  all: () => true,
+  // Nothing to score until the game has been played at least once, and never if marked Won't score.
+  todo: (g, final) => final(g) == null && g.plays > 0 && !g.wontScore,
+  scored: (g, final) => final(g) != null,
+  owned: (g) => g.status === "Owned",
+  wishlist: (g) => g.status === "Wishlist" || g.status === "Want" || g.status === "Want to play",
+  update: (g, final, settings) => bggDrift(g, settings) != null,
+  avoid: (g) => g.avoidTheme,
+};
+
+const SORTERS = {
+  score: (final) => (a, b) => (final(b) ?? -1) - (final(a) ?? -1) || (b.bggRating ?? -1) - (a.bggRating ?? -1),
+  name: () => (a, b) => a.name.localeCompare(b.name),
+  plays: () => (a, b) => b.plays - a.plays,
+  recent: () => (a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""),
+};
+
+/** True when a game passes a Games list filter. An unknown key passes every game. */
+export function matchesFilter(game, filterKey, settings) {
+  return Boolean((FILTER_TESTS[filterKey] || FILTER_TESTS.all)(game, scoreWith(settings), settings));
+}
+
+/**
+ * The Games list: the games the main list shows, narrowed by one filter and a
+ * case-insensitive name search, then sorted. Unknown keys fall back to All and
+ * Score. Returns a new array.
+ */
+export function listGames(games, settings, { filter = "all", sort = "score", q = "" } = {}) {
+  const needle = (q || "").trim().toLowerCase();
+  const final = scoreWith(settings);
+  return visibleGames(games, settings)
+    .filter((g) => matchesFilter(g, filter, settings) && (!needle || g.name.toLowerCase().includes(needle)))
+    .sort((SORTERS[sort] || SORTERS.score)(final));
+}
+
+/**
+ * The next game after game in list that passes test, wrapping round to the top;
+ * never game itself, and null when there is none. A game not in the list
+ * searches from the top.
+ */
+export function nextInList(list, game, test) {
+  const i = list.findIndex((x) => x.id === game.id);
+  const order = [...list.slice(i + 1), ...list.slice(0, Math.max(i, 0))];
+  return order.find((x) => x.id !== game.id && test(x)) || null;
+}
+
+/**
+ * The number a Games list row shows, first match wins: the Tablescore; for a
+ * watched game, its Predicted score (null when there is none); the BGG rating;
+ * otherwise none.
+ */
+export function rowNumber(game, settings) {
+  const f = scoreWith(settings)(game);
+  if (f != null) return { kind: "score", value: f };
+  if (isWatching(game)) return { kind: "predicted", value: game.predictedScore ?? null };
+  if (game.bggRating != null) return { kind: "bgg", value: game.bggRating };
+  return { kind: "none", value: null };
 }
 
 /**
