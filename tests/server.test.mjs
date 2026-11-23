@@ -313,6 +313,102 @@ test("sync links a watched game with no BGG ID by exact name, then fetches its t
   assert.equal(store.getGame(unwatched.id).bggId, null);
 });
 
+/** A BGG stub whose collection is `items`, recording every search. */
+function collectionBgg(items) {
+  const searched = [];
+  return {
+    searched,
+    collection: async () => items,
+    search: async (q) => {
+      searched.push(q);
+      return items.filter((i) => i.name.toLowerCase() === q.toLowerCase()).map(({ bggId, name, type }) => ({ bggId, name, type }));
+    },
+    things: async () => [],
+  };
+}
+
+test("sync links a watched game with no BGG ID to the same-named new collection item instead of adding a twin", async () => {
+  const store = openDb(":memory:");
+  const watched = store.createGame({ name: "excursions ", watchStage: "campaign", notes: "keep", predictedScore: 7.3 });
+  const before = store.getGame(watched.id);
+  const bgg = collectionBgg([{ bggId: 77, name: "Excursions", type: "Base", status: "Wishlist", plays: 0, thumbnail: "https://img/77.jpg" }]);
+
+  const out = await syncCollection(store, bgg, "me");
+  assert.deepEqual(out, { collection: 1, added: 0, updated: 0, linked: 1, enriched: 0 });
+  assert.deepEqual(bgg.searched, []);
+  assert.equal(store.listGames().length, 1);
+  const after = store.getGame(watched.id);
+  assert.equal(after.bggId, 77);
+  assert.equal(after.status, "Wishlist");
+  assert.equal(after.thumbnail, "https://img/77.jpg");
+  assert.equal(after.name, before.name);
+  assert.equal(after.watchStage, "campaign");
+  assert.equal(after.notes, "keep");
+  assert.equal(after.predictedScore, 7.3);
+
+  const again = await syncCollection(store, bgg, "me");
+  assert.deepEqual(again, { collection: 1, added: 0, updated: 1, linked: 0, enriched: 0 });
+  assert.equal(store.listGames().length, 1);
+});
+
+test("sync adds the collection item when two unlinked watched games share its name", async () => {
+  const store = openDb(":memory:");
+  const a = store.createGame({ name: "Excursions", watchStage: "campaign" });
+  const b = store.createGame({ name: "excursions", watchStage: "delivered" });
+  const out = await syncCollection(store, collectionBgg([{ bggId: 77, name: "Excursions", type: "Base", status: "Wishlist" }]), "me");
+  assert.equal(out.added, 1);
+  assert.equal(out.linked, 0);
+  assert.equal(store.getGame(a.id).bggId, null);
+  assert.equal(store.getGame(b.id).bggId, null);
+});
+
+test("sync adds both items when two new collection items share a watched game's name", async () => {
+  const store = openDb(":memory:");
+  const w = store.createGame({ name: "Excursions", watchStage: "campaign" });
+  const out = await syncCollection(store, collectionBgg([
+    { bggId: 3, name: "Excursions", type: "Base", status: "Wishlist" },
+    { bggId: 4, name: "Excursions", type: "Base", status: "Owned" },
+  ]), "me");
+  assert.equal(out.added, 2);
+  assert.equal(out.linked, 0);
+  assert.equal(store.getGame(w.id).bggId, null);
+  assert.equal(store.listGames().length, 3);
+});
+
+test("sync links a watched game when one BGG ID appears twice in the collection", async () => {
+  const store = openDb(":memory:");
+  const w = store.createGame({ name: "Excursions", watchStage: "buy" });
+  const out = await syncCollection(store, collectionBgg([
+    { bggId: 77, name: "Excursions", type: "Base", status: "Owned" },
+    { bggId: 77, name: "Excursions", type: "Base", status: "Owned" },
+  ]), "me");
+  assert.equal(out.added, 0);
+  assert.equal(out.updated, 1);
+  assert.equal(out.linked, 1);
+  assert.equal(store.getGame(w.id).bggId, 77);
+  assert.equal(store.listGames().length, 1);
+});
+
+test("sync prefers a game that already holds the item's BGG ID over a same-named watched game", async () => {
+  const store = openDb(":memory:");
+  const known = store.createGame({ name: "Catan", bggId: 13 });
+  const w = store.createGame({ name: "Catan", watchStage: "campaign" });
+  const out = await syncCollection(store, collectionBgg([{ bggId: 13, name: "Catan", type: "Base", status: "Owned" }]), "me");
+  assert.equal(out.updated, 1);
+  assert.equal(out.added, 0);
+  assert.equal(store.getGame(known.id).status, "Owned");
+  assert.equal(store.getGame(w.id).bggId, null);
+});
+
+test("sync does not link an unwatched game with no BGG ID by name", async () => {
+  const store = openDb(":memory:");
+  const g = store.createGame({ name: "Excursions" });
+  const out = await syncCollection(store, collectionBgg([{ bggId: 77, name: "Excursions", type: "Base", status: "Owned" }]), "me");
+  assert.equal(out.added, 1);
+  assert.equal(out.linked, 0);
+  assert.equal(store.getGame(g.id).bggId, null);
+});
+
 test("linking a game to a BGG id fills in its details and keeps its name", async () => {
   const t = await startApp();
   try {
