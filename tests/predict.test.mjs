@@ -6,7 +6,8 @@ import { createApp } from "../server/app.js";
 import { Predictor, buildSystem, buildTarget, parseSubmission } from "../server/predict.js";
 import { DEFAULT_SETTINGS } from "../public/js/rubric.js";
 
-const all = (v) => ({ desire: v, table: v, depth: v, interaction: v, replay: v, art: v, theme: v });
+const CRITERIA_COLS = "s_desire, s_table, s_depth, s_interaction, s_replay, s_art, s_theme";
+const all = (v) =>({ desire: v, table: v, depth: v, interaction: v, replay: v, art: v, theme: v });
 
 // ---------- fakes ----------
 
@@ -232,7 +233,10 @@ test("predict a BGG game: a job that finishes with scores, a final and sources",
   try {
     t.store.createGame({ name: "Brass", bggId: 100, plays: 10, scores: all(10) });
     const { body: state } = await t.call("GET", "/api/state");
-    assert.deepEqual(state.claude, { configured: true, model: "claude-opus-5-5", running: null, recommending: false });
+    assert.deepEqual(state.claude, {
+      configured: true, model: "claude-opus-5-5", running: null, recommending: false,
+      budget: { used: 0, cap: 30, left: 30, freesAt: null },
+    });
 
     const r = await t.call("POST", "/api/predictions", { bggId: 500, name: "Brass: Extra" });
     assert.equal(r.status, 202);
@@ -351,6 +355,21 @@ test("accuracy pairs a game's score with the last prediction made before it was 
     assert.equal(acc.pairs[0].actual, 7);
     assert.equal(acc.pairs[0].error, 1.4);
     assert.equal(acc.meanAbsError, 1.4);
+    assert.equal(acc.bias, 1.4);
+    const crit = Object.fromEntries(acc.criteria.map((c) => [c.key, c]));
+    assert.deepEqual(acc.criteria.map((c) => c.key), ["desire", "table", "depth", "interaction", "replay", "art", "theme"]);
+    assert.deepEqual(crit.desire, { key: "desire", n: 1, meanAbsError: 2, bias: 2 });
+    assert.equal(crit.art.bias, -1);
+    assert.equal(crit.table.bias, 0);
+    assert.deepEqual(acc.pairs[0].criteria, { desire: 2, table: 0, depth: 1, interaction: 2, replay: 1, art: -1, theme: 0 });
+    assert.equal(acc.pairs[0].confidence, "medium");
+    assert.deepEqual(acc.byConfidence.map((c) => c.confidence), ["high", "medium", "low"]);
+    assert.deepEqual(acc.byConfidence[1], { confidence: "medium", n: 1, meanAbsError: 1.4, bias: 1.4 });
+    assert.deepEqual(acc.byConfidence[0], { confidence: "high", n: 0, meanAbsError: null, bias: null });
+    assert.equal(acc.baselines.mean.n, 0);
+    assert.equal(acc.baselines.mean.meanAbsError, null);
+    assert.equal(acc.baselines.mean.claudeMeanAbsError, null);
+    assert.deepEqual(acc.pairs[0].baselines, { mean: null, bggAvg: null });
 
     // Re-scoring later doesn't move the first-scored time.
     await t.call("PATCH", `/api/games/${g.id}`, { scores: { desire: 8 } });
@@ -358,6 +377,134 @@ test("accuracy pairs a game's score with the last prediction made before it was 
   } finally {
     t.close();
   }
+});
+
+/**
+ * A finished prediction from submission()'s scores (Tablescore 8.4), backdated
+ * so it is always made before the game is scored.
+ */
+function addPrediction(store, target, overrides = {}) {
+  const p = store.createPrediction({ name: "Predicted", model: "m", ...target });
+  store.finishPrediction(p.id, {
+    name: p.name, scoredGames: 1, scores: submission().scores, confidence: "medium", avoidTheme: false,
+    avoidThemeReason: "", rationale: "", twoPlayer: "", sources: [], ...overrides,
+  });
+  store.db.prepare("UPDATE predictions SET created_at = '2020-01-01T00:00:00.000Z' WHERE id = ?").run(p.id);
+  return p.id;
+}
+
+/** Every bias in an accuracy report, so a test can check none is -0. */
+function allBiases(acc) {
+  return [acc.bias, ...acc.criteria.map((c) => c.bias), ...acc.byConfidence.map((c) => c.bias),
+    acc.baselines.mean.bias, acc.baselines.bggAvg.bias];
+}
+
+test("accuracy: signed and absolute error differ, and the mean baseline judges each game against the others", () => {
+  const store = openDb(":memory:");
+  const a = store.createGame({ name: "A" });
+  const b = store.createGame({ name: "B" });
+  addPrediction(store, { gameId: a.id });
+  addPrediction(store, { gameId: b.id }, { confidence: "high" });
+  store.updateGame(a.id, { scores: { ...all(7), desire: 6 } }); // 7.0
+  store.updateGame(b.id, { scores: all(9) }); // 10.0
+
+  const acc = store.predictionAccuracy();
+  assert.equal(acc.n, 2);
+  assert.equal(acc.meanAbsError, 1.5);
+  assert.equal(acc.bias, -0.1);
+  const crit = Object.fromEntries(acc.criteria.map((c) => [c.key, c]));
+  assert.deepEqual(crit.desire, { key: "desire", n: 2, meanAbsError: 1.5, bias: 0.5 });
+  assert.deepEqual(crit.art, { key: "art", n: 2, meanAbsError: 2, bias: -2 });
+  assert.deepEqual(crit.theme, { key: "theme", n: 2, meanAbsError: 1, bias: -1 });
+  assert.deepEqual(acc.byConfidence[0], { confidence: "high", n: 1, meanAbsError: 1.6, bias: -1.6 });
+  assert.deepEqual(acc.byConfidence[1], { confidence: "medium", n: 1, meanAbsError: 1.4, bias: 1.4 });
+  assert.deepEqual(acc.byConfidence[2], { confidence: "low", n: 0, meanAbsError: null, bias: null });
+  assert.deepEqual(acc.baselines.mean, { n: 2, meanAbsError: 3, bias: 0, claudeMeanAbsError: 1.5 });
+  assert.deepEqual(acc.baselines.bggAvg, { n: 0, meanAbsError: null, bias: null, claudeMeanAbsError: null });
+  const byName = Object.fromEntries(acc.pairs.map((x) => [x.name, x]));
+  assert.equal(byName.A.baselines.mean, 10);
+  assert.equal(byName.B.baselines.mean, 7);
+  for (const x of allBiases(acc)) assert.ok(!Object.is(x, -0));
+});
+
+/** Ten games whose Tablescores sit on an exact line against their BGG averages. */
+function lineOfGames(store, count = 10) {
+  const levels = [1, 3, 5, 7, 9, 1, 3, 5, 7, 9]; // Tablescores 0, 2.5, 5, 7.5, 10
+  for (let i = 0; i < count; i++) store.createGame({ name: `Fit ${i}`, bggAvg: levels[i], scores: all(levels[i]) });
+}
+
+test("accuracy: the BGG average baseline is a line fitted without the judged game", () => {
+  const store = openDb(":memory:");
+  lineOfGames(store);
+  const t = store.createGame({ name: "Target", bggAvg: 7 });
+  addPrediction(store, { gameId: t.id });
+  store.updateGame(t.id, { scores: all(9) }); // 10.0
+
+  const acc = store.predictionAccuracy();
+  assert.equal(acc.n, 1);
+  assert.equal(acc.pairs[0].baselines.bggAvg, 7.5);
+  assert.deepEqual(acc.baselines.bggAvg, { n: 1, meanAbsError: 2.5, bias: -2.5, claudeMeanAbsError: 1.6 });
+  assert.equal(acc.pairs[0].baselines.mean, 5);
+  assert.equal(acc.baselines.mean.meanAbsError, 5);
+});
+
+test("accuracy: the BGG average baseline is left out with too few games or no BGG average, but the pair still counts", () => {
+  const few = openDb(":memory:");
+  lineOfGames(few, 9);
+  const t = few.createGame({ name: "Target", bggAvg: 7 });
+  addPrediction(few, { gameId: t.id });
+  few.updateGame(t.id, { scores: all(9) });
+  let acc = few.predictionAccuracy();
+  assert.equal(acc.n, 1);
+  assert.equal(acc.meanAbsError, 1.6);
+  assert.equal(acc.pairs[0].baselines.bggAvg, null);
+  assert.deepEqual(acc.baselines.bggAvg, { n: 0, meanAbsError: null, bias: null, claudeMeanAbsError: null });
+
+  const noAvg = openDb(":memory:");
+  lineOfGames(noAvg);
+  const u = noAvg.createGame({ name: "Target" });
+  addPrediction(noAvg, { gameId: u.id });
+  noAvg.updateGame(u.id, { scores: all(9) });
+  acc = noAvg.predictionAccuracy();
+  assert.equal(acc.n, 1);
+  assert.equal(acc.baselines.bggAvg.n, 0);
+
+  // Equal BGG averages give no line.
+  const flat = openDb(":memory:");
+  for (let i = 0; i < 10; i++) flat.createGame({ name: `Fit ${i}`, bggAvg: 7, scores: all(i % 10) });
+  const v = flat.createGame({ name: "Target", bggAvg: 7 });
+  addPrediction(flat, { gameId: v.id });
+  flat.updateGame(v.id, { scores: all(9) });
+  assert.equal(flat.predictionAccuracy().baselines.bggAvg.n, 0);
+});
+
+test("accuracy skips a finished prediction with no scores instead of counting it as an error", () => {
+  const store = openDb(":memory:");
+  const g = store.createGame({ name: "A", bggId: 500 });
+  store.db.prepare("INSERT INTO predictions (bgg_id, name, model, status, created_at) VALUES (500, 'Blank', 'm', 'done', '2020-01-01T00:00:00.000Z')").run();
+  store.updateGame(g.id, { scores: all(7) });
+  const acc = store.predictionAccuracy();
+  assert.equal(acc.n, 0);
+  assert.equal(acc.meanAbsError, null);
+  assert.equal(acc.bias, null);
+});
+
+test("accuracy only takes a prediction by game id when it names no other BGG game", () => {
+  // Left over from before ids stopped being reused: a deleted BGG game's
+  // prediction sitting on a game with no BGG ID, which the clean-up at open
+  // can't prove wrong.
+  const store = openDb(":memory:");
+  const g = store.createGame({ name: "No BGG" });
+  store.db.prepare(`INSERT INTO predictions (bgg_id, game_id, name, model, status, created_at, ${CRITERIA_COLS})
+    VALUES (777, ?, 'Gone', 'm', 'done', '2020-01-01T00:00:00.000Z', 1, 1, 1, 1, 1, 1, 1)`).run(g.id);
+  store.updateGame(g.id, { scores: all(7) });
+  assert.equal(store.predictionAccuracy().n, 0);
+
+  // Its own prediction, made by game id, still pairs.
+  addPrediction(store, { gameId: g.id });
+  const acc = store.predictionAccuracy();
+  assert.equal(acc.n, 1);
+  assert.equal(acc.pairs[0].predicted, 8.4);
 });
 
 test("predictions left running by a restart are marked failed", () => {
@@ -399,6 +546,77 @@ test("latest predictions: one per game, the newest finished one, joined to the l
   }
 });
 
+// ---------- a deleted game's id is never reused while a prediction holds it ----------
+
+test("a new game doesn't take the id of a deleted game whose prediction is still running", () => {
+  const store = openDb(":memory:");
+  const a = store.createGame({ name: "A" });
+  store.createPrediction({ gameId: a.id, name: "A", model: "m" });
+  store.deleteGame(a.id);
+  const b = store.createGame({ name: "B" });
+  assert.ok(b.id > a.id);
+  assert.deepEqual(store.listPredictions({ gameId: b.id }), []);
+  const latest = store.latestPredictions();
+  assert.equal(latest.length, 1);
+  assert.equal(latest[0].gameId, null);
+});
+
+test("a deleted game's prediction stays off the next game and attaches again when its BGG game is re-added", async () => {
+  const t = await startApp({ replies: [submitMsg()] });
+  try {
+    const a = t.store.createGame({ name: "Brass: Extra", bggId: 500 });
+    await t.settle((await t.call("POST", "/api/predictions", { gameId: a.id })).body.id);
+    assert.equal((await t.call("DELETE", `/api/games/${a.id}`, {})).status, 204);
+    const b = (await t.call("POST", "/api/games", { name: "Other", bggId: 600 })).body;
+    assert.deepEqual((await t.call("GET", `/api/predictions?gameId=${b.id}`)).body, []);
+    let latest = (await t.call("GET", "/api/predictions/latest")).body;
+    assert.equal(latest.length, 1);
+    assert.equal(latest[0].gameId, null);
+
+    const again = (await t.call("POST", "/api/games", { name: "Brass: Extra", bggId: 500 })).body;
+    latest = (await t.call("GET", "/api/predictions/latest")).body;
+    assert.equal(latest.length, 1);
+    assert.equal(latest[0].gameId, again.id);
+  } finally {
+    t.close();
+  }
+});
+
+test("accuracy doesn't pair a deleted game's prediction with the next game's Tablescore", async () => {
+  const t = await startApp({ replies: [submitMsg()] });
+  try {
+    const a = t.store.createGame({ name: "No BGG" });
+    await t.settle((await t.call("POST", "/api/predictions", { gameId: a.id })).body.id);
+    t.store.deleteGame(a.id);
+    const b = t.store.createGame({ name: "Another" });
+    await t.call("PATCH", `/api/games/${b.id}`, { scores: all(7) });
+    assert.ok(t.store.getGame(b.id).scoredAt);
+    assert.equal((await t.call("GET", "/api/predictions/accuracy")).body.n, 0);
+  } finally {
+    t.close();
+  }
+});
+
+test("over HTTP, a game added after deleting one with a prediction gets a different id", async () => {
+  const t = await startApp();
+  try {
+    const a = (await t.call("POST", "/api/games", { name: "A" })).body;
+    t.store.createPrediction({ gameId: a.id, name: "A", model: "m" });
+    assert.equal((await t.call("DELETE", `/api/games/${a.id}`, {})).status, 204);
+    const b = await t.call("POST", "/api/games", { name: "B" });
+    assert.equal(b.status, 201);
+    assert.notEqual(b.body.id, a.id);
+  } finally {
+    t.close();
+  }
+});
+
+test("with no predictions, game ids start at 1 as before", () => {
+  const store = openDb(":memory:");
+  assert.equal(store.createGame({ name: "First" }).id, 1);
+  assert.equal(store.createGame({ name: "Second" }).id, 2);
+});
+
 test("a prediction keeps BGG's thumbnail, and older ones get it backfilled once", async () => {
   const thing = THING.replace("<yearpublished", "<thumbnail>https://img.example/500.jpg</thumbnail><yearpublished");
   const t = await startApp({ replies: [submitMsg()], thing });
@@ -422,6 +640,57 @@ test("the taste profile is a setting with a length limit", async () => {
     assert.equal(ok.body.tasteProfile, "Shared maps, cute art for my wife.");
     assert.equal((await t.call("PUT", "/api/settings", { tasteProfile: "x".repeat(4001) })).status, 400);
     assert.equal((await t.call("PUT", "/api/settings", { tasteProfile: 5 })).status, 400);
+  } finally {
+    t.close();
+  }
+});
+
+// ---------- daily prediction cap ----------
+
+test("a manual prediction over the daily cap gets a 429, makes no row and doesn't block the next one", async () => {
+  const t = await startApp({ replies: [submitMsg()] });
+  try {
+    assert.equal((await t.call("PUT", "/api/settings", { dailyPredictionCap: 5 })).status, 200);
+    // Failed predictions spent tokens too, so they count.
+    for (let i = 0; i < 5; i++) {
+      const p = t.store.createPrediction({ bggId: 900 + i, name: `G${i}`, model: "m" });
+      if (i % 2) t.store.failPrediction(p.id, "boom");
+    }
+    const count = () => t.store.db.prepare("SELECT COUNT(*) AS n FROM predictions").get().n;
+    const refused = await t.call("POST", "/api/predictions", { bggId: 500 });
+    assert.equal(refused.status, 429);
+    assert.equal(refused.body.error, "Daily prediction cap reached (5 in 24 hours). Raise it in Settings or try again later.");
+    assert.equal(count(), 5);
+    const { budget } = (await t.call("GET", "/api/state")).body.claude;
+    assert.equal(budget.used, 5);
+    assert.equal(budget.left, 0);
+    assert.ok(budget.freesAt);
+
+    // Lowering the cap below what is used never shows a negative number left.
+    t.store.setSettings({ dailyPredictionCap: 5 });
+    t.store.createPrediction({ bggId: 950, name: "Extra", model: "m" });
+    assert.equal((await t.call("GET", "/api/state")).body.claude.budget.left, 0);
+
+    // Once those rows are older than 24 hours, the cap is free again.
+    t.store.db.prepare("UPDATE predictions SET created_at = ?").run(new Date(Date.now() - 25 * 3600000).toISOString());
+    const ok = await t.call("POST", "/api/predictions", { bggId: 500 });
+    assert.equal(ok.status, 202);
+    assert.equal((await t.settle(ok.body.id)).status, "done");
+  } finally {
+    t.close();
+  }
+});
+
+test("the daily prediction cap is a whole-number setting from 5 to 100", async () => {
+  const t = await startApp();
+  try {
+    assert.equal((await t.call("GET", "/api/state")).body.settings.dailyPredictionCap, 30);
+    for (const bad of [4, 101, 7.5, "30"]) {
+      assert.equal((await t.call("PUT", "/api/settings", { dailyPredictionCap: bad })).status, 400, `rejects ${bad}`);
+    }
+    assert.equal((await t.call("PUT", "/api/settings", { dailyPredictionCap: 5 })).body.dailyPredictionCap, 5);
+    assert.equal((await t.call("PUT", "/api/settings", { dailyPredictionCap: 100 })).body.dailyPredictionCap, 100);
+    assert.equal((await t.call("GET", "/api/state")).body.claude.budget.cap, 100);
   } finally {
     t.close();
   }

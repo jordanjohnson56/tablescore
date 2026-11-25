@@ -1,16 +1,61 @@
 import express from "express";
 import { fileURLToPath } from "node:url";
-import { HttpError } from "./db.js";
+import { HttpError, checkUserFields } from "./db.js";
 import { BggError } from "./bgg.js";
 import { syncCollection, addFromBgg, linkToBgg } from "./sync.js";
 import { watchlistExport } from "./export-watchlist.js";
-import { Predictor, PredictError, MAX_NOMINEES, buildSystem, buildTarget } from "./predict.js";
+import { Predictor, PredictError, CapError, MAX_NOMINEES, buildSystem, buildTarget } from "./predict.js";
 import { RecommendScheduler, SHOWN, runRecommendations } from "./recommend.js";
-import { CRITERIA, RECOMMEND_FREQUENCIES, finalScore } from "../public/js/rubric.js";
+import { CRITERIA, RECOMMEND_FREQUENCIES, finalScore, weightsProblem } from "../public/js/rubric.js";
 
 const PUBLIC_DIR = fileURLToPath(new URL("../public", import.meta.url));
 
 const TASTE_PROFILE_LIMIT = 4000;
+// The daily prediction cap's range. Below SHOWN no run could ever start.
+const MAX_DAILY_CAP = 100;
+const DAY_MS = 86400000;
+
+// One check per setting: true if the value is allowed, plus the message a 400
+// carries otherwise (a function of the value when it depends on it).
+const SETTINGS_RULES = {
+  weights: [(v) => !weightsProblem(v), weightsProblem],
+  stretch: [(v) => typeof v === "number" && v > 0 && v <= 5, "stretch must be a number between 0 and 5"],
+  hideExpansions: [(v) => typeof v === "boolean", "hideExpansions must be true or false"],
+  includeWatching: [(v) => typeof v === "boolean", "includeWatching must be true or false"],
+  tasteProfile: [
+    (v) => typeof v === "string" && v.length <= TASTE_PROFILE_LIMIT,
+    `tasteProfile must be text of at most ${TASTE_PROFILE_LIMIT} characters`,
+  ],
+  recommendFrequency: [
+    (v) => RECOMMEND_FREQUENCIES.some((f) => f.key === v),
+    `recommendFrequency must be one of ${RECOMMEND_FREQUENCIES.map((f) => f.key).join(", ")}`,
+  ],
+  recommendNominees: [
+    (v) => Number.isInteger(v) && v >= SHOWN && v <= MAX_NOMINEES,
+    `recommendNominees must be a whole number from ${SHOWN} to ${MAX_NOMINEES}`,
+  ],
+  dailyPredictionCap: [
+    (v) => Number.isInteger(v) && v >= SHOWN && v <= MAX_DAILY_CAP,
+    `dailyPredictionCap must be a whole number from ${SHOWN} to ${MAX_DAILY_CAP}`,
+  ],
+};
+
+/**
+ * Validate a settings patch and return the settings to store. Throws a 400
+ * HttpError on a bad value. Weights keep only the seven criteria.
+ */
+function checkSettings(body) {
+  const out = {};
+  for (const [k, [ok, msg]] of Object.entries(SETTINGS_RULES)) {
+    const v = body[k];
+    if (v === undefined) continue;
+    if (!ok(v)) throw new HttpError(400, typeof msg === "function" ? msg(v) : msg);
+    out[k] = k === "weights" ? Object.fromEntries(CRITERIA.map((c) => [c.key, v[c.key]])) : v;
+  }
+  return out;
+}
+
+const isBggId = (v) => Number.isInteger(v) && v > 0;
 
 export function createApp({ store, bgg, bggUsername, predictor = new Predictor(), now = () => new Date(), schedulerTickMs } = {}) {
   const app = express();
@@ -56,6 +101,22 @@ export function createApp({ store, bgg, bggUsername, predictor = new Predictor()
   const targetPending = (target) => (current && sameTarget(current, target)) || queue.some((t) => sameTarget(t.target, target));
   let manual = null; // id of the last prediction the user asked for
 
+  // The daily prediction cap: Claude conversations started in the last 24
+  // hours (predictions plus each run's nomination) against the setting.
+  // `freesAt` is when the oldest of them leaves the window.
+  function budget() {
+    const { used, oldest } = store.claudeUsageSince(new Date(now().getTime() - DAY_MS).toISOString());
+    const cap = store.getSettings().dailyPredictionCap;
+    const freesAt = oldest ? new Date(new Date(oldest).getTime() + DAY_MS).toISOString() : null;
+    return { used, cap, left: Math.max(0, cap - used), freesAt };
+  }
+  // A run needs room for SHOWN conversations, so it can be refused with a few left.
+  const capReached = (b) =>
+    new HttpError(
+      429,
+      `Daily prediction cap reached (${b.cap} in 24 hours${b.left ? `, ${b.left} left and a run needs ${SHOWN}` : ""}). Raise it in Settings or try again later.`,
+    );
+
   let recommending = null; // the promise of the running recommendation run
   const job = { running: false, phase: "", done: 0, total: 0, error: null, result: null, finishedAt: null };
 
@@ -64,42 +125,21 @@ export function createApp({ store, bgg, bggUsername, predictor = new Predictor()
       settings: store.getSettings(),
       games: store.listGames(),
       bgg: { configured: bgg.configured, username: bggUsername || null },
-      claude: { configured: predictor.configured, model: predictor.model, running: predicting, recommending: !!recommending },
+      claude: { configured: predictor.configured, model: predictor.model, running: predicting, recommending: !!recommending, budget: budget() },
     });
   });
 
   app.put("/api/settings", (req, res) => {
-    const { weights, stretch, hideExpansions, includeWatching, tasteProfile, recommendFrequency, recommendNominees } = req.body;
-    if (weights !== undefined) {
-      const ok = CRITERIA.every((c) => typeof weights[c.key] === "number" && weights[c.key] >= 0);
-      if (!ok) throw new HttpError(400, "weights needs a non-negative number for every criterion");
-    }
-    if (stretch !== undefined && !(typeof stretch === "number" && stretch > 0 && stretch <= 5)) {
-      throw new HttpError(400, "stretch must be a number between 0 and 5");
-    }
-    if (hideExpansions !== undefined && typeof hideExpansions !== "boolean") {
-      throw new HttpError(400, "hideExpansions must be true or false");
-    }
-    if (includeWatching !== undefined && typeof includeWatching !== "boolean") {
-      throw new HttpError(400, "includeWatching must be true or false");
-    }
-    if (tasteProfile !== undefined && !(typeof tasteProfile === "string" && tasteProfile.length <= TASTE_PROFILE_LIMIT)) {
-      throw new HttpError(400, `tasteProfile must be text of at most ${TASTE_PROFILE_LIMIT} characters`);
-    }
-    if (recommendFrequency !== undefined && !RECOMMEND_FREQUENCIES.some((f) => f.key === recommendFrequency)) {
-      throw new HttpError(400, `recommendFrequency must be one of ${RECOMMEND_FREQUENCIES.map((f) => f.key).join(", ")}`);
-    }
-    if (recommendNominees !== undefined && !(Number.isInteger(recommendNominees) && recommendNominees >= SHOWN && recommendNominees <= MAX_NOMINEES)) {
-      throw new HttpError(400, `recommendNominees must be a whole number from ${SHOWN} to ${MAX_NOMINEES}`);
-    }
-    res.json(store.setSettings({ weights, stretch, hideExpansions, includeWatching, tasteProfile, recommendFrequency, recommendNominees }));
+    res.json(store.setSettings(checkSettings(req.body)));
   });
 
   app.post("/api/games", (req, res) => {
-    const { name, bggId, type = "Base", status = "", watchStage } = req.body;
-    if (!name?.trim()) throw new HttpError(400, "name is required");
+    const { name, bggId = null, type = "Base", status = "", watchStage } = req.body;
+    if (name === undefined) throw new HttpError(400, "name is required");
+    const user = checkUserFields({ name, type, status });
+    if (bggId !== null && !isBggId(bggId)) throw new HttpError(400, "bggId must be a positive integer or null");
     if (bggId && store.getByBggId(bggId)) throw new HttpError(409, "that BGG game is already in your list");
-    res.status(201).json(store.createGame({ name: name.trim(), bggId: bggId || null, type, status, watchStage }));
+    res.status(201).json(store.createGame({ ...user, bggId, watchStage }));
   });
 
   app.post("/api/games/from-bgg", async (req, res) => {
@@ -184,6 +224,8 @@ export function createApp({ store, bgg, bggUsername, predictor = new Predictor()
     if (manual != null && pending(manual)) throw new HttpError(409, "a prediction is already running");
     const target = predictionTarget(req.body);
     if (targetPending(target)) throw new HttpError(409, "that game is being predicted right now");
+    const b = budget();
+    if (b.left < 1) throw capReached(b);
     const prediction = store.createPrediction({ ...target, model: predictor.model });
     manual = prediction.id;
     enqueue({ id: prediction.id, target, work: () => runPrediction(prediction.id, target) }, { front: true }).catch(() => {});
@@ -292,7 +334,10 @@ export function createApp({ store, bgg, bggUsername, predictor = new Predictor()
   // any manual prediction) and keeps the top picks. One run at a time.
   function startRun(trigger) {
     if (recommending || !predictor.configured || !bgg.configured) return false;
+    // Too little left under the cap for five picks: don't start, and record no run.
+    if (budget().left < SHOWN) return false;
     const predict = async (target, details) => {
+      if (budget().left < 1) throw new CapError("daily prediction cap reached");
       const row = store.createPrediction({ ...target, model: predictor.model });
       const done = await enqueue({ id: row.id, target, work: () => runPrediction(row.id, target, details) });
       if (done.status !== "done") throw new PredictError(done.error || "prediction failed");
@@ -318,6 +363,9 @@ export function createApp({ store, bgg, bggUsername, predictor = new Predictor()
       lastRun: latest && latest.id !== run?.id ? { ...latest, nominees: undefined } : null,
       running: !!recommending,
       nextRunAt: predictor.configured && bgg.configured ? (scheduler.nextRunAt?.toISOString() ?? null) : null,
+      // Scheduled runs stopped after failed runs in a row (only said when the schedule is on).
+      paused: store.getSettings().recommendFrequency !== "off" && scheduler.paused,
+      budget: budget(),
     };
   }
 
@@ -326,6 +374,9 @@ export function createApp({ store, bgg, bggUsername, predictor = new Predictor()
   app.post("/api/recommendations/refresh", (req, res) => {
     if (!predictor.configured) throw new HttpError(400, "ANTHROPIC_API_KEY is not set on the server");
     if (!bgg.configured) throw new HttpError(400, "BGG_TOKEN is not set on the server");
+    if (recommending) throw new HttpError(409, "a recommendation run is already going");
+    const b = budget();
+    if (b.left < SHOWN) throw capReached(b);
     if (!startRun("manual")) throw new HttpError(409, "a recommendation run is already going");
     res.status(202).json(recommendationsView());
   });

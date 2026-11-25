@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { openDb } from "../server/db.js";
 import { BggClient } from "../server/bgg.js";
 import { createApp } from "../server/app.js";
-import { Predictor, parseNominees } from "../server/predict.js";
-import { DROP, RecommendScheduler, buildNominateSystem, buildNominateUser, matchNominee, matches, nextRunAt } from "../server/recommend.js";
+import { CapError, Predictor, parseNominees } from "../server/predict.js";
+import { DROP, RecommendScheduler, buildNominateSystem, buildNominateUser, matchNominee, matches, nextRunAt, runRecommendations } from "../server/recommend.js";
 import { DEFAULT_SETTINGS } from "../public/js/rubric.js";
 
 const all = (v) => ({ desire: v, table: v, depth: v, interaction: v, replay: v, art: v, theme: v });
@@ -84,12 +84,13 @@ const hotXml = (items) =>
   `<items>${items.map((i, n) => `<item id="${i.id}" rank="${n + 1}"><thumbnail value="https://img/${i.id}.jpg"/><name value="${i.name}"/><yearpublished value="${i.year || 2025}"/></item>`).join("")}</items>`;
 
 /** A fake BGG holding `things` (by id). Search matches by a case-insensitive substring. */
-function fakeBgg(things, { hot = [], failHot = false } = {}) {
+function fakeBgg(things, { hot = [], failHot = false, failSearch = [] } = {}) {
   const calls = [];
   const fetchImpl = async (url) => {
     const u = new URL(url);
     const path = u.pathname.split("/").pop();
     calls.push(`${path}?${u.searchParams}`);
+    if (path === "search" && failSearch.includes(u.searchParams.get("query"))) throw new TypeError("fetch failed");
     if (path === "hot") return new Response(failHot ? "oops" : hotXml(hot), { status: failHot ? 500 : 200 });
     if (path === "thing") {
       const ids = u.searchParams.get("id").split(",").map(Number);
@@ -352,6 +353,27 @@ test("a run that can't fill 5 picks fails and keeps the last good set", async ()
   }
 });
 
+test("a nominee whose BGG lookup failed is recorded as such, and the short run says so", async () => {
+  const five = ["Arcs", "Nucleum", "Hegemony", "Voidfall", "Kutna Hora"];
+  const predictions = Object.fromEntries(five.map((n, i) => [n, { score: 9 - i }]));
+  const nominees = [...five, "Totally Made Up"].map((n) => nominee(n));
+  const t = await startApp({ claude: { nominees, predictions }, bgg: { failSearch: ["Kutna Hora"] } });
+  try {
+    await t.call("POST", "/api/recommendations/refresh", {});
+    const view = await t.settle();
+    assert.equal(view.lastRun.status, "failed");
+    assert.match(view.lastRun.error, /Only 4 of 5/);
+    assert.match(view.lastRun.error, /BGG lookup failed for 1 nominee/);
+    const runs = (await t.call("GET", "/api/recommendations/runs")).body;
+    const dropped = (name) => runs[0].nominees.find((n) => n.name === name).dropped;
+    assert.ok(dropped("Kutna Hora").startsWith(`${DROP.bggFailed}: `), dropped("Kutna Hora"));
+    assert.match(dropped("Kutna Hora"), /Couldn't reach BGG/);
+    assert.equal(dropped("Totally Made Up"), DROP.unmatched);
+  } finally {
+    t.close();
+  }
+});
+
 test("a failed nomination, a BGG hotness outage and missing keys are reported", async () => {
   const t = await startApp({
     claude: { nominees: () => ({ stop_reason: "refusal", usage: {}, content: [] }) },
@@ -498,5 +520,173 @@ test("a run left going by a restart is marked failed", () => {
     assert.equal(store.failRunningRecommendationRuns(), 0);
   } finally {
     store.db.close();
+  }
+});
+
+// ---------- daily prediction cap and the failure pause ----------
+
+const backdate = (store, table, col, hours) =>
+  store.db.prepare(`UPDATE ${table} SET ${col} = ?`).run(new Date(Date.now() - hours * 3600000).toISOString());
+
+test("a run that reaches the daily cap keeps the rest as capped, still reuses, and its nomination counts", async () => {
+  const fresh = ["Nucleum", "Hegemony", "Voidfall", "Kutna Hora", "Spirit Island"];
+  const predictions = Object.fromEntries(fresh.map((n, i) => [n, { score: 9 - i * 0.5 }]));
+  const t = await startApp({ claude: { nominees: [...fresh, "Arcs"].map((n) => nominee(n)), predictions } });
+  try {
+    await t.call("PUT", "/api/settings", { dailyPredictionCap: 5 });
+    const old = t.store.createPrediction({ bggId: 301, name: "Arcs", model: "m" });
+    t.store.finishPrediction(old.id, { ...submissionStored(7), name: "Arcs", scoredGames: 0 });
+    backdate(t.store, "predictions", "created_at", 48); // reusable, but outside the 24 hours
+    assert.equal((await t.call("POST", "/api/recommendations/refresh", {})).status, 202);
+    const view = await t.settle();
+    assert.equal(view.run.status, "done");
+    assert.equal(view.run.predicted, 4);
+    assert.equal(view.run.reused, 1);
+    assert.deepEqual(view.picks.map((p) => p.name), ["Nucleum", "Hegemony", "Voidfall", "Kutna Hora", "Arcs"]);
+    const runs = (await t.call("GET", "/api/recommendations/runs")).body;
+    assert.equal(runs[0].nominees.find((n) => n.name === "Spirit Island").dropped, DROP.cap);
+    assert.equal(DROP.cap, "daily prediction cap reached");
+    const asked = t.claude.map((c) => c.messages[0].content);
+    assert.ok(!asked.some((m) => /^Name: Spirit Island/m.test(m)), "Claude never asked about the capped nominee");
+
+    const { budget } = (await t.call("GET", "/api/state")).body.claude;
+    assert.deepEqual([budget.used, budget.left], [5, 0], "four predictions plus the nomination");
+    const refused = await t.call("POST", "/api/recommendations/refresh", {});
+    assert.equal(refused.status, 429);
+    assert.match(refused.body.error, /Daily prediction cap reached \(5 in 24 hours\)/);
+    assert.equal(t.store.listRecommendationRuns().length, 1, "no run row for a refused refresh");
+    assert.equal((await t.call("POST", "/api/predictions", { bggId: 308, name: "Slay the Spire: The Board Game" })).status, 429);
+  } finally {
+    t.close();
+  }
+});
+
+test("refresh now needs 5 left under the cap; the scheduler skips quietly without a run row", async () => {
+  const t = await startApp({ now: () => new Date("2026-10-19T04:01:00") });
+  try {
+    await t.call("PUT", "/api/settings", { dailyPredictionCap: 5 });
+    t.store.createPrediction({ bggId: 999, name: "Manual", model: "m" });
+    assert.equal((await t.call("GET", "/api/state")).body.claude.budget.left, 4);
+    const refused = await t.call("POST", "/api/recommendations/refresh", {});
+    assert.equal(refused.status, 429);
+    assert.equal(refused.body.error, "Daily prediction cap reached (5 in 24 hours, 4 left and a run needs 5). Raise it in Settings or try again later.");
+    assert.ok((await t.call("GET", "/api/recommendations")).body.nextRunAt, "due now");
+    assert.equal(t.app.scheduler.tick(), false);
+    assert.equal(t.store.listRecommendationRuns().length, 0);
+    assert.equal(t.claude.length, 0);
+  } finally {
+    t.close();
+  }
+});
+
+test("runRecommendations drops a nominee whose prediction hits the cap, and a short run's error names the cap", async () => {
+  const store = openDb(":memory:");
+  const fake = fakeClaude({ nominees: ["Arcs", "Nucleum", "Hegemony", "Voidfall", "Kutna Hora"].map((n) => nominee(n)) });
+  const bgg = fakeBgg(THINGS);
+  const log = { error() {} };
+  let made = 0;
+  const predict = async (target) => {
+    if (made >= 3) throw new CapError("daily prediction cap reached");
+    made++;
+    const row = store.createPrediction({ ...target, model: "m" });
+    return store.finishPrediction(row.id, { ...submissionStored(8), name: target.name, scoredGames: 0 });
+  };
+  try {
+    const run = await runRecommendations({ store, bgg: bgg.client, predictor: new Predictor({ client: fake.client }), predict, log });
+    assert.equal(run.status, "failed");
+    assert.equal(run.error, "Only 3 of 5 recommendations could be made because the daily prediction cap was reached. The last good set is kept.");
+    const nominees = store.listRecommendationRuns(1)[0].nominees;
+    assert.deepEqual(nominees.filter((n) => n.dropped === DROP.cap).map((n) => n.name).sort(), ["Kutna Hora", "Voidfall"]);
+  } finally {
+    store.db.close();
+  }
+});
+
+test("failedRunStreak counts the newest finished runs that failed, ignoring one still going", () => {
+  const store = openDb(":memory:");
+  let minute = 0;
+  const add = (status) => {
+    const run = store.createRecommendationRun({ model: "m", startedAt: new Date(Date.UTC(2026, 9, 19, 4, minute++)).toISOString() });
+    if (status === "failed") store.failRecommendationRun(run.id, "boom");
+    if (status === "done") store.finishRecommendationRun(run.id, { usage: null, predicted: 5, reused: 0 });
+  };
+  try {
+    assert.equal(store.failedRunStreak(), 0);
+    add("failed");
+    assert.equal(store.failedRunStreak(), 1);
+    add("failed");
+    assert.equal(store.failedRunStreak(), 2);
+    add("running");
+    assert.equal(store.failedRunStreak(), 2, "a run still going doesn't count either way");
+    add("done");
+    assert.equal(store.failedRunStreak(), 0);
+    add("failed");
+    add("failed");
+    add("failed");
+    assert.equal(store.failedRunStreak(), 2, "never more than the limit");
+    assert.equal(store.failedRunStreak(5), 3);
+  } finally {
+    store.db.close();
+  }
+});
+
+test("the scheduler pauses after two failed runs in a row and resumes after a successful one", () => {
+  const store = openDb(":memory:");
+  let clock = new Date("2026-10-19T04:01:00");
+  const runs = [];
+  const sched = new RecommendScheduler({ store, run: (o) => (runs.push(o.trigger), true), now: () => clock });
+  const record = (status, trigger = "schedule") => {
+    const run = store.createRecommendationRun({ model: "m", trigger, startedAt: clock.toISOString() });
+    if (status === "failed") store.failRecommendationRun(run.id, "boom");
+    else store.finishRecommendationRun(run.id, { usage: null, predicted: 5, reused: 0 });
+  };
+  try {
+    assert.equal(sched.tick(), true);
+    record("failed");
+    assert.equal(sched.paused, false, "one failure still retries");
+    clock = new Date("2026-10-20T04:01:00");
+    assert.equal(sched.tick(), true, "the next-day retry happens");
+    record("failed", "manual"); // a failure of any trigger counts
+    assert.equal(sched.paused, true);
+    assert.equal(sched.nextRunAt, null);
+    clock = new Date("2026-10-21T04:01:00");
+    assert.equal(sched.tick(), false);
+    clock = new Date("2026-10-28T04:01:00");
+    assert.equal(sched.tick(), false, "paused for good, not just for a day");
+    record("done", "manual");
+    assert.equal(sched.paused, false);
+    clock = new Date("2026-11-04T04:01:00");
+    assert.equal(sched.tick(), true, "the schedule resumed on its own");
+    assert.equal(runs.length, 3);
+  } finally {
+    store.db.close();
+  }
+});
+
+test("GET /api/recommendations reports the pause after two failed runs, until a refresh succeeds", async () => {
+  const five = ["Arcs", "Nucleum", "Hegemony", "Voidfall", "Kutna Hora"];
+  let fail = true;
+  const nominees = () => (fail ? { stop_reason: "refusal", usage: {}, content: [] } : toolMsg("submit_nominees", { nominees: five.map((n) => nominee(n)) }));
+  const predictions = Object.fromEntries(five.map((n, i) => [n, { score: 9 - i }]));
+  const t = await startApp({ claude: { nominees, predictions } });
+  try {
+    for (let i = 0; i < 2; i++) {
+      assert.equal((await t.call("POST", "/api/recommendations/refresh", {})).status, 202, "the pause never blocks refresh now");
+      const view = await t.settle();
+      assert.equal(view.paused, i === 1);
+      assert.equal(view.nextRunAt === null, i === 1);
+    }
+    await t.call("PUT", "/api/settings", { recommendFrequency: "off" });
+    assert.equal((await t.call("GET", "/api/recommendations")).body.paused, false, "not paused when the schedule is off");
+    await t.call("PUT", "/api/settings", { recommendFrequency: "weekly" });
+    fail = false;
+    await t.call("POST", "/api/recommendations/refresh", {});
+    const view = await t.settle();
+    assert.equal(view.run.status, "done");
+    assert.equal(view.paused, false);
+    assert.ok(view.nextRunAt);
+    assert.equal(view.budget.used, 3 + 5, "three nominations and five predictions");
+  } finally {
+    t.close();
   }
 });

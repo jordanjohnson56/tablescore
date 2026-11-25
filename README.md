@@ -59,9 +59,9 @@ BGG's XML API needs a registered application token, sent as `Authorization: Bear
 
 ## Claude predictions
 
-Tablescore can ask Claude to predict your score for a game you haven't scored. Set `ANTHROPIC_API_KEY` in `.env` (from console.anthropic.com; usage is billed to that account, and Max plans include monthly API credits). Without a key the feature is off.
+Tablescore can ask Claude to predict your score for a game you haven't scored. Set `ANTHROPIC_API_KEY` in `.env` (from console.anthropic.com; usage is billed to that account, and Max plans include monthly API credits). Without a key the feature is off. The **daily prediction cap** (`dailyPredictionCap` in Settings, 5–100, default 30) bounds how many Claude conversations start in any 24 hours: each prediction, finished or failed, and each recommendation run's nomination counts as one. Over it, a prediction or Refresh now answers 429. It bounds call volume, not money, so also set a spend limit in the Anthropic console.
 
-**Discover** search shows **Predict** next to each BGG result, and an unscored game's page has a **Predict my score** button. The prediction page shows each criterion, the rationale, a note on two-player play and the sources, with **Add to list** and **Add to watchlist** for a game that isn't in your list yet. With the search box empty, **Discover** lists every game Claude has predicted, one row each (its latest finished prediction), newest first; sort it by predicted score or name. Typing filters that list and searches BGG below it. Write your **taste profile** under **Settings → Claude predictions**; the same card shows how far off past predictions were once you've scored those games.
+**Discover** search shows **Predict** next to each BGG result, and an unscored game's page has a **Predict my score** button. The prediction page shows each criterion, the rationale, a note on two-player play and the sources, with **Add to list** and **Add to watchlist** for a game that isn't in your list yet. With the search box empty, **Discover** lists every game Claude has predicted, one row each (its latest finished prediction), newest first; sort it by predicted score or name. Typing filters that list and searches BGG below it. Write your **taste profile** under **Settings → Claude predictions**; the same card shows how far off past predictions were once you've scored those games: whether Claude runs high or low, the error on each criterion and by Claude's stated confidence, and two free baselines to compare with (guessing your average Tablescore, and a straight line from BGG's average, each worked out without the game being judged).
 
 - Claude sees the rubric (criteria, bands, weights, stretch), your **taste profile** (free text under Settings), every game you've scored with its seven criterion scores, plays, BGG weight and player counts, and your old ratings for games not yet rescored, labeled as the weaker signal they are. Watched games and the game being predicted are left out.
 - For the game itself it gets BGG's details (description, mechanics, categories, designers, and the base game for an expansion, with your score for it if you have one), plus up to 5 web searches. A game with no BGG ID is predicted from its name and the web.
@@ -76,6 +76,8 @@ The **Watchlist** tab follows crowdfunded games you aren't backing, so you can w
 
 A watched game moves through these **watch stages**, only when you change them: Campaign live → Awaiting delivery → Delivered → Reviews out → Buy or Pass. Buy and Pass are **Decided** and sit in a collapsed section. The watch stage is separate from status, so a BGG sync never touches it.
 
+A watched game's row shows a hint, with one button, when something has probably changed: you own it or have logged plays (stop watching, and score it if there's something to score), its campaign has ended (move to Awaiting delivery), its estimated delivery month has passed (move to Delivered), or it's at Reviews out without a full score (predict again). Nothing changes until you tap. A Claude prediction fills a watched game's predicted score only when it has none; after that, the prediction page offers **Use 7.9 as the Predicted score** for a newer prediction.
+
 Watched games stay out of the main list, Summary and Claude export. **Settings → Include watched games in the list and Claude export** shows them in the list and the export, labeled *predicted*. Summary statistics never use predicted scores.
 
 ### Export to the private repo
@@ -86,12 +88,12 @@ A monthly cloud routine checks on watched games. It can't reach this server, so 
 ~/tablescore/scripts/sync-watchlist.sh
 ```
 
-It pulls the private repo (the routine commits its `state.json` there), exports the watchlist from the running container, and commits and pushes `watchlist.json` only if a game or setting changed; a new `exportedAt` alone doesn't count, except once the committed one is 30 days old (`REFRESH_DAYS`), so the routine, which calls an export over 45 days old stale, doesn't warn just because nothing changed. It runs from any directory and needs only Docker and git on the host, not Node. It stops with an error, leaving the repo alone, if the container is down or the export doesn't look right.
+It pulls the private repo (the routine commits its `state.json` there), exports the watchlist from the running container, and commits and pushes `watchlist.json` only if a game or setting changed; a new `exportedAt` alone doesn't count, except once the committed one is 30 days old (`REFRESH_DAYS`), so the routine, which calls an export over 45 days old stale, doesn't warn just because nothing changed. It compares the export with the last commit, not the file on disk, and pushes whenever the clone has unpushed commits, so a failed commit or push is picked up by the next run. A run that starts while another is going stops with an error. It runs from any directory and needs only Docker and git on the host, not Node. It stops with an error, leaving the repo alone, if the container is down or the export doesn't look right. Any non-zero exit means the private repo may be behind.
 
 - The clone defaults to `~/tablescore-watchlist`. If yours is elsewhere, set `WATCHLIST_REPO` in `.env` once (or in the environment, or pass the path as the first argument).
 - Set `DOCKER="sudo docker"` if your user isn't in the `docker` group.
 - To type just `sync-watchlist`, link it onto your PATH: `ln -s ~/tablescore/scripts/sync-watchlist.sh ~/.local/bin/sync-watchlist`.
-- To never think about it, run it from cron (`crontab -e`), e.g. daily at 3:30am. Cron has no SSH agent, so the private repo's remote needs a key without a passphrase or an HTTPS credential helper:
+- To never think about it, run it from cron (`crontab -e`), e.g. daily at 3:30am. Each run starts with a timestamp line, so the log shows when a run failed. Cron has no SSH agent, so the private repo's remote needs a key without a passphrase or an HTTPS credential helper:
 
   ```
   30 3 * * * $HOME/tablescore/scripts/sync-watchlist.sh >>$HOME/tablescore-watchlist-sync.log 2>&1
@@ -128,20 +130,55 @@ Once a week (by default), Tablescore asks Claude for games you should be looking
 - Each nominee is matched to BGG (by the ID Claude gives, checked against the name, or by a name search) and dropped if it's already in your list or marked Not interested. Each remaining one gets a full prediction, unless it has one under 30 days old, which is reused. A game whose prediction flags an avoided theme is never shown.
 - The five highest predicted scores are shown, with at most one expansion. Every nominee is recorded with why it was or wasn't shown (`GET /api/recommendations/runs`), and every prediction made this way shows on **Discover** like any other.
 - A run that can't fill five picks is recorded as failed and the last good set stays up. A manual prediction asked for during a run goes ahead of the run's remaining nominees.
-- Scheduled runs start at 04:00 server time, counted from the last successful run's start: **Off**, **Daily**, **Weekly**, **Every 2 weeks** or **Monthly** (`recommendFrequency`). A run that is overdue when the server starts waits for the next 04:00. A failed run is retried at the next 04:00. **Refresh now** (`POST /api/recommendations/refresh`) runs at once. Set `TZ` (for example `TZ=America/Chicago`) in `.env` so 04:00 is your 04:00; in Docker it is UTC otherwise.
+- Scheduled runs start at 04:00 server time, counted from the last successful run's start: **Off**, **Daily**, **Weekly**, **Every 2 weeks** or **Monthly** (`recommendFrequency`). A run that is overdue when the server starts waits for the next 04:00. A failed run is retried at the next 04:00; after two failed runs in a row scheduled runs pause, and Settings says so, until a run succeeds (Refresh now still works, and one good run resumes the schedule). A run doesn't start with fewer than five conversations left under the daily prediction cap (a scheduled one just skips and tries again later), and one that reaches the cap part-way keeps the remaining nominees that need a new prediction as "daily prediction cap reached". **Refresh now** (`POST /api/recommendations/refresh`) runs at once. Set `TZ` (for example `TZ=America/Chicago`) in `.env` so 04:00 is your 04:00; in Docker it is UTC otherwise.
 - **Not interested** (`POST /api/recommendations/dismissed`) hides a game for good; undo it under Settings. Adding a game to your list or watchlist drops it from the picks too.
-- A run is roughly ten predictions, so expect 10–20 minutes and about ten times a single prediction's tokens. Each run's token and search counts are stored with it.
+- A run is roughly ten predictions, so expect 10–20 minutes and about ten times a single prediction's tokens. Each run's token and search counts are stored with it. A run uses one conversation from the daily prediction cap for its nomination plus one per new prediction, so a default run is up to 11 of the 30.
 
 ## Data and backups
 
-Everything lives in `data/tablescore.db`. On start and every 24 h, the server writes `data/backups/tablescore-YYYY-MM-DD.db` and keeps the newest `BACKUP_KEEP` (default 14). Copying `data/` somewhere else is your off-box backup. **Settings → Export JSON** downloads everything, and **Copy scores for Claude** puts a plain-text summary on the clipboard for asking about recommendations.
+Everything lives in `data/tablescore.db`. On start and every 24 h, the server writes a snapshot, `data/backups/tablescore-YYYY-MM-DD.db`, and keeps the newest `BACKUP_KEEP` (default 14). `BACKUP_KEEP` must be a whole number of 1 or more; anything else is logged at start and 14 is used. Each snapshot is one complete file, checked before it replaces that day's earlier one.
+
+**Off-box backup:** copy `data/backups/` somewhere else, and keep `.env` separately. Don't copy `data/tablescore.db` while the server runs: recent edits sit in `tablescore.db-wal` beside it until SQLite folds them in, so a copy of the database alone can be missing them or be torn mid-write.
+
+**Settings → Export JSON** downloads your settings and every game with its scores, notes and watch fields. It leaves out Claude's predictions, recommendation Runs and the Not interested list, and nothing imports it, so it is not a backup. **Copy scores for Claude** puts a plain-text summary on the clipboard for asking about recommendations.
+
+### Restore from a snapshot
+
+Check a snapshot first. This changes nothing and is safe while the server runs:
+
+```sh
+docker compose run --rm tablescore node server/restore.js --check 2026-11-20
+```
+
+It prints how many games (scored and watched), predictions, Runs and Not interested games the snapshot holds. Run it with no date to list the snapshots, newest first. To restore:
+
+```sh
+docker compose stop
+docker compose run --rm tablescore node server/restore.js 2026-11-20
+docker compose up -d
+```
+
+Use `run`, not `exec`: `exec` needs the server up, and the restore needs it stopped. If your image was built before `server/restore.js` existed, `docker compose build` first. A date means that day's snapshot in `data/backups/`; you can give a path inside the container instead, such as `/data/backups/tablescore-2026-11-20.db`.
+
+Without Docker, stop the server (Ctrl-C), then run `npm run restore -- 2026-11-20` from the checkout, with `DATA_DIR` set if your data isn't in `./data`. Add `--check` to only check.
+
+What a restore does:
+
+- It verifies a copy of the snapshot (SQLite's integrity check, and the games and settings tables present) before touching anything, and refuses a missing, truncated or non-Tablescore file, or the live database itself, with nothing changed. The snapshot file is never modified.
+- It refuses, with nothing changed, if the live database is open in another process, which means the server is still running.
+- It moves `tablescore.db`, and any `tablescore.db-wal` and `tablescore.db-shm`, into `data/replaced/<time>/` together, then puts the checked copy in place and brings an old snapshot's tables up to date. Nothing is deleted. To undo, restore `data/replaced/<time>/tablescore.db` the same way; delete the folder once you're happy.
+- A server stopped with `docker compose stop` or Ctrl-C closes the database cleanly and leaves only `tablescore.db`. One that was killed leaves a `-wal` holding edits that aren't in `tablescore.db` yet. Before moving the old database aside, the restore folds its own `-wal` back into it, as a clean stop would, so the copy in `data/replaced/` is complete on its own. A snapshot must never sit beside a stale `-wal`: SQLite would read the old edits into it, giving back the old data or a corrupt file.
+
+After the restore, the server writes today's snapshot again from the restored data when it starts. A prediction or Run that was in progress when the snapshot was taken shows as failed. Because the recommendation schedule is read from the database, restoring an older snapshot can make a Run due at the next 04:00. The next `sync-watchlist` commits the restored Watchlist.
+
+**Manual fallback**, if the script can't run: stop the server; move `tablescore.db`, `tablescore.db-wal` and `tablescore.db-shm` into a new folder together; copy the snapshot to `data/tablescore.db`; start the server. Do the copy as your own user, not with `sudo`: the container runs as uid 1000, and a database owned by root can't be written. The Docker steps above avoid this.
 
 ## Develop
 
 ```sh
 npm ci
-npm test                     # rubric math, BGG parsing (fixtures), API, import, backups
+npm test                     # rubric math, BGG parsing (fixtures), API, import, backups, restore
 DATA_DIR=./data PORT=8080 npm start
 ```
 
-Layout: `server/` (Express API, SQLite store, BGG client, sync, xlsx import, watchlist export) and `public/` (static app; `public/js/rubric.js` holds the criteria text and score math).
+Layout: `server/` (Express API, SQLite store, BGG client, sync, xlsx import, watchlist export, restore) and `public/` (static app; `public/js/rubric.js` holds the criteria text and score math).

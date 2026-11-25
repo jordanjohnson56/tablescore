@@ -1,7 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CRITERIA, DEFAULT_SETTINGS } from "../public/js/rubric.js";
-import { awaitingHint, bggUrl, bgoSearchUrl, claudeExport, monthLabel, rankings, sortWatchlist, summaryStats, targetCurrency, visibleGames } from "../public/js/watchlist.js";
+import {
+  LIST_FILTERS, LIST_SORTS, bggDrift, bggUrl, bgoSearchUrl, claudeExport, listGames, matchesFilter, monthLabel,
+  nextInList, predictionToUse, rankings, rowNumber, sortWatchlist, summaryStats, targetCurrency, visibleGames, watchHints,
+} from "../public/js/watchlist.js";
 
 const base = { type: "Base", scores: {}, plays: 0, status: "", avoidTheme: false, bggRating: null };
 const game = (name, extra = {}) => ({ ...base, name, ...extra });
@@ -113,18 +116,116 @@ test("within a stage, the Watchlist goes by estimated delivery month, games with
   assert.deepEqual(order(games), ["Live", "Soon", "Alpha", "Bravo", "Later", "Apple", "Zebra"]);
 });
 
-// ---------- "Move to Awaiting delivery?" hint ----------
+// ---------- Watchlist hints ----------
 
-test("the Awaiting delivery hint shows only for a Campaign live game whose end date has passed", () => {
+const kinds = (g, today) => watchHints(g, today).map((h) => h.kind);
+const FULL = vec([9, 9, 9, 9, 9, 9, 9]);
+
+test("the campaign ended hint shows only for a Campaign live game whose end date has passed", () => {
   const today = "2026-10-21";
-  const hint = (watchStage, campaignEnd) => awaitingHint(game("Kings Gambit", { watchStage, campaignEnd }), today);
-  assert.equal(hint("campaign", "2026-10-20"), true);
-  assert.equal(hint("campaign", "2026-10-21"), false, "the campaign is still live on its end date");
-  assert.equal(hint("campaign", "2026-10-30"), false);
-  assert.equal(hint("campaign", null), false);
-  assert.equal(hint("awaiting", "2026-10-20"), false);
-  assert.equal(hint("pass", "2026-10-20"), false);
-  assert.equal(hint(null, "2026-10-20"), false);
+  const hint = (watchStage, campaignEnd) => kinds(game("Kings Gambit", { watchStage, campaignEnd }), today);
+  assert.deepEqual(hint("campaign", "2026-10-20"), ["campaignEnded"]);
+  assert.deepEqual(hint("campaign", "2026-10-21"), [], "the campaign is still live on its end date");
+  assert.deepEqual(hint("campaign", "2026-10-30"), []);
+  assert.deepEqual(hint("campaign", null), []);
+  assert.deepEqual(hint("awaiting", "2026-10-20"), []);
+  assert.deepEqual(hint("pass", "2026-10-20"), []);
+  assert.deepEqual(hint(null, "2026-10-20"), []);
+  assert.deepEqual(watchHints(game("Kings Gambit", { watchStage: "campaign", campaignEnd: "2026-10-20" }), today), [
+    { kind: "campaignEnded", text: "Campaign ended 2026-10-20.", button: "Move to Awaiting delivery?" },
+  ]);
+});
+
+test("the delivery passed hint shows at Awaiting delivery once the estimated month is over", () => {
+  const today = "2026-10-21";
+  const hint = (watchStage, deliveryEst) => kinds(game("Bookwyrm", { watchStage, deliveryEst }), today);
+  assert.deepEqual(hint("awaiting", "2026-09"), ["deliveryPassed"]);
+  assert.deepEqual(hint("awaiting", "2026-10"), [], "a game due this month is not late yet");
+  assert.deepEqual(hint("awaiting", "2026-11"), []);
+  assert.deepEqual(hint("awaiting", null), []);
+  for (const stage of ["campaign", "delivered", "reviews", "buy"]) assert.ok(!hint(stage, "2026-09").includes("deliveryPassed"), stage);
+  assert.deepEqual(watchHints(game("Bookwyrm", { watchStage: "awaiting", deliveryEst: "2026-09" }), today), [
+    { kind: "deliveryPassed", text: "Estimated delivery Sep 2026 has passed.", button: "Move to Delivered?" },
+  ]);
+});
+
+test("the delivery passed hint crosses the year boundary on the first of the month", () => {
+  const g = game("Bookwyrm", { watchStage: "awaiting", deliveryEst: "2026-12" });
+  assert.deepEqual(kinds(g, "2026-12-31"), []);
+  assert.deepEqual(kinds(g, "2027-01-01"), ["deliveryPassed"]);
+});
+
+test("an owned or played watched game offers to stop watching, and to score it when there is something to score", () => {
+  const today = "2026-10-21";
+  const hint = (extra) => watchHints(game("Excursions", { watchStage: "reviews", ...extra }), today);
+  assert.deepEqual(hint({ status: "Owned" }), [
+    { kind: "owned", text: "You own it now.", button: "Stop watching", score: false },
+  ]);
+  assert.deepEqual(hint({ plays: 2 }), [
+    { kind: "owned", text: "You've logged 2 plays.", button: "Stop watching and score it", score: true },
+  ]);
+  assert.equal(hint({ plays: 1 })[0].text, "You've logged 1 play.");
+  assert.deepEqual(hint({ status: "Owned", plays: 2 })[0].text, "You own it and have logged 2 plays.");
+  assert.equal(hint({ plays: 2, scores: FULL })[0].button, "Stop watching");
+  assert.equal(hint({ plays: 2, wontScore: true })[0].button, "Stop watching");
+  assert.equal(hint({ plays: 2, scores: vec([9, 9, 9, null, null, null, null]) })[0].button, "Stop watching and score it");
+});
+
+test("the owned hint shows at every watch stage and is then the only hint", () => {
+  const today = "2026-10-21";
+  for (const watchStage of ["campaign", "awaiting", "delivered", "reviews", "buy", "pass"]) {
+    assert.deepEqual(kinds(game("Excursions", { watchStage, status: "Owned" }), today), ["owned"], watchStage);
+  }
+  assert.deepEqual(kinds(game("Late", { watchStage: "campaign", campaignEnd: "2026-10-01", status: "Owned" }), today), ["owned"]);
+  assert.deepEqual(kinds(game("Late", { watchStage: "awaiting", deliveryEst: "2026-01", plays: 1 }), today), ["owned"]);
+});
+
+test("a status other than Owned with no plays is not owning it", () => {
+  for (const status of ["Wishlist", "Preordered", "Prev. owned", "Want to play", ""]) {
+    assert.deepEqual(kinds(game("Bookwyrm", { watchStage: "buy", status }), "2026-10-21"), [], status);
+  }
+});
+
+test("a Reviews out game without a full score offers a new prediction", () => {
+  const today = "2026-10-21";
+  const hint = (extra) => watchHints(game("Excursions", { watchStage: "reviews", predictedScore: null, ...extra }), today);
+  assert.deepEqual(hint({ predictedScore: 7.2 }), [
+    { kind: "repredict", text: "Reviews are out. Predicted 7.2 may predate them.", button: "Predict again" },
+  ]);
+  assert.deepEqual(hint({}), [
+    { kind: "repredict", text: "Reviews are out. No Predicted score yet.", button: "Predict my score" },
+  ]);
+  assert.deepEqual(hint({ predictedScore: 7, scores: FULL }), []);
+  for (const watchStage of ["delivered", "buy"]) assert.deepEqual(kinds(game("Excursions", { watchStage, predictedScore: 7 }), today), [], watchStage);
+});
+
+test("a game that isn't Watching gets no hints, even when owned and played", () => {
+  assert.deepEqual(watchHints(game("Brass", { watchStage: null, status: "Owned", plays: 4 }), "2026-10-21"), []);
+  assert.deepEqual(watchHints(game("Brass", { status: "Owned", plays: 4 }), "2026-10-21"), []);
+});
+
+test("watchHints leaves the game alone", () => {
+  const g = game("Excursions", { watchStage: "reviews", predictedScore: 7.2, status: "Owned", plays: 2, scores: vec([9, 9, 9, null, null, null, null]) });
+  const before = structuredClone(g);
+  watchHints(g, "2026-10-21");
+  assert.deepEqual(g, before);
+});
+
+// ---------- "Use it as the Predicted score" ----------
+
+test("a finished prediction for a watched game is offered as its Predicted score when it differs", () => {
+  const done = (final) => ({ status: "done", final });
+  const watched = (predictedScore) => game("Excursions", { watchStage: "reviews", predictedScore });
+  assert.equal(predictionToUse(watched(7.2), done(7.9)), 7.9);
+  assert.equal(predictionToUse(watched(null), done(7.9)), 7.9);
+  assert.equal(predictionToUse(watched(7.9), done(7.9)), null, "already the Predicted score");
+  assert.equal(predictionToUse(watched(7.2), done(7.94)), 7.9, "rounded to one decimal, as the server stores it");
+  assert.equal(predictionToUse(watched(7.9), done(7.94)), null);
+  assert.equal(predictionToUse(watched(7.2), { status: "running", final: null }), null);
+  assert.equal(predictionToUse(watched(7.2), { status: "error", final: null }), null);
+  assert.equal(predictionToUse(watched(7.2), done(null)), null);
+  assert.equal(predictionToUse(watched(7.2), undefined), null);
+  assert.equal(predictionToUse(game("Brass", { predictedScore: null }), done(7.9)), null, "not Watching");
 });
 
 test("a target price with no currency is in USD", () => {
@@ -220,4 +321,181 @@ test("outside links point at the BGG page and a Board Game Oracle search", () =>
     bgoSearchUrl("Brass: Birmingham & Co"),
     "https://www.boardgameoracle.com/boardgame/search?q=Brass%3A%20Birmingham%20%26%20Co",
   );
+});
+
+// ---------- Games list: BGG drift, filters, sorts, next in list, row number ----------
+
+const S91 = vec([9, 4, 9, 10, 9, 9, 8]); // 9.1
+const S76 = vec([7, 8, 7, 4, 7, 10, 6]); // 7.6
+const S99 = vec([9, 9, 9, 9, 9, 9, 9]); // 10.0 at the default stretch
+const PARTIAL = { desire: 8, table: 7 };
+
+test("a scored game with a BGG ID and no BGG rating needs its Tablescore typed into BGG", () => {
+  assert.equal(bggDrift(game("Brass", { bggId: 1, scores: S91 }), DEFAULT_SETTINGS), 9.1);
+});
+
+test("there is no BGG drift when the BGG rating matches or is within 0.05", () => {
+  const drift = (bggRating) => bggDrift(game("Brass", { bggId: 1, scores: S91, bggRating }), DEFAULT_SETTINGS);
+  assert.equal(drift(9.1), null);
+  assert.equal(drift(9.14), null);
+  assert.equal(drift(9.0), 9.1);
+  assert.equal(drift(9.2), 9.1);
+});
+
+test("there is no BGG drift without a BGG ID or without a full score", () => {
+  assert.equal(bggDrift(game("No ID", { scores: S91 }), DEFAULT_SETTINGS), null);
+  assert.equal(bggDrift(game("Unscored", { bggId: 1, bggRating: 7 }), DEFAULT_SETTINGS), null);
+  assert.equal(bggDrift(game("Partial", { bggId: 1, scores: PARTIAL, bggRating: 7 }), DEFAULT_SETTINGS), null);
+});
+
+test("BGG drift follows the settings passed in", () => {
+  const g = game("Nines", { bggId: 1, scores: S99, bggRating: 10 });
+  assert.equal(bggDrift(g, DEFAULT_SETTINGS), null);
+  assert.equal(bggDrift(g, { ...DEFAULT_SETTINGS, stretch: 1 }), 9);
+});
+
+// One collection for the filter tests. Every game has an id and a BGG ID unless noted.
+const LIST = [
+  game("Brass", { id: 1, bggId: 11, scores: S91, bggRating: 9.1, plays: 12, status: "Owned" }),
+  game("Pax Pamir", { id: 2, bggId: 12, scores: S76, bggRating: 7, plays: 2, status: "Owned", avoidTheme: true }),
+  game("Ark Nova", { id: 3, bggId: 13, bggRating: 8.2, plays: 3, status: "Wishlist" }),
+  game("Azul", { id: 4, bggId: 14, scores: PARTIAL, plays: 1, status: "Want" }),
+  game("Cascadia", { id: 5, bggId: 15, plays: 0, status: "Want to play" }),
+  game("Dune", { id: 6, bggId: 16, plays: 4, status: "Preordered", wontScore: true }),
+  game("Root", { id: 7, scores: S91, plays: 5 }),
+  game("Bookwyrm", { id: 8, bggId: 18, watchStage: "reviews", plays: 1, status: "Wishlist", predictedScore: 8 }),
+  game("Brass: Iron Clays", { id: 9, bggId: 19, type: "Expansion", plays: 2, avoidTheme: true }),
+];
+const namesFor = (filter, settings = DEFAULT_SETTINGS, extra = {}) =>
+  listGames(LIST, settings, { filter, sort: "name", ...extra }).map((g) => g.name);
+
+test("the list filters and sorts keep their keys, labels and order", () => {
+  assert.deepEqual(LIST_FILTERS.map((f) => [f.key, f.label]), [
+    ["all", "All"], ["todo", "To score"], ["scored", "Scored"], ["owned", "Owned"],
+    ["wishlist", "Wishlist"], ["update", "Update BGG"], ["avoid", "Avoid theme"],
+  ]);
+  assert.deepEqual(LIST_SORTS.map((s) => [s.key, s.label]), [["score", "Score"], ["name", "Name"], ["plays", "Plays"], ["recent", "Recent"]]);
+});
+
+test("To score keeps unscored and partly scored games with plays, and drops unplayed, Won't score and scored games", () => {
+  assert.deepEqual(namesFor("todo"), ["Ark Nova", "Azul", "Brass: Iron Clays"]);
+});
+
+test("Scored, Owned, Update BGG and Avoid theme each keep the right games", () => {
+  assert.deepEqual(namesFor("scored"), ["Brass", "Pax Pamir", "Root"]);
+  assert.deepEqual(namesFor("owned"), ["Brass", "Pax Pamir"]);
+  assert.deepEqual(namesFor("update"), ["Pax Pamir"]);
+  assert.deepEqual(namesFor("avoid"), ["Brass: Iron Clays", "Pax Pamir"]);
+});
+
+test("Wishlist keeps Wishlist, Want and Want to play, and not Preordered", () => {
+  assert.deepEqual(namesFor("wishlist"), ["Ark Nova", "Azul", "Cascadia"]);
+});
+
+test("All and an unknown filter key show every game the main list shows", () => {
+  const all = ["Ark Nova", "Azul", "Brass", "Brass: Iron Clays", "Cascadia", "Dune", "Pax Pamir", "Root"];
+  assert.deepEqual(namesFor("all"), all);
+  assert.deepEqual(namesFor("nonsense"), all);
+  assert.equal(matchesFilter(LIST[0], "nonsense", DEFAULT_SETTINGS), true);
+  assert.deepEqual(listGames(LIST, DEFAULT_SETTINGS).map((g) => g.id).sort((a, b) => a - b), [1, 2, 3, 4, 5, 6, 7, 9]);
+});
+
+test("every filter leaves out what the main list hides", () => {
+  const watching = { ...DEFAULT_SETTINGS, includeWatching: true };
+  const noExp = { ...DEFAULT_SETTINGS, hideExpansions: true };
+  for (const { key } of LIST_FILTERS) {
+    assert.ok(!namesFor(key).includes("Bookwyrm"), key);
+    assert.ok(!namesFor(key, noExp).includes("Brass: Iron Clays"), key);
+  }
+  assert.deepEqual(namesFor("wishlist", watching), ["Ark Nova", "Azul", "Bookwyrm", "Cascadia"]);
+  assert.deepEqual(namesFor("todo", watching), ["Ark Nova", "Azul", "Bookwyrm", "Brass: Iron Clays"]);
+  assert.deepEqual(namesFor("avoid", noExp), ["Pax Pamir"]);
+});
+
+test("search is case-insensitive, ignores surrounding spaces, and combines with the filter", () => {
+  assert.deepEqual(namesFor("all", DEFAULT_SETTINGS, { q: "  BRASS " }), ["Brass", "Brass: Iron Clays"]);
+  assert.deepEqual(namesFor("scored", DEFAULT_SETTINGS, { q: "brass" }), ["Brass"]);
+  assert.deepEqual(namesFor("all", DEFAULT_SETTINGS, { q: "   " }).length, 8);
+});
+
+test("the Score sort puts Tablescore first, then unscored games by BGG rating, then games with neither", () => {
+  const games = [
+    game("Neither", { id: 1 }),
+    game("Rated 6", { id: 2, bggRating: 6 }),
+    game("Scored 7.6", { id: 3, scores: S76 }),
+    game("Rated 8", { id: 4, bggRating: 8 }),
+    game("Scored 9.1", { id: 5, scores: S91, bggRating: 5 }),
+  ];
+  const names = (sort) => listGames(games, DEFAULT_SETTINGS, { sort }).map((g) => g.name);
+  assert.deepEqual(names("score"), ["Scored 9.1", "Scored 7.6", "Rated 8", "Rated 6", "Neither"]);
+  assert.deepEqual(names("nonsense"), names("score"));
+});
+
+test("a watched game with only a Predicted score sorts as unscored, not by its prediction", () => {
+  const games = [
+    game("Predicted", { id: 1, watchStage: "reviews", predictedScore: 9.9 }),
+    game("Scored", { id: 2, scores: S76 }),
+    game("Rated", { id: 3, bggRating: 7 }),
+  ];
+  const settings = { ...DEFAULT_SETTINGS, includeWatching: true };
+  assert.deepEqual(listGames(games, settings, { sort: "score" }).map((g) => g.name), ["Scored", "Rated", "Predicted"]);
+});
+
+test("the Name, Plays and Recent sorts each order the list", () => {
+  const games = [
+    game("Cascadia", { id: 1, plays: 3, updatedAt: "2026-01-02T00:00:00Z" }),
+    game("Azul", { id: 2, plays: 9 }),
+    game("Brass", { id: 3, plays: 1, updatedAt: "2026-03-01T00:00:00Z" }),
+  ];
+  const names = (sort) => listGames(games, DEFAULT_SETTINGS, { sort }).map((g) => g.name);
+  assert.deepEqual(names("name"), ["Azul", "Brass", "Cascadia"]);
+  assert.deepEqual(names("plays"), ["Azul", "Cascadia", "Brass"]);
+  assert.deepEqual(names("recent"), ["Brass", "Cascadia", "Azul"]);
+});
+
+test("listGames returns a new array and leaves the input order alone", () => {
+  const games = [game("Brass", { id: 1 }), game("Azul", { id: 2 })];
+  const out = listGames(games, DEFAULT_SETTINGS, { sort: "name" });
+  assert.notEqual(out, games);
+  assert.deepEqual(out.map((g) => g.name), ["Azul", "Brass"]);
+  assert.deepEqual(games.map((g) => g.name), ["Brass", "Azul"]);
+});
+
+const ids = (...xs) => xs.map((id) => ({ id }));
+const even = (g) => g.id % 2 === 0;
+
+test("next in list is the next match after the game, skipping non-matches and wrapping to the top", () => {
+  const list = ids(1, 2, 3, 4, 5, 6);
+  assert.equal(nextInList(list, list[1], even).id, 4);
+  assert.equal(nextInList(list, list[2], even).id, 4);
+  assert.equal(nextInList(list, list[5], even).id, 2);
+  assert.equal(nextInList(list, list[4], even).id, 6);
+});
+
+test("next in list is null when the game is the only match, and never the game itself", () => {
+  const list = ids(1, 2, 3);
+  assert.equal(nextInList(list, list[1], even), null);
+  assert.equal(nextInList(list, list[0], () => false), null);
+  assert.equal(nextInList(ids(7), { id: 7 }, () => true), null);
+});
+
+test("next in list searches from the top when the game is not in the list", () => {
+  const list = ids(1, 2, 3, 4);
+  assert.equal(nextInList(list, { id: 99 }, even).id, 2);
+  assert.equal(nextInList(list, { id: 99 }, () => true).id, 1);
+});
+
+test("the row number is the Tablescore when there is one, even for a watched game", () => {
+  assert.deepEqual(rowNumber(game("Brass", { scores: S91, bggRating: 8 }), DEFAULT_SETTINGS), { kind: "score", value: 9.1 });
+  assert.deepEqual(rowNumber(game("Watched", { scores: S91, watchStage: "delivered", predictedScore: 7 }), DEFAULT_SETTINGS), { kind: "score", value: 9.1 });
+});
+
+test("a watched, unscored game's row number is its Predicted score, null without one even when it has a BGG rating", () => {
+  assert.deepEqual(rowNumber(game("Bookwyrm", { watchStage: "reviews", predictedScore: 8.4, bggRating: 7 }), DEFAULT_SETTINGS), { kind: "predicted", value: 8.4 });
+  assert.deepEqual(rowNumber(game("Bookwyrm", { watchStage: "reviews", bggRating: 7 }), DEFAULT_SETTINGS), { kind: "predicted", value: null });
+});
+
+test("an unwatched, unscored game's row number is its BGG rating, or none without one", () => {
+  assert.deepEqual(rowNumber(game("Ark Nova", { bggRating: 8.2, scores: PARTIAL }), DEFAULT_SETTINGS), { kind: "bgg", value: 8.2 });
+  assert.deepEqual(rowNumber(game("Unrated"), DEFAULT_SETTINGS), { kind: "none", value: null });
 });

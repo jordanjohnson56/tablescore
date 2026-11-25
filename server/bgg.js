@@ -16,53 +16,122 @@ const parser = new XMLParser({
 
 export class BggError extends Error {}
 
+const TRANSIENT_STATUS = new Set([500, 502, 503, 504]);
+const SEARCH_CACHE_SIZE = 100;
+
 export class BggClient {
-  constructor({ token, fetchImpl = fetch, spacingMs = 5000, retryMs = 5000, maxRetries = 8, sleep } = {}) {
+  constructor({
+    token,
+    fetchImpl = fetch,
+    spacingMs = 5000,
+    retryMs = 5000,
+    maxRetries = 8,
+    timeoutMs = 15000,
+    transientRetries = 1,
+    searchCacheMs = 600000,
+    now = () => Date.now(),
+    sleep,
+  } = {}) {
     this.token = token;
     this.fetch = fetchImpl;
     this.spacingMs = spacingMs;
     this.retryMs = retryMs;
     this.maxRetries = maxRetries;
+    this.timeoutMs = timeoutMs;
+    this.transientRetries = transientRetries;
+    this.searchCacheMs = searchCacheMs;
+    this.now = now;
     this.sleep = sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.nextAt = 0;
+    this.searchCache = new Map(); // key -> { at, rows }, oldest first
+    this.searching = new Map(); // key -> in-flight promise of rows
   }
 
   get configured() {
     return !!this.token;
   }
 
+  /**
+   * Wait for this caller's turn. The slot is reserved before sleeping, so
+   * overlapping callers queue a full spacing apart in arrival order.
+   */
+  async slot() {
+    const now = this.now();
+    const at = Math.max(now, this.nextAt);
+    this.nextAt = at + this.spacingMs;
+    if (at > now) await this.sleep(at - now);
+  }
+
   async get(path, params) {
     if (!this.token) throw new BggError("BGG_TOKEN is not set on the server");
     const url = `${BASE}/${path}?${new URLSearchParams(params)}`;
-    for (let attempt = 0; ; attempt++) {
-      const wait = this.nextAt - Date.now();
-      if (wait > 0) await this.sleep(wait);
-      this.nextAt = Date.now() + this.spacingMs;
-      const res = await this.fetch(url, { headers: { Authorization: `Bearer ${this.token}` } });
+    let queued = 0; // 202 and 429 answers so far
+    let transient = 0; // timeouts, network failures and 5xx answers so far
+    for (;;) {
+      await this.slot();
+      let res;
+      let body;
+      try {
+        res = await this.fetch(url, {
+          headers: { Authorization: `Bearer ${this.token}` },
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+        body = await res.text();
+      } catch (e) {
+        if (transient++ < this.transientRetries) continue;
+        throw new BggError(
+          e?.name === "TimeoutError" ? `BGG didn't answer within ${Math.round(this.timeoutMs / 1000)} s` : "Couldn't reach BGG",
+        );
+      }
       // 202 = collection request queued on BGG's side; 429 = slow down. Both mean retry.
-      if ((res.status === 202 || res.status === 429) && attempt < this.maxRetries) {
-        await this.sleep(this.retryMs * (res.status === 429 ? 2 : 1));
-        continue;
+      if (res.status === 202 || res.status === 429) {
+        if (queued++ < this.maxRetries) {
+          // A 429 slows every caller, by pushing back the shared next slot.
+          if (res.status === 429) this.nextAt = Math.max(this.nextAt, this.now() + this.retryMs * 2);
+          else await this.sleep(this.retryMs);
+          continue;
+        }
+        throw new BggError(
+          res.status === 202
+            ? "BGG is still preparing the collection. Try the sync again in a minute."
+            : "BGG is rate limiting requests (HTTP 429). Try again in a minute.",
+        );
       }
       if (res.status === 401) throw new BggError("BGG rejected the token (401). Check BGG_TOKEN.");
-      if (!res.ok) throw new BggError(`BGG ${path} returned HTTP ${res.status}`);
-      const doc = parser.parse(await res.text());
-      if (doc.errors || doc.error) {
-        const msg = doc.errors?.error?.[0]?.message ?? doc.error?.message ?? "unknown error";
-        throw new BggError(`BGG ${path}: ${msg}`);
-      }
+      if (TRANSIENT_STATUS.has(res.status) && transient++ < this.transientRetries) continue;
+      const doc = parse(body);
+      const msg = errorText(doc);
+      if (!res.ok) throw new BggError(`BGG ${path} returned HTTP ${res.status}${msg ? `: ${msg}` : ""}`);
+      if (msg || doc.errors !== undefined || doc.error !== undefined) throw new BggError(`BGG ${path}: ${msg || "unknown error"}`);
+      if (doc.items === undefined) throw new BggError(`BGG ${path} sent an unexpected response`);
       return doc;
     }
   }
 
+  /** Name search. Results are kept for a while per query, and one request is shared by identical queries. */
   async search(query) {
-    const doc = await this.get("search", { query, type: "boardgame,boardgameexpansion" });
-    return (doc.items?.item || []).map((it) => ({
-      bggId: Number(it.id),
-      name: primaryName(it.name),
-      year: num(it.yearpublished?.value),
-      type: it.type === "boardgameexpansion" ? "Expansion" : "Base",
-    }));
+    const key = query.trim().toLowerCase();
+    const hit = this.searchCache.get(key);
+    if (hit && this.now() - hit.at < this.searchCacheMs) return hit.rows.map((r) => ({ ...r }));
+    let pending = this.searching.get(key);
+    if (!pending) {
+      pending = this.get("search", { query: query.trim(), type: "boardgame,boardgameexpansion" })
+        .then((doc) => {
+          const rows = (doc.items?.item || []).map((it) => ({
+            bggId: Number(it.id),
+            name: primaryName(it.name),
+            year: num(it.yearpublished?.value),
+            type: it.type === "boardgameexpansion" ? "Expansion" : "Base",
+          }));
+          this.searchCache.delete(key);
+          this.searchCache.set(key, { at: this.now(), rows });
+          while (this.searchCache.size > SEARCH_CACHE_SIZE) this.searchCache.delete(this.searchCache.keys().next().value);
+          return rows;
+        })
+        .finally(() => this.searching.delete(key));
+      this.searching.set(key, pending);
+    }
+    return (await pending).map((r) => ({ ...r }));
   }
 
   /** Full details for up to any number of ids, fetched in batches of 20. */
@@ -100,6 +169,25 @@ export class BggClient {
     const exp = await this.get("collection", { username, stats: "1", subtype: "boardgameexpansion" });
     return [...(base.items?.item || []), ...(exp.items?.item || [])].map(parseCollectionItem);
   }
+}
+
+/** Parse a response body. A body that isn't XML (an HTML error page, say) reads as an empty document. */
+function parse(body) {
+  try {
+    return parser.parse(body) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * BGG's error message, or "". It comes as <errors><error><message>…</message></error></errors>
+ * (one error or several) or as <error message="…"/>. `error` is deliberately not
+ * in isArray, which would break the attribute form, so both are normalised here.
+ */
+function errorText(doc) {
+  const first = [].concat(doc.errors?.error ?? doc.error ?? [])[0];
+  return text(first?.message).trim();
 }
 
 export function parseThing(it) {

@@ -47,10 +47,13 @@ A game Claude nominated for the user to look at, shown with its predicted score.
 _Avoid_: suggestion
 
 **Run**:
-One pass of the recommender: Claude nominates games, each is matched to BGG and predicted, and the top five are ranked. A run is scheduled or started by Refresh now, and is kept with every nominee and why it was dropped.
+One pass of the recommender: Claude nominates games, each is matched to BGG and predicted, and the top five are ranked. A run is scheduled or started by Refresh now, and is kept with every nominee and why it was dropped. Scheduled runs pause after two failed runs in a row until one succeeds.
 
 **Nominee**:
 A game Claude put forward in a run, before matching, exclusion and prediction decided whether it is shown.
+
+**Daily prediction cap**:
+The most Claude conversations the app starts in any 24 hours: each prediction and each run's nomination counts as one, failed or not.
 
 **Not interested**:
 A game the user dismissed from the recommendations. It is never nominated or shown again until the user undoes it in Settings.

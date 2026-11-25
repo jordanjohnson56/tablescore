@@ -1,12 +1,18 @@
 import {
   CRITERIA, BAND_LABELS, RECOMMEND_FREQUENCIES, bandIndex, finalScore, formatNumber, rawAverage, scaleEntry, scoredCount,
-  rescoreStatus, isProvisional, weightTotal,
+  rescoreStatus, isProvisional, weightTotal, weightsProblem,
 } from "./rubric.js";
 import {
   STAGES, STAGE_LABELS, PLATFORMS, DEFAULT_CURRENCY, targetCurrency, claudeExport, isDecided, isWatching, isHiddenType,
-  summaryStats, visibleGames, sortWatchlist, awaitingHint, monthLabel, rankings, bggUrl, bgoSearchUrl,
+  summaryStats, visibleGames, sortWatchlist, watchHints, predictionToUse, monthLabel, rankings, bggUrl, bgoSearchUrl, STATUSES,
+  bggDrift as driftWith, LIST_FILTERS, LIST_SORTS, listGames, nextInList, rowNumber,
 } from "./watchlist.js";
 import { api } from "./api.js";
+import { latestOnly, SUPERSEDED } from "./latest.js";
+import { sharedPoll } from "./poll.js";
+import { applySaved, createSaveQueue, mergeGames } from "./saves.js";
+import { canRefresh, isStale, repaintsAfterRefresh, syncStep, syncToast } from "./refresh.js";
+import { MERGED, createScrollMemory, goesBack } from "./nav.js";
 
 const view = document.getElementById("view");
 let state = { settings: null, games: [], bgg: { configured: false }, claude: { configured: false } };
@@ -59,67 +65,72 @@ function metaDetails(g) {
 }
 
 /** Score to type into BGG, if it differs from what BGG currently has. */
-function bggDrift(g) {
-  const f = final(g);
-  if (f == null || !g.bggId) return null;
-  if (g.bggRating != null && Math.abs(g.bggRating - f) < 0.05) return null;
-  return f;
-}
+const bggDrift = (g) => driftWith(g, state.settings);
 
 /** The game after g in the current list order that still needs a BGG rating. */
-function nextDrift(g) {
-  const list = filtered();
-  const i = list.findIndex((x) => x.id === g.id);
-  const order = [...list.slice(i + 1), ...list.slice(0, Math.max(i, 0))];
-  return order.find((x) => x.id !== g.id && bggDrift(x) != null) || null;
-}
+const nextDrift = (g) => nextInList(filtered(), g, (x) => bggDrift(x) != null);
 
-// ---------- save queue: debounced PATCH per game ----------
+// ---------- save queue: debounced PATCH per game, kept and retried until it lands ----------
 
-const pending = new Map();
-function queueSave(id, patch) {
-  const p = pending.get(id) || { body: {}, timer: null };
-  for (const [k, v] of Object.entries(patch)) {
-    p.body[k] = k === "scores" ? { ...p.body.scores, ...v } : v;
-  }
-  clearTimeout(p.timer);
-  p.timer = setTimeout(() => flush(id), 450);
-  pending.set(id, p);
-  setSaveState("Saving…");
-}
-
-async function flush(id) {
-  const p = pending.get(id);
-  if (!p) return;
-  pending.delete(id);
-  try {
-    const saved = await api.patch(`/api/games/${id}`, p.body);
-    const i = state.games.findIndex((g) => g.id === id);
-    if (i >= 0) state.games[i] = { ...saved, scores: { ...saved.scores, ...pendingScores(id) } };
-    if (!pending.size) setSaveState("Saved");
-  } catch (e) {
-    setSaveState("Not saved");
-    toast(`Couldn't save: ${e.message}`, 5000);
-  }
-}
-const pendingScores = (id) => pending.get(id)?.body.scores || {};
+const SAVE_LABELS = { saved: "Saved", saving: "Saving…", error: "Not saved" };
+let saveFailed = false; // a failure was toasted, so recovery gets a toast too
+const saves = createSaveQueue({
+  patch: (id, body, opts) => api.patch(`/api/games/${id}`, body, opts),
+  // The open page holds this same object, so updating it in place keeps the page current.
+  apply: (id, saved, unsent) => {
+    const g = byId(id);
+    if (g) applySaved(g, saved, unsent);
+  },
+  onState: (s) => {
+    setSaveState(SAVE_LABELS[s]);
+    if (s === "error" && !saveFailed) {
+      saveFailed = true;
+      toast("Couldn't save. Will keep trying.", 5000);
+    } else if (s === "saved" && saveFailed) {
+      saveFailed = false;
+      toast("Saved");
+    }
+  },
+  // The field was dropped; show the stored value again.
+  onReject: async (id, err) => {
+    toast(`Couldn't save: ${err.message}`, 5000);
+    try {
+      await reload();
+      route();
+    } catch {
+      /* server unreachable; the page keeps what it has */
+    }
+  },
+});
+const queueSave = (id, patch) => saves.queue(id, patch);
 function setSaveState(text) {
-  const el = document.querySelector(".save-state");
+  const el = document.getElementById("save-state");
   if (el) el.textContent = text;
 }
-window.addEventListener("pagehide", () => {
-  for (const id of [...pending.keys()]) flush(id);
+window.addEventListener("pagehide", () => saves.flushAll({ keepalive: true }));
+// Coming back (into view, from the back/forward cache, or online): send what is waiting, then catch up.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") return saves.flushAll({ keepalive: true });
+  saves.retry();
+  resume();
+});
+window.addEventListener("pageshow", (e) => {
+  saves.retry();
+  if (e.persisted) resume();
+});
+window.addEventListener("online", () => {
+  saves.retry();
+  resume();
 });
 
 // ---------- router ----------
 
 // Each tab's renderer, matched by hash prefix; anything else is the games list.
 const TABS = { watchlist: renderWatchlist, discover: renderDiscover, summary: renderSummary, settings: renderSettings, games: renderList };
-// Screens that were merged into Discover; old links and bookmarks land there.
-const MERGED = ["#/add", "#/predictions"];
 
 function route() {
   const hash = location.hash || "#/";
+  // Screens that were merged into Discover; old links and bookmarks land there.
   if (MERGED.some((h) => hash.startsWith(h))) return void location.replace("#/discover");
   closeMore();
   // A prediction page sits under Discover, wherever it was opened from.
@@ -136,60 +147,90 @@ function route() {
   if (p) return renderPrediction(p[1], Number(p[2]), p[3] ? decodeURIComponent(p[3]) : "");
   return TABS[tab]();
 }
-window.addEventListener("hashchange", (e) => {
-  // A prediction page opened from Discover goes back there.
-  if (location.hash.startsWith("#/predict/")) predictBack = new URL(e.oldURL).hash.startsWith("#/discover") ? "#/discover" : null;
+
+/**
+ * Draw the open screen and scroll to `y`, putting back the `<details>` open flags in `open` if given.
+ * The one place the page scrolls after route(): a navigation passes the y from scroll memory, a
+ * repaint in place passes the y it had.
+ */
+function show(y, open = null) {
   route();
-  window.scrollTo(0, 0);
+  if (open) {
+    view.querySelectorAll("details").forEach((d, i) => {
+      if (i < open.length) d.open = open[i];
+    });
+  }
+  window.scrollTo(0, y);
+}
+
+// The Games list, Watchlist and Summary keep their position while a game or prediction page is
+// open, so Back (the arrow, the system gesture or the tab) returns to the same place.
+const scrollMemory = createScrollMemory();
+// The app sets every scroll position itself; the browser restoring one first would spoil the y read on leaving.
+try {
+  history.scrollRestoration = "manual";
+} catch {
+  /* not supported; the y is set after every draw anyway */
+}
+
+/**
+ * Record on the current history entry the hash beneath it (null when unknown), once. A pushed entry
+ * arrives without state; one reached by Back or Forward keeps its stamp. goesBack() reads it.
+ */
+function stampEntry(from) {
+  if (history.state?.from !== undefined) return;
+  try {
+    history.replaceState({ ...history.state, from }, "");
+  } catch {
+    /* rate limited; the arrow then pushes, as a plain link */
+  }
+}
+
+/** Go back to `href` when it is the entry beneath, otherwise open it as a new entry. */
+function backOr(href) {
+  if (goesBack(history.state, href)) history.back();
+  else location.hash = href;
+}
+
+window.addEventListener("hashchange", (e) => {
+  const from = new URL(e.oldURL).hash;
+  stampEntry(from);
+  // A prediction page opened from Discover goes back there.
+  if (location.hash.startsWith("#/predict/")) predictBack = from.startsWith("#/discover") ? "#/discover" : null;
+  // Before the first load succeeds there is no state to show, so a tab tap tries the load again.
+  if (!booted) return void boot();
+  scrollMemory.leave(from, location.hash, window.scrollY);
+  show(scrollMemory.arrive(from, location.hash));
+  // The repaint after an owed refresh keeps whatever position show() just set.
+  if (refreshOwed) refresh({ force: true });
+});
+
+// The back arrow on a game or prediction page goes back when the entry beneath is the screen it
+// names, so returning adds no history; otherwise it opens its href as before.
+view.addEventListener("click", (e) => {
+  const a = e.target.closest("a.back");
+  if (!a || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+  if (!goesBack(history.state, a.getAttribute("href"))) return;
+  e.preventDefault();
+  history.back();
 });
 
 // ---------- list ----------
 
-const FILTERS = [
-  ["all", "All"],
-  ["todo", "To score"],
-  ["scored", "Scored"],
-  ["owned", "Owned"],
-  ["wishlist", "Wishlist"],
-  ["update", "Update BGG"],
-  ["avoid", "Avoid theme"],
-];
-
-function filtered() {
-  const q = prefs.q.trim().toLowerCase();
-  const tests = {
-    all: () => true,
-    // Nothing to score until the game has been played at least once, and never if marked Won't score.
-    todo: (g) => final(g) == null && g.plays > 0 && !g.wontScore,
-    scored: (g) => final(g) != null,
-    owned: (g) => g.status === "Owned",
-    wishlist: (g) => g.status === "Wishlist" || g.status === "Want" || g.status === "Want to play",
-    update: (g) => bggDrift(g) != null,
-    avoid: (g) => g.avoidTheme,
-  };
-  const list = shownGames().filter((g) => (tests[prefs.filter] || tests.all)(g) && (!q || g.name.toLowerCase().includes(q)));
-  const sorters = {
-    score: (a, b) => (final(b) ?? -1) - (final(a) ?? -1) || (b.bggRating ?? -1) - (a.bggRating ?? -1),
-    name: (a, b) => a.name.localeCompare(b.name),
-    plays: (a, b) => b.plays - a.plays,
-    recent: (a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""),
-  };
-  return list.sort(sorters[prefs.sort] || sorters.score);
-}
+const filtered = () => listGames(state.games, state.settings, prefs);
 
 function renderList() {
-  if (!FILTERS.some(([v]) => v === prefs.filter)) prefs.filter = "all";
+  if (!LIST_FILTERS.some((f) => f.key === prefs.filter)) prefs.filter = "all";
   view.innerHTML = `
     <div class="toolbar">
       <div class="toolbar-row">
         <input type="search" id="q" placeholder="Search ${shownGames().length} games" value="${esc(prefs.q)}" aria-label="Search games">
         <select id="sort" aria-label="Sort">
-          ${[["score", "Score"], ["name", "Name"], ["plays", "Plays"], ["recent", "Recent"]]
-            .map(([v, l]) => `<option value="${v}" ${prefs.sort === v ? "selected" : ""}>${l}</option>`).join("")}
+          ${LIST_SORTS.map(({ key, label }) => `<option value="${key}" ${prefs.sort === key ? "selected" : ""}>${label}</option>`).join("")}
         </select>
       </div>
       <div class="chips" role="group" aria-label="Filter">
-        ${FILTERS.map(([v, l]) => `<button class="chip" data-f="${v}" aria-pressed="${prefs.filter === v}">${l}</button>`).join("")}
+        ${LIST_FILTERS.map(({ key, label }) => `<button class="chip" data-f="${key}" aria-pressed="${prefs.filter === key}">${label}</button>`).join("")}
       </div>
       <p class="list-count muted" id="count" aria-live="polite"></p>
     </div>
@@ -263,13 +304,13 @@ function rowHtml(g, ranks) {
     g.avoidTheme ? `<span class="tag danger">Avoid</span>` : "",
     bggDrift(g) != null ? `<span class="tag warn" title="BGG rating differs">BGG</span>` : "",
   ].join("");
-  const badge = f != null
-    ? `<div class="num">${formatNumber(f)}</div><div class="lbl">score</div>`
-    : isWatching(g)
-      ? `<div class="num predicted">${formatNumber(g.predictedScore)}</div><div class="lbl">predicted</div>`
-      : g.bggRating != null
-        ? `<div class="num old">${formatNumber(g.bggRating)}</div><div class="lbl">old</div>`
-        : `<div class="num old">—</div>`;
+  const num = rowNumber(g, state.settings);
+  const badge = {
+    score: () => `<div class="num">${formatNumber(num.value)}</div><div class="lbl">score</div>`,
+    predicted: () => `<div class="num predicted">${formatNumber(num.value)}</div><div class="lbl">predicted</div>`,
+    bgg: () => `<div class="num old">${formatNumber(num.value)}</div><div class="lbl">old</div>`,
+    none: () => `<div class="num old">—</div>`,
+  }[num.kind]();
   return `<li class="${g.avoidTheme ? "avoid" : ""}"><a class="game-row" href="#/g/${g.id}">
     ${rankedThumbHtml(g, ranks)}
     <div class="info"><div class="name">${esc(g.name)}</div><div class="meta">${metaHtml(g, tags)}</div></div>
@@ -297,7 +338,7 @@ function renderScorer(id) {
         : `<a class="back" href="#/" aria-label="Back to games">‹</a>`}
       <div class="title">
         <div class="name ${g.avoidTheme ? "avoid-name" : ""}">${esc(g.name)}</div>
-        <div class="save-state">${esc(rescoreStatus(g.scores))}</div>
+        <div class="save-state" id="save-state">${esc(saves.busy() ? SAVE_LABELS[saves.state()] : rescoreStatus(g.scores))}</div>
         <div id="rank"></div>
       </div>
       <div class="final" id="final"></div>
@@ -330,12 +371,12 @@ function renderScorer(id) {
       <label class="field"><span>Logged plays</span>
         <div class="stepper">
           <button class="btn" type="button" data-step="-1" aria-label="One fewer play">−</button>
-          <input type="number" id="plays" min="0" inputmode="numeric" value="${g.plays}">
+          <input type="number" id="plays" min="0" inputmode="numeric" value="${esc(g.plays)}">
           <button class="btn" type="button" data-step="1" aria-label="One more play">+</button>
         </div>
       </label>
       <label class="field"><span>Status</span>
-        <select id="status">${["Owned", "Preordered", "Prev. owned", "Wishlist", "Want to play", "Want", ""]
+        <select id="status">${STATUSES
           .map((s) => `<option value="${esc(s)}" ${g.status === s ? "selected" : ""}>${s || "Not in collection"}</option>`).join("")}</select>
       </label>
       <label class="toggle"><input type="checkbox" id="avoid" ${g.avoidTheme ? "checked" : ""}> Avoid theme (demons, spirits, horror)</label>
@@ -376,7 +417,7 @@ function renderScorer(id) {
       ? `<div class="notice drift">
           <p>Rate it <b>${formatNumber(d)}</b> on BGG${g.bggRating != null ? ` (it has ${formatNumber(g.bggRating)})` : ""}.</p>
           <div class="btn-row">
-            <a class="btn primary" data-act="open" href="${bggUrl(g.bggId)}" target="_blank" rel="noopener">Copy ${formatNumber(d)} &amp; open BGG</a>
+            <a class="btn primary" data-act="open" href="${esc(bggUrl(g.bggId))}" target="_blank" rel="noopener">Copy ${formatNumber(d)} &amp; open BGG</a>
             <button class="btn" type="button" data-act="done">I've rated it</button>
           </div>
         </div>`
@@ -488,7 +529,7 @@ function renderScorer(id) {
       b.disabled = true;
       b.textContent = "Linking…";
       try {
-        Object.assign(g, await api.post(`/api/games/${g.id}/link-bgg`, { bggId: Number(b.dataset.link) }));
+        applySaved(g, await api.post(`/api/games/${g.id}/link-bgg`, { bggId: Number(b.dataset.link) }), saves.unsent(g.id));
         renderScorer(g.id);
       } catch (err) {
         b.disabled = false;
@@ -501,10 +542,10 @@ function renderScorer(id) {
   view.querySelector("#del").addEventListener("click", async () => {
     if (!confirm(`Delete ${g.name} and its scores? This can't be undone.`)) return;
     try {
-      pending.delete(g.id);
+      saves.drop(g.id);
       await api.del(`/api/games/${g.id}`);
       state.games = state.games.filter((x) => x.id !== g.id);
-      location.hash = "#/";
+      backOr("#/");
       toast(`Deleted ${g.name}`);
     } catch (e) {
       toast(`Couldn't delete: ${e.message}`, 5000);
@@ -578,7 +619,8 @@ function bindWatch(g) {
 
 // ---------- watchlist ----------
 
-let decidedOpen = false;
+// Null until the owner toggles Decided this session; until then it opens when a Decided game has a hint.
+let decidedOpen = null;
 const todayIso = () => new Date().toLocaleDateString("en-CA"); // local YYYY-MM-DD
 
 function priceLabel(g) {
@@ -596,19 +638,23 @@ function renderWatchlist() {
   const active = list.filter((g) => !isDecided(g));
   const decided = list.filter(isDecided);
   const today = todayIso();
+  const openDecided = decidedOpen ?? decided.some((g) => rowHints(g, today).length > 0);
   view.innerHTML = `
     <h1>Watchlist</h1>
     ${list.length ? "" : `<p class="empty">No watched games. Open a game and choose Start watching.</p>`}
     <ul class="list" id="watch-active">${active.map((g) => watchRowHtml(g, today)).join("")}</ul>
-    ${decided.length ? `<details class="decided" ${decidedOpen ? "open" : ""}><summary>Decided (${decided.length})</summary>
+    ${decided.length ? `<details class="decided" ${openDecided ? "open" : ""}><summary>Decided (${decided.length})</summary>
       <ul class="list">${decided.map((g) => watchRowHtml(g, today)).join("")}</ul></details>` : ""}`;
-  view.querySelector(".decided")?.addEventListener("toggle", (e) => (decidedOpen = e.target.open));
+  // Opening it from the markup fires a toggle too; only the owner's toggles are remembered.
+  view.querySelector(".decided")?.addEventListener("toggle", (e) => {
+    if (decidedOpen != null || e.target.open !== openDecided) decidedOpen = e.target.open;
+  });
 
   // Same saves as the game page: a stage change re-sorts the list, a price doesn't.
   view.querySelectorAll(".watch-row").forEach((row) => {
     const g = byId(Number(row.dataset.id));
     row.querySelector("[data-w=stage]").addEventListener("change", (e) => setStage(g, e.target.value, renderWatchlist));
-    row.querySelector("[data-act=awaiting]")?.addEventListener("click", () => setStage(g, "awaiting", renderWatchlist));
+    row.querySelectorAll("[data-hint]").forEach((b) => b.addEventListener("click", () => tapHint(b.dataset.hint, Number(row.dataset.id))));
     row.querySelector("[data-w=price]").addEventListener("change", (e) => {
       const v = e.target.value.trim() === "" ? null : Number(e.target.value);
       const patch = { targetPrice: v };
@@ -617,6 +663,30 @@ function renderWatchlist() {
       row.querySelector(".details").textContent = watchDetails(g);
     });
   });
+}
+
+/** A row's hints; a new prediction is only worth offering when the server can make one. */
+const rowHints = (g, today) => watchHints(g, today).filter((h) => h.kind !== "repredict" || state.claude.configured);
+
+/** Act on a hint's button. The game is looked up at tap time, so a reload since the render can't leave it stale. */
+function tapHint(kind, id) {
+  const g = byId(id);
+  if (!g) return;
+  if (kind === "campaignEnded") return setStage(g, "awaiting", renderWatchlist);
+  if (kind === "deliveryPassed") return setStage(g, "delivered", renderWatchlist);
+  if (kind === "owned") {
+    const score = watchHints(g, todayIso()).some((h) => h.kind === "owned" && h.score);
+    if (score) return setStage(g, null, () => (location.hash = `#/g/${g.id}`));
+    setStage(g, null, renderWatchlist);
+    toast(`Stopped watching ${g.name}. It's in Games now.`);
+  }
+}
+
+function hintHtml(g, h) {
+  const action = h.kind === "repredict"
+    ? `<a class="btn" href="#/predict/game/${g.id}">${esc(h.button)}</a>`
+    : `<button class="btn" type="button" data-hint="${h.kind}">${esc(h.button)}</button>`;
+  return `<div class="notice"><span>${esc(h.text)}</span>${action}</div>`;
 }
 
 /** "· Oct 2027 · $45.00": the row details after the stage. */
@@ -642,8 +712,7 @@ function watchRowHtml(g, today) {
       <label class="price"><input type="number" data-w="price" min="0" step="0.01" inputmode="decimal" placeholder="Target"
         aria-label="Target price for ${esc(g.name)}" value="${g.targetPrice ?? ""}"><span>${esc(targetCurrency(g))}</span></label>
     </div>
-    ${awaitingHint(g, today) ? `<div class="notice"><span>Campaign ended ${esc(g.campaignEnd)}.</span>
-      <button class="btn" type="button" data-act="awaiting">Move to Awaiting delivery?</button></div>` : ""}
+    ${rowHints(g, today).map((h) => hintHtml(g, h)).join("")}
   </li>`;
 }
 
@@ -655,7 +724,7 @@ const TAG_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12V4a1
 /** Full-width outline buttons to the game on BGG and its prices on Board Game Oracle. */
 function gameLinksHtml(bggId, name) {
   const links = [];
-  if (bggId) links.push(`<a class="btn outline" href="${bggUrl(bggId)}" target="_blank" rel="noopener">${DICE_ICON}<span>Open on BGG</span></a>`);
+  if (bggId) links.push(`<a class="btn outline" href="${esc(bggUrl(bggId))}" target="_blank" rel="noopener">${DICE_ICON}<span>Open on BGG</span></a>`);
   if (name) links.push(`<a class="btn outline" href="${esc(bgoSearchUrl(name))}" target="_blank" rel="noopener">${TAG_ICON}<span>Prices on Board Game Oracle</span></a>`);
   return links.length ? `<div class="link-stack">${links.join("")}</div>` : "";
 }
@@ -682,6 +751,9 @@ function bindClearButton(input) {
   });
   sync();
 }
+
+/** Discover's BGG search: one request in flight, and only the newest query waits behind it. Shared across renders. */
+const searchBggLatest = latestOnly((q) => api.get(`/api/bgg/search?q=${encodeURIComponent(q)}`));
 
 /**
  * Add and Predicted in one screen: with an empty search box it lists every
@@ -759,6 +831,7 @@ async function renderDiscover() {
     const q = prefs.discoverQ.trim();
     if (!bggOn || q.length < 2) {
       seq++;
+      searchBggLatest.drop();
       results.innerHTML = "";
       return;
     }
@@ -766,17 +839,17 @@ async function renderDiscover() {
       const mine = ++seq;
       results.innerHTML = `<li class="empty">Searching…</li>`;
       try {
-        const rows = await api.get(`/api/bgg/search?q=${encodeURIComponent(q)}`);
-        if (mine !== seq) return;
+        const rows = await searchBggLatest(q);
+        if (rows === SUPERSEDED || mine !== seq) return;
         const shown = rows.filter((r) => !isHiddenType(r.type, state.settings));
+        // The server knows a game this page's state lacks (added elsewhere), so fetch the state again.
+        if (shown.some((r) => r.inList && !state.games.some((g) => g.bggId === r.bggId))) refresh({ force: true });
         results.innerHTML = shown.length
           ? shown.map((r) => `<li><div class="game-row">
               <div class="info"><div class="name">${esc(r.name)}${r.type === "Expansion" ? '<span class="tag">Exp</span>' : ""}</div>
               <div class="meta">${r.year ?? ""}</div></div>
               ${predictLinkHtml(r)}
-              ${r.inList
-                ? `<a class="btn" href="#/g/${state.games.find((g) => g.bggId === r.bggId)?.id}">Open</a>`
-                : `<button class="btn primary" data-add="${r.bggId}">Add</button>`}
+              ${discoverAction(r)}
             </div></li>`).join("")
           : `<li class="empty">No matches on BGG.</li>`;
       } catch (err) {
@@ -839,18 +912,20 @@ async function renderDiscover() {
 // ---------- recommendations ----------
 
 const recommendationsOn = () => state.claude.configured && state.bgg.configured;
-let recPoll;
+const recPoll = sharedPoll(15000);
 
 /** Loads the picks into a Discover section (or a Settings card) and keeps them fresh while a run is going. */
 async function bindRecommendations(sec, { onChange } = {}) {
-  clearInterval(recPoll);
+  const me = {};
+  recPoll.claim(me);
+  const live = () => view.contains(sec);
   const list = sec.querySelector("#recs");
   const when = sec.querySelector("#rec-when");
   const refresh = sec.querySelector("#rec-refresh");
   let data = null;
 
   const draw = () => {
-    if (!view.contains(sec)) return clearInterval(recPoll);
+    if (!live()) return;
     const running = data?.running;
     refresh.disabled = !!running;
     refresh.dataset.label ??= refresh.textContent;
@@ -867,23 +942,22 @@ async function bindRecommendations(sec, { onChange } = {}) {
     try {
       data = await api.get("/api/recommendations");
     } catch (err) {
+      if (!live()) return recPoll.stop(me);
       if (!data) list.innerHTML = `<li class="empty">${esc(err.message)}</li>`;
       return;
     }
+    if (!live()) return recPoll.stop(me);
     draw();
-    if (data.running && !recPoll) recPoll = setInterval(load, 15000);
-    if (!data.running) {
-      clearInterval(recPoll);
-      recPoll = null;
-    }
+    data.running ? recPoll.start(me, load) : recPoll.stop(me);
   };
 
   refresh.addEventListener("click", async () => {
     refresh.disabled = true;
     try {
       data = await api.post("/api/recommendations/refresh", {});
+      if (!live()) return;
       draw();
-      recPoll = setInterval(load, 15000);
+      recPoll.start(me, load);
     } catch (err) {
       refresh.disabled = false;
       toast(err.message, 5000);
@@ -914,6 +988,7 @@ function recWhenHtml(d) {
   else if (d.run) parts.push(`Updated ${dateLabel(d.run.finishedAt)}`);
   if (d.lastRun?.status === "failed" && !d.running) parts.push(`<span class="tag warn">Last refresh failed</span> ${esc(d.lastRun.error || "")}`);
   if (d.nextRunAt) parts.push(`next ${dateLabel(d.nextRunAt)}`);
+  else if (d.paused) parts.push(`<span class="tag warn">Scheduled runs are paused after 2 failed runs in a row.</span> Refresh to try again; a successful run resumes the schedule.`);
   else parts.push("scheduled runs are off");
   return parts.join(" · ");
 }
@@ -976,7 +1051,51 @@ function renderSummary() {
 
 // ---------- settings ----------
 
+// One watcher follows a running BGG sync wherever the owner is, and fetches the state again when it
+// finishes, with a result or an error (a failed sync may already have saved the collection).
 let syncPoll;
+let syncSeen = null;
+
+/** Show the sync job on Settings, if Settings is open. */
+function paintSync(job) {
+  const btn = view.querySelector("#sync");
+  const el = view.querySelector("#syncstate");
+  if (!btn || !el) return;
+  btn.disabled = job.running || !state.bgg.username;
+  if (job.running) el.textContent = `${job.phase}${job.total ? ` (${job.done}/${job.total})` : ""}…`;
+  else if (job.error) el.innerHTML = `<span class="tag warn">Sync failed</span> ${esc(job.error)}`;
+  else if (job.result) el.textContent = `Last sync: ${job.result.collection} items, ${job.result.added} new, ${job.result.updated} updated, ${job.result.linked} linked, ${job.result.enriched} detailed.`;
+  else el.textContent = "";
+}
+
+async function checkSync() {
+  clearTimeout(syncPoll);
+  let job;
+  try {
+    job = await api.get("/api/bgg/sync");
+  } catch {
+    return; // server unreachable; the next resume or Settings visit looks again
+  }
+  paintSync(job);
+  const step = syncStep(syncSeen, job);
+  syncSeen = step.seen;
+  clearTimeout(syncPoll); // another check may have scheduled one while this one waited
+  if (job.running && !document.hidden) syncPoll = setTimeout(checkSync, 2000);
+  if (step.finished) {
+    if (!location.hash.startsWith("#/settings")) toast(syncToast(job), 5000);
+    refresh({ force: true });
+  }
+}
+
+/** Start a BGG sync and follow it. */
+async function startSync() {
+  const job = await api.post("/api/bgg/sync", {});
+  paintSync(job);
+  syncSeen = syncStep(syncSeen, job).seen;
+  clearTimeout(syncPoll);
+  syncPoll = setTimeout(checkSync, 1500);
+}
+
 function renderSettings() {
   const s = state.settings;
   view.innerHTML = `
@@ -1030,6 +1149,8 @@ function renderSettings() {
   form.addEventListener("input", total);
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
+    const problem = weightsProblem(Object.fromEntries(CRITERIA.map((c) => [c.key, Number(form[c.key].value)])));
+    if (problem) return toast(problem, 5000);
     if (total() !== 100 && !confirm("Weights don't total 100. Scores still work as a weighted average. Save anyway?")) return;
     try {
       state.settings = await api.put("/api/settings", {
@@ -1066,35 +1187,14 @@ function renderSettings() {
 
   const syncBtn = view.querySelector("#sync");
   if (!syncBtn) return;
-  const paint = (job) => {
-    const el = view.querySelector("#syncstate");
-    if (!el) return;
-    syncBtn.disabled = job.running || !state.bgg.username;
-    if (job.running) el.textContent = `${job.phase}${job.total ? ` (${job.done}/${job.total})` : ""}…`;
-    else if (job.error) el.innerHTML = `<span class="tag warn">Sync failed</span> ${esc(job.error)}`;
-    else if (job.result) el.textContent = `Last sync: ${job.result.collection} items, ${job.result.added} new, ${job.result.updated} updated, ${job.result.linked} linked, ${job.result.enriched} detailed.`;
-    else el.textContent = "";
-  };
-  const poll = async () => {
-    clearTimeout(syncPoll);
-    try {
-      const job = await api.get("/api/bgg/sync");
-      paint(job);
-      if (job.running && location.hash.startsWith("#/settings")) syncPoll = setTimeout(poll, 2000);
-      else if (job.result && !job.running) await reload();
-    } catch {
-      /* server unreachable; next click retries */
-    }
-  };
   syncBtn.addEventListener("click", async () => {
     try {
-      paint(await api.post("/api/bgg/sync", {}));
-      syncPoll = setTimeout(poll, 1500);
+      await startSync();
     } catch (err) {
       toast(err.message, 5000);
     }
   });
-  poll();
+  checkSync();
 }
 
 async function copyForClaude() {
@@ -1123,6 +1223,13 @@ function predictLinkHtml(r) {
   const g = state.games.find((x) => x.bggId === r.bggId);
   if (g && final(g) != null) return "";
   return `<a class="btn" href="${predictHref(g, r.bggId, r.name)}">Predict</a>`;
+}
+
+/** Open for a BGG search result already in the list, Add otherwise; a plain tag until the state has the game. */
+function discoverAction(r) {
+  if (!r.inList) return `<button class="btn primary" data-add="${r.bggId}">Add</button>`;
+  const g = state.games.find((x) => x.bggId === r.bggId);
+  return g ? `<a class="btn" href="#/g/${g.id}">Open</a>` : `<span class="tag">In list</span>`;
 }
 
 function predictHref(g, bggId, name) {
@@ -1154,9 +1261,12 @@ async function renderPrediction(kind, id, name) {
   const here = location.hash;
   const body = view.querySelector("#pbody");
 
+  let shown = [];
   const paint = (list) => {
     if (location.hash !== here) return;
+    shown = list;
     const [latest, ...older] = list;
+    const use = game ? predictionToUse(game, latest) : null;
     const scored = game && final(game) != null;
     const running = latest?.status === "running";
     const canPredict = state.claude.configured && !scored && !running;
@@ -1170,6 +1280,7 @@ async function renderPrediction(kind, id, name) {
       ${latest && !running ? predictionCardHtml(latest, game) : ""}
       ${!latest ? `<p class="small muted">Claude compares this game with every game you've scored, your taste profile and BGG's details, searches the web if it needs to, and predicts each of the seven criteria. The final score uses your weights.</p>` : ""}
       ${gameLinksHtml(bggId, game?.name || name)}
+      ${use != null ? `<div class="btn-row"><button class="btn" id="use-prediction" type="button">Use ${formatNumber(use)} as the Predicted score${game.predictedScore != null ? ` (now ${formatNumber(game.predictedScore)})` : ""}</button></div>` : ""}
       ${canPredict ? `<div class="btn-row"><button class="btn primary" id="predict" type="button">${latest ? "Predict again" : "Predict my score"}</button></div>` : ""}
       ${!game && latest?.status === "done" ? `<div class="btn-row">
           <button class="btn" type="button" data-add-as="list">Add to list</button>
@@ -1179,6 +1290,7 @@ async function renderPrediction(kind, id, name) {
           <ul class="plain">${older.map((p) => `<li>${esc(dateLabel(p.createdAt))}: ${p.status === "done" ? `<b>${formatNumber(p.final)}</b> (${esc(p.confidence)} confidence)` : `<span class="muted">${esc(p.status)}${p.error ? `: ${esc(p.error)}` : ""}</span>`}</li>`).join("")}</ul>
         </details>` : ""}`;
     body.querySelector("#predict")?.addEventListener("click", start);
+    body.querySelector("#use-prediction")?.addEventListener("click", () => usePrediction(use));
     body.querySelectorAll("[data-add-as]").forEach((b) => b.addEventListener("click", () => addPredicted(b, id)));
     if (running) predictPoll = setTimeout(load, 3000);
   };
@@ -1194,6 +1306,14 @@ async function renderPrediction(kind, id, name) {
       if (location.hash === here) body.innerHTML = `<p class="empty">${esc(e.message)}</p>`;
     }
   };
+
+  // The owner's own Predicted score stays until they choose a prediction over it.
+  function usePrediction(score) {
+    game.predictedScore = score;
+    queueSave(game.id, { predictedScore: score });
+    paint(shown);
+    toast(`Predicted score is now ${formatNumber(score)}.`);
+  }
 
   async function start(e) {
     e.target.disabled = true;
@@ -1344,11 +1464,15 @@ function recommendSettingsHtml() {
   }
   return `<section class="card" id="recsec">
     <h2 style="margin-top:0">Recommendations</h2>
-    <p class="small muted">Claude nominates games you don't have, each gets a prediction, and the five highest show on Discover. A run is about ${s.recommendNominees} predictions' worth of tokens.</p>
+    <p class="small muted">Claude nominates games you don't have, each gets a prediction, and the five highest show on Discover. A run is about ${s.recommendNominees} predictions' worth of tokens, and counts toward the daily prediction cap below.</p>
     <label class="field"><span>How often</span>
       <select id="rec-freq">${RECOMMEND_FREQUENCIES.map((f) => `<option value="${f.key}" ${s.recommendFrequency === f.key ? "selected" : ""}>${f.label}</option>`).join("")}</select></label>
     <label class="field"><span>Games Claude nominates per run (5–20)</span>
       <input type="number" id="rec-count" min="5" max="20" step="1" inputmode="numeric" value="${s.recommendNominees}"></label>
+    <label class="field"><span>Daily prediction cap (5–100)</span>
+      <input type="number" id="rec-cap" min="5" max="100" step="1" inputmode="numeric" value="${s.dailyPredictionCap}"></label>
+    <p class="small muted">The most Claude conversations started in any 24 hours: each prediction, manual or in a run, and each run's nomination counts as one. A run needs 5 left to start.</p>
+    <p class="small muted" id="rec-budget"></p>
     <p class="small muted">Scheduled runs start at 4 am server time. More nominees cost more and give the top five more to choose from.</p>
     <div class="btn-row"><button class="btn primary" id="rec-refresh" type="button">Refresh now</button></div>
     <p class="small muted" id="rec-when"></p>
@@ -1387,6 +1511,11 @@ async function bindRecommendSettings() {
     if (!Number.isInteger(n) || n < 5 || n > 20) return toast("Nominees must be a whole number from 5 to 20", 4000);
     save({ recommendNominees: n }, "Nominee count saved");
   });
+  sec.querySelector("#rec-cap").addEventListener("change", (e) => {
+    const n = Number(e.target.value);
+    if (!Number.isInteger(n) || n < 5 || n > 100) return toast("The daily prediction cap must be a whole number from 5 to 100", 4000);
+    save({ dailyPredictionCap: n }, "Daily prediction cap saved");
+  });
 
   const dismissed = sec.querySelector("#rec-dismissed");
   const drawDismissed = (rows) => {
@@ -1411,6 +1540,9 @@ async function bindRecommendSettings() {
     try {
       const [rows, view] = await Promise.all([api.get("/api/recommendations/runs"), api.get("/api/recommendations")]);
       sec.querySelector("#rec-when").innerHTML = recWhenHtml(view);
+      const b = view.budget;
+      sec.querySelector("#rec-budget").textContent =
+        `Predictions in the last 24 hours: ${b.used} of ${b.cap}` + (!b.left && b.freesAt ? `. The next one frees up ${new Date(b.freesAt).toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" })}.` : "");
       runs.innerHTML = rows.length
         ? `<table><tbody>${rows.slice(0, 20).map((r) => {
             const cost = runCost(r);
@@ -1435,6 +1567,43 @@ async function bindRecommendSettings() {
   bindRecommendations(sec, { onChange: (d) => d.running || loadRuns() });
 }
 
+/** A signed figure, + for positive: how far Claude's predicted score sits above or below. */
+const signed = (x, digits = 1) => (x == null ? "—" : `${x > 0 ? "+" : ""}${formatNumber(x, digits)}`);
+const gamesLabel = (n) => `${n} ${n === 1 ? "game" : "games"}`;
+
+/** Settings → Accuracy: the headline with bias, the baselines, the criterion and confidence tables, then each game. */
+function accuracyHtml(acc) {
+  if (!acc.n) return "No games scored after a prediction yet. Once you score a game Claude predicted, it shows up here.";
+  const lean = acc.bias > 0 ? `Claude runs <b>${formatNumber(acc.bias, 2)} high</b>.`
+    : acc.bias < 0 ? `Claude runs <b>${formatNumber(-acc.bias, 2)} low</b>.`
+    : "Claude runs neither high nor low.";
+  const { mean, bggAvg } = acc.baselines;
+  const sameGames = (b) => (b.n === acc.n ? `${gamesLabel(b.n)}` : `${gamesLabel(b.n)}; Claude ${formatNumber(b.claudeMeanAbsError, 2)} on the same ${b.n}`);
+  const baselines = [
+    mean.n ? `<p>Guessing your average Tablescore every time: off by ${formatNumber(mean.meanAbsError, 2)} (${sameGames(mean)}).</p>` : "",
+    bggAvg.n ? `<p>A straight line from BGG's average: off by ${formatNumber(bggAvg.meanAbsError, 2)} (${sameGames(bggAvg)}).</p>` : "",
+  ].join("");
+  const name = Object.fromEntries(CRITERIA.map((c) => [c.key, c.name]));
+  return `
+    <p>Off by <b>${formatNumber(acc.meanAbsError, 2)}</b> on average across ${gamesLabel(acc.n)} you scored after a prediction. ${lean}</p>
+    ${baselines}
+    <h4>By criterion</h4>
+    <table>
+      <thead><tr><th>Criterion</th><th class="num">Weight</th><th class="num">Bias</th><th class="num">Off by</th><th class="num">n</th></tr></thead>
+      <tbody>${acc.criteria.map((c) => `<tr><td>${esc(name[c.key])}</td><td class="num">${state.settings.weights[c.key]}%</td>
+        <td class="num">${signed(c.bias, 2)}</td><td class="num">${formatNumber(c.meanAbsError, 2)}</td><td class="num">${c.n}</td></tr>`).join("")}</tbody>
+    </table>
+    <h4>By confidence</h4>
+    <table>
+      <thead><tr><th>Confidence</th><th class="num">n</th><th class="num">Off by</th><th class="num">Bias</th></tr></thead>
+      <tbody>${acc.byConfidence.map((c) => `<tr><td>${c.confidence[0].toUpperCase()}${c.confidence.slice(1)}</td>
+        <td class="num">${c.n}</td><td class="num">${formatNumber(c.meanAbsError, 2)}</td><td class="num">${signed(c.bias, 2)}</td></tr>`).join("")}</tbody>
+    </table>
+    <h4>By game</h4>
+    <table><tbody>${acc.pairs.map((x) => `<tr><td><a href="#/g/${x.gameId}">${esc(x.name)}</a></td>
+      <td class="num">${formatNumber(x.predicted)} → ${formatNumber(x.actual)}</td><td class="num">${signed(x.error)}</td></tr>`).join("")}</tbody></table>`;
+}
+
 async function bindClaudeSettings() {
   const save = view.querySelector("#taste-save");
   if (!save) return;
@@ -1450,11 +1619,7 @@ async function bindClaudeSettings() {
   const box = view.querySelector("#accuracy");
   try {
     const acc = await api.get("/api/predictions/accuracy");
-    box.innerHTML = acc.n
-      ? `<p>Off by <b>${formatNumber(acc.meanAbsError, 2)}</b> on average across ${acc.n} ${acc.n === 1 ? "game" : "games"} you scored after a prediction.</p>
-         <table><tbody>${acc.pairs.map((x) => `<tr><td><a href="#/g/${x.gameId}">${esc(x.name)}</a></td>
-           <td class="num">${formatNumber(x.predicted)} → ${formatNumber(x.actual)}</td><td class="num">${x.error > 0 ? "+" : ""}${formatNumber(x.error)}</td></tr>`).join("")}</tbody></table>`
-      : "No games scored after a prediction yet. Once you score a game Claude predicted, it shows up here.";
+    box.innerHTML = accuracyHtml(acc);
   } catch (err) {
     box.textContent = err.message;
   }
@@ -1554,11 +1719,11 @@ document.getElementById("more-copy").addEventListener("click", () => {
   closeMore();
   copyForClaude();
 });
-// Settings polls the running sync and shows its progress.
+// The sync watcher follows the sync; Settings shows its progress.
 document.getElementById("more-sync").addEventListener("click", async () => {
   closeMore();
   try {
-    await api.post("/api/bgg/sync", {});
+    await startSync();
     if (location.hash.startsWith("#/settings")) route();
     else location.hash = "#/settings";
   } catch (err) {
@@ -1568,16 +1733,89 @@ document.getElementById("more-sync").addEventListener("click", async () => {
 
 // ---------- boot ----------
 
-async function reload() {
-  state = await api.get("/api/state");
+let loadedAt = 0; // when the state was last fetched; 0 = never
+let booted = false; // the first fetch succeeded, so screens have real state to show
+let booting = null;
+let refreshing = null;
+let refreshOwed = false; // a refresh was skipped for an unsent edit or a focused field
+
+/** Fold fetched state in. Games already loaded keep their objects, so an open page stays attached, and keep unsent edits. */
+function takeState(fresh) {
+  fresh.games = mergeGames(state.games, fresh.games, saves.unsent);
+  state = fresh;
+  loadedAt = Date.now();
 }
 
-(async () => {
-  view.innerHTML = `<p class="empty">Loading…</p>`;
-  try {
-    await reload();
-    route();
-  } catch (e) {
-    view.innerHTML = `<p class="empty">Can't reach the Tablescore server (${esc(e.message)}). Check that it's running and you're on your tailnet.</p>`;
+/** Fetch the state again, without repainting. */
+async function reload() {
+  takeState(await api.get("/api/state"));
+}
+
+const refreshAllowed = () => canRefresh({ busy: saves.busy(), focused: document.activeElement });
+
+/**
+ * Fetch the state again if it is stale (or `force`), then repaint the open screen. Skipped, and owed
+ * to the next navigation or trigger, while the save queue is busy or a field has focus. It never
+ * runs when the queue drains, which would rebuild the scorer between two slider drags.
+ */
+function refresh({ force = false } = {}) {
+  if (refreshing) return refreshing;
+  if (!booted || (!force && !isStale(loadedAt, Date.now()))) return Promise.resolve();
+  if (!refreshAllowed()) {
+    refreshOwed = true;
+    return Promise.resolve();
   }
-})();
+  refreshing = (async () => {
+    let fresh;
+    try {
+      fresh = await api.get("/api/state");
+    } catch {
+      return; // unreachable; the next trigger tries again
+    }
+    // The owner may have started typing or editing while the fetch was out.
+    if (!refreshAllowed()) {
+      refreshOwed = true;
+      return;
+    }
+    takeState(fresh);
+    refreshOwed = false;
+    if (repaintsAfterRefresh(location.hash)) repaint();
+  })().finally(() => (refreshing = null));
+  return refreshing;
+}
+
+/** Render the open screen again from the current state, keeping the scroll position and open sections. */
+function repaint() {
+  show(window.scrollY, [...view.querySelectorAll("details")].map((d) => d.open));
+}
+
+/** The app came back into view or online: load it if it never loaded, otherwise catch up. */
+function resume() {
+  if (!booted) return void boot();
+  refresh();
+  checkSync();
+}
+
+/** The first load. Until it succeeds no screen renders, and the error offers Try again. */
+function boot() {
+  if (booted) return Promise.resolve();
+  if (booting) return booting;
+  booting = (async () => {
+    view.innerHTML = `<p class="empty">Loading…</p>`;
+    try {
+      await reload();
+    } catch (e) {
+      view.innerHTML = `<p class="empty">Can't reach the Tablescore server (${esc(e.message)}). Check that it's running and you're on your tailnet.</p>
+        <div class="btn-row boot-retry"><button class="btn primary" id="boot-retry" type="button">Try again</button></div>`;
+      view.querySelector("#boot-retry").addEventListener("click", () => boot());
+      return;
+    }
+    booted = true;
+    show(0);
+    checkSync();
+  })().finally(() => (booting = null));
+  return booting;
+}
+
+stampEntry(null);
+boot();

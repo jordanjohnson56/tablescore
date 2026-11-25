@@ -11,6 +11,7 @@
     "export-watchlist": "node --disable-warning=ExperimentalWarning server/export-watchlist.js",
     "sync-watchlist": "scripts/sync-watchlist.sh",
     "import-watchlist": "node --disable-warning=ExperimentalWarning server/import-watchlist.js",
+    "restore": "node --disable-warning=ExperimentalWarning server/restore.js",
     "test": "node --disable-warning=ExperimentalWarning --test"
   },
   "dependencies": {

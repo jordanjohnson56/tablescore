@@ -5,14 +5,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { strToU8, zipSync } from "fflate";
-import { openDb } from "../server/db.js";
-import { BggClient } from "../server/bgg.js";
+import { openDb, parseBackupKeep, Store } from "../server/db.js";
+import { BggClient, BggError } from "../server/bgg.js";
 import { createApp } from "../server/app.js";
 import { syncCollection } from "../server/sync.js";
 import { readWorkbook, importInto } from "../server/import-xlsx.js";
 import { readXlsx } from "../server/xlsx.js";
 import { watchlistExport, writeWatchlist } from "../server/export-watchlist.js";
 import { importWatchlist, readWatchlistFile } from "../server/import-watchlist.js";
+import { GAME_TYPES, STATUSES } from "../public/js/watchlist.js";
+import { DEFAULT_SETTINGS } from "../public/js/rubric.js";
 
 // ---------- synthetic BGG responses (shapes copied from the XML API2 docs) ----------
 
@@ -69,17 +71,22 @@ const SEARCH = `<?xml version="1.0" encoding="utf-8"?>
   <item type="boardgameexpansion" id="926"><name type="primary" value="Catan: Seafarers"/><yearpublished value="1997"/></item>
 </items>`;
 
-function fakeBgg(routes) {
+/**
+ * A fake BGG answering by endpoint. A route returns a body, a bare status, or
+ * { status, body }, and may throw to stand for a network failure.
+ */
+function fakeBgg(routes, options = {}) {
   const calls = [];
   const fetchImpl = async (url, opts) => {
-    calls.push({ url, auth: opts.headers.Authorization });
+    calls.push({ url, auth: opts.headers.Authorization, signal: opts.signal });
     const u = new URL(url);
     const key = u.pathname.split("/").pop();
-    const body = routes[key](u.searchParams, calls.length);
+    const body = await routes[key](u.searchParams, calls.length);
     if (typeof body === "number") return new Response("", { status: body });
+    if (typeof body === "object") return new Response(body.body ?? "", { status: body.status });
     return new Response(body, { status: 200 });
   };
-  const client = new BggClient({ token: "tok", fetchImpl, spacingMs: 0, retryMs: 0, sleep: async () => {} });
+  const client = new BggClient({ token: "tok", fetchImpl, spacingMs: 0, retryMs: 0, sleep: async () => {}, ...options });
   return { client, calls };
 }
 
@@ -99,9 +106,9 @@ const defaultRoutes = () => {
   };
 };
 
-async function startApp({ withBgg = true, file = ":memory:" } = {}) {
+async function startApp({ withBgg = true, file = ":memory:", routes = defaultRoutes() } = {}) {
   const store = openDb(file);
-  const { client, calls } = fakeBgg(defaultRoutes());
+  const { client, calls } = fakeBgg(routes);
   const bgg = withBgg ? client : new BggClient({});
   const app = createApp({ store, bgg, bggUsername: "tester" });
   const server = await new Promise((r) => {
@@ -117,7 +124,7 @@ async function startApp({ withBgg = true, file = ":memory:" } = {}) {
     const text = await res.text();
     return { status: res.status, body: text ? JSON.parse(text) : null };
   };
-  return { store, calls, call, close: () => (server.close(), store.db.close()) };
+  return { store, calls, call, base, close: () => (server.close(), store.db.close()) };
 }
 
 // ---------- BGG client ----------
@@ -156,6 +163,122 @@ test("things batches ids 20 at a time", async () => {
 
 test("a missing token fails clearly without calling BGG", async () => {
   await assert.rejects(new BggClient({}).search("catan"), /BGG_TOKEN/);
+});
+
+test("overlapping requests start a full spacing apart, in arrival order", async () => {
+  const sleeps = [];
+  const { client } = fakeBgg({ hot: () => "<items></items>" }, { spacingMs: 5000, now: () => 100000, sleep: async (ms) => void sleeps.push(ms) });
+  await Promise.all([client.hot(), client.hot(), client.hot()]);
+  assert.deepEqual(sleeps, [5000, 10000]);
+});
+
+test("a 429 pushes back the next request of every caller", async () => {
+  const sleeps = [];
+  let hits = 0;
+  const routes = { ...defaultRoutes(), hot: () => (++hits === 1 ? 429 : "<items></items>") };
+  const { client } = fakeBgg(routes, { spacingMs: 1000, retryMs: 5000, now: () => 100000, sleep: async (ms) => void sleeps.push(ms) });
+  await client.get("hot", {}); // 429, then OK
+  sleeps.length = 0;
+  await client.search("catan"); // another caller
+  assert.ok(sleeps[0] >= 10000, `the next caller waited ${sleeps[0]} ms`);
+});
+
+test("a collection still queued after the last retry fails instead of reading as empty", async () => {
+  const { client, calls } = fakeBgg({ collection: () => 202 }, { maxRetries: 3 });
+  await assert.rejects(client.collection("tester"), (e) => e instanceof BggError && /still preparing/.test(e.message));
+  assert.equal(calls.length, 4);
+  const onlyExp = fakeBgg({ collection: (p) => (p.get("subtype") === "boardgameexpansion" ? 202 : COLLECTION_BASE) }, { maxRetries: 2 });
+  await assert.rejects(onlyExp.client.collection("tester"), /still preparing/);
+});
+
+test("a 429 after the last retry says BGG is rate limiting", async () => {
+  const { client } = fakeBgg({ hot: () => 429 }, { maxRetries: 1 });
+  await assert.rejects(client.get("hot", {}), (e) => e instanceof BggError && /rate limit/i.test(e.message));
+});
+
+test("BGG's own error text comes through in every shape", async () => {
+  const element = `<?xml version="1.0" encoding="utf-8"?><errors><error><message>Invalid username specified</message></error></errors>`;
+  const attribute = `<error message="Invalid username specified"/>`;
+  for (const body of [element, attribute, { status: 400, body: element }, { status: 400, body: attribute }]) {
+    const { client } = fakeBgg({ collection: () => body });
+    await assert.rejects(client.collection("nobody"), (e) => e instanceof BggError && /Invalid username specified/.test(e.message));
+  }
+  const two = `<errors><error><message>First</message></error><error><message>Second</message></error></errors>`;
+  await assert.rejects(fakeBgg({ hot: () => two }).client.get("hot", {}), /First/);
+  await assert.rejects(fakeBgg({ hot: () => "<errors></errors>" }).client.get("hot", {}), /unknown error/);
+  await assert.rejects(fakeBgg({ hot: () => ({ status: 404, body: "<html>nope</html>" }) }).client.get("hot", {}), /HTTP 404/);
+});
+
+test("a success with no items root is refused, while an empty items root is an empty list", async () => {
+  await assert.rejects(fakeBgg({ hot: () => "<something/>" }).client.hot(), (e) => e instanceof BggError);
+  await assert.rejects(fakeBgg({ hot: () => "" }).client.hot(), (e) => e instanceof BggError);
+  const { client } = fakeBgg({ collection: () => COLLECTION_EXP });
+  assert.deepEqual(await client.collection("tester"), []);
+});
+
+test("network failures and timeouts become BggErrors after one more try", async () => {
+  const failing = fakeBgg({
+    search: () => {
+      throw new TypeError("fetch failed");
+    },
+  });
+  await assert.rejects(failing.client.search("catan"), (e) => e instanceof BggError && /Couldn't reach BGG/.test(e.message));
+  assert.equal(failing.calls.length, 2);
+  assert.ok(failing.calls[0].signal instanceof AbortSignal, "each attempt has a timeout signal");
+
+  const slow = fakeBgg(
+    {
+      search: () => {
+        throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+      },
+    },
+    { timeoutMs: 15000 },
+  );
+  await assert.rejects(slow.client.search("catan"), (e) => e instanceof BggError && /didn't answer within 15 s/.test(e.message));
+
+  let hits = 0;
+  const once = fakeBgg({
+    search: () => {
+      if (++hits === 1) throw new TypeError("fetch failed");
+      return SEARCH;
+    },
+  });
+  assert.equal((await once.client.search("catan")).length, 2);
+  assert.equal(once.calls.length, 2);
+
+  const flaky = fakeBgg({ hot: (_p, n) => (n === 1 ? 503 : "<items></items>") });
+  assert.deepEqual(await flaky.client.hot(), []);
+  assert.equal(flaky.calls.length, 2);
+});
+
+test("searches are cached per trimmed, lower-cased query, and failures are not", async () => {
+  let fail = true;
+  const { client, calls } = fakeBgg({
+    search: () => {
+      if (fail) return { status: 500, body: "" };
+      return SEARCH;
+    },
+  });
+  await assert.rejects(client.search("Catan"), /HTTP 500/);
+  fail = false;
+  const [a, b] = await Promise.all([client.search("Catan"), client.search(" catan ")]);
+  assert.deepEqual(a, b);
+  assert.equal(calls.length, 3); // two failed attempts, then one shared search
+  a.pop();
+  assert.equal((await client.search("CATAN")).length, 2, "callers get their own copy");
+  assert.equal(calls.length, 3);
+});
+
+test("a cached search expires after its time", async () => {
+  let t = 0;
+  const { client, calls } = fakeBgg({ search: () => SEARCH }, { now: () => t, searchCacheMs: 1000 });
+  await client.search("catan");
+  t = 999;
+  await client.search("catan");
+  assert.equal(calls.length, 1);
+  t = 1000;
+  await client.search("catan");
+  assert.equal(calls.length, 2);
 });
 
 // ---------- API ----------
@@ -239,6 +362,8 @@ test("sync adds new games, updates existing ones and leaves scores alone", async
     }
     assert.equal(job.error, null);
     assert.deepEqual(job.result, { collection: 2, added: 1, updated: 1, linked: 0, enriched: 2 });
+    assert.equal(job.running, false);
+    assert.ok(job.finishedAt, "a finished sync has a finishedAt");
     const catan = t.store.getByBggId(13);
     assert.equal(catan.name, "Catan (my name)");
     assert.equal(catan.plays, 9);
@@ -248,6 +373,27 @@ test("sync adds new games, updates existing ones and leaves scores alone", async
     assert.equal(catan.bggWeight, 2.35);
     assert.equal(catan.bestPlayers, "3");
     assert.equal(t.store.getByBggId(999).status, "Wishlist");
+  } finally {
+    t.close();
+  }
+});
+
+test("a sync that fails after saving the collection still finishes, with an error and a finishedAt", async () => {
+  const routes = { ...defaultRoutes(), thing: () => 400 };
+  const t = await startApp({ routes });
+  try {
+    await t.call("POST", "/api/bgg/sync", {});
+    let job;
+    for (let i = 0; i < 50; i++) {
+      job = (await t.call("GET", "/api/bgg/sync")).body;
+      if (!job.running) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.equal(job.running, false);
+    assert.match(job.error, /HTTP 400/);
+    assert.ok(job.finishedAt, "a failed sync has a finishedAt");
+    // The collection phase committed before the failure, so the client has to refetch state.
+    assert.equal(t.store.getByBggId(13).plays, 9);
   } finally {
     t.close();
   }
@@ -311,6 +457,102 @@ test("sync links a watched game with no BGG ID by exact name, then fetches its t
   assert.equal(store.getGame(unwatched.id).bggId, null);
 });
 
+/** A BGG stub whose collection is `items`, recording every search. */
+function collectionBgg(items) {
+  const searched = [];
+  return {
+    searched,
+    collection: async () => items,
+    search: async (q) => {
+      searched.push(q);
+      return items.filter((i) => i.name.toLowerCase() === q.toLowerCase()).map(({ bggId, name, type }) => ({ bggId, name, type }));
+    },
+    things: async () => [],
+  };
+}
+
+test("sync links a watched game with no BGG ID to the same-named new collection item instead of adding a twin", async () => {
+  const store = openDb(":memory:");
+  const watched = store.createGame({ name: "excursions ", watchStage: "campaign", notes: "keep", predictedScore: 7.3 });
+  const before = store.getGame(watched.id);
+  const bgg = collectionBgg([{ bggId: 77, name: "Excursions", type: "Base", status: "Wishlist", plays: 0, thumbnail: "https://img/77.jpg" }]);
+
+  const out = await syncCollection(store, bgg, "me");
+  assert.deepEqual(out, { collection: 1, added: 0, updated: 0, linked: 1, enriched: 0 });
+  assert.deepEqual(bgg.searched, []);
+  assert.equal(store.listGames().length, 1);
+  const after = store.getGame(watched.id);
+  assert.equal(after.bggId, 77);
+  assert.equal(after.status, "Wishlist");
+  assert.equal(after.thumbnail, "https://img/77.jpg");
+  assert.equal(after.name, before.name);
+  assert.equal(after.watchStage, "campaign");
+  assert.equal(after.notes, "keep");
+  assert.equal(after.predictedScore, 7.3);
+
+  const again = await syncCollection(store, bgg, "me");
+  assert.deepEqual(again, { collection: 1, added: 0, updated: 1, linked: 0, enriched: 0 });
+  assert.equal(store.listGames().length, 1);
+});
+
+test("sync adds the collection item when two unlinked watched games share its name", async () => {
+  const store = openDb(":memory:");
+  const a = store.createGame({ name: "Excursions", watchStage: "campaign" });
+  const b = store.createGame({ name: "excursions", watchStage: "delivered" });
+  const out = await syncCollection(store, collectionBgg([{ bggId: 77, name: "Excursions", type: "Base", status: "Wishlist" }]), "me");
+  assert.equal(out.added, 1);
+  assert.equal(out.linked, 0);
+  assert.equal(store.getGame(a.id).bggId, null);
+  assert.equal(store.getGame(b.id).bggId, null);
+});
+
+test("sync adds both items when two new collection items share a watched game's name", async () => {
+  const store = openDb(":memory:");
+  const w = store.createGame({ name: "Excursions", watchStage: "campaign" });
+  const out = await syncCollection(store, collectionBgg([
+    { bggId: 3, name: "Excursions", type: "Base", status: "Wishlist" },
+    { bggId: 4, name: "Excursions", type: "Base", status: "Owned" },
+  ]), "me");
+  assert.equal(out.added, 2);
+  assert.equal(out.linked, 0);
+  assert.equal(store.getGame(w.id).bggId, null);
+  assert.equal(store.listGames().length, 3);
+});
+
+test("sync links a watched game when one BGG ID appears twice in the collection", async () => {
+  const store = openDb(":memory:");
+  const w = store.createGame({ name: "Excursions", watchStage: "buy" });
+  const out = await syncCollection(store, collectionBgg([
+    { bggId: 77, name: "Excursions", type: "Base", status: "Owned" },
+    { bggId: 77, name: "Excursions", type: "Base", status: "Owned" },
+  ]), "me");
+  assert.equal(out.added, 0);
+  assert.equal(out.updated, 1);
+  assert.equal(out.linked, 1);
+  assert.equal(store.getGame(w.id).bggId, 77);
+  assert.equal(store.listGames().length, 1);
+});
+
+test("sync prefers a game that already holds the item's BGG ID over a same-named watched game", async () => {
+  const store = openDb(":memory:");
+  const known = store.createGame({ name: "Catan", bggId: 13 });
+  const w = store.createGame({ name: "Catan", watchStage: "campaign" });
+  const out = await syncCollection(store, collectionBgg([{ bggId: 13, name: "Catan", type: "Base", status: "Owned" }]), "me");
+  assert.equal(out.updated, 1);
+  assert.equal(out.added, 0);
+  assert.equal(store.getGame(known.id).status, "Owned");
+  assert.equal(store.getGame(w.id).bggId, null);
+});
+
+test("sync does not link an unwatched game with no BGG ID by name", async () => {
+  const store = openDb(":memory:");
+  const g = store.createGame({ name: "Excursions" });
+  const out = await syncCollection(store, collectionBgg([{ bggId: 77, name: "Excursions", type: "Base", status: "Owned" }]), "me");
+  assert.equal(out.added, 1);
+  assert.equal(out.linked, 0);
+  assert.equal(store.getGame(g.id).bggId, null);
+});
+
 test("linking a game to a BGG id fills in its details and keeps its name", async () => {
   const t = await startApp();
   try {
@@ -348,6 +590,64 @@ test("add from BGG fills in details and is idempotent", async () => {
     const s = await t.call("GET", "/api/bgg/search?q=catan");
     assert.equal(s.body.length, 2);
     assert.equal(s.body[1].type, "Expansion");
+  } finally {
+    t.close();
+  }
+});
+
+/** Start a sync through the API and wait for the job to stop. */
+async function syncJob(t) {
+  assert.equal((await t.call("POST", "/api/bgg/sync", {})).status, 202);
+  for (let i = 0; i < 100; i++) {
+    const job = (await t.call("GET", "/api/bgg/sync")).body;
+    if (!job.running) return job;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  throw new Error("sync never finished");
+}
+
+test("a sync whose collection BGG is still preparing fails and writes nothing", async () => {
+  for (const collection of [() => 202, (p) => (p.get("subtype") === "boardgameexpansion" ? 202 : COLLECTION_BASE)]) {
+    const t = await startApp({ routes: { ...defaultRoutes(), collection } });
+    try {
+      const catan = t.store.createGame({ name: "Catan", bggId: 13, plays: 1 });
+      const job = await syncJob(t);
+      assert.match(job.error, /still preparing the collection/);
+      assert.equal(job.result, null);
+      assert.equal(t.store.listGames().length, 1);
+      assert.deepEqual(t.store.getGame(catan.id), catan);
+    } finally {
+      t.close();
+    }
+  }
+});
+
+test("a BGG network failure in Discover search answers 502 with a message", async () => {
+  const routes = {
+    ...defaultRoutes(),
+    search: () => {
+      throw new TypeError("fetch failed");
+    },
+  };
+  const t = await startApp({ routes });
+  try {
+    const r = await t.call("GET", "/api/bgg/search?q=catan");
+    assert.equal(r.status, 502);
+    assert.match(r.body.error, /Couldn't reach BGG/);
+  } finally {
+    t.close();
+  }
+});
+
+test("a repeated Discover search comes from the cache and still marks games in your list", async () => {
+  const t = await startApp();
+  try {
+    const first = await t.call("GET", "/api/bgg/search?q=Catan");
+    assert.equal(first.body[0].inList, false);
+    t.store.createGame({ name: "Catan", bggId: 13 });
+    const second = await t.call("GET", "/api/bgg/search?q=%20catan%20");
+    assert.equal(second.body[0].inList, true);
+    assert.equal(t.calls.filter((c) => c.url.includes("/search?")).length, 1);
   } finally {
     t.close();
   }
@@ -455,6 +755,98 @@ test("backups keep only the newest N daily files", () => {
   assert.equal(copy.listGames()[0].name, "A");
 });
 
+test("BACKUP_KEEP accepts only a whole number of 1 or more", () => {
+  for (const raw of [undefined, null, "", "  "]) assert.deepEqual(parseBackupKeep(raw), { keep: 14, invalid: false }, String(raw));
+  for (const [raw, keep] of [["1", 1], ["14", 14], [" 30 ", 30]]) assert.deepEqual(parseBackupKeep(raw), { keep, invalid: false }, raw);
+  for (const raw of ["0", "-1", "two", "14d", "2.5", "1e2", "0x10", "Infinity", "99999999999999999999"]) {
+    assert.deepEqual(parseBackupKeep(raw), { keep: 14, invalid: true }, raw);
+  }
+});
+
+const day = (y, m, d) => new Date(Date.UTC(y, m - 1, d));
+const fakeStore = (run) => new Store({ prepare: () => ({ run }) });
+
+test("a backup refuses a keep that is not a whole number of 1 or more, touching nothing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ts-bk-"));
+  writeFileSync(join(dir, "tablescore-2026-01-01.db"), "a");
+  writeFileSync(join(dir, "tablescore-2026-01-02.db"), "b");
+  const store = openDb(":memory:");
+  for (const keep of [0, -1, NaN, 2.5, Infinity, "3", null]) {
+    assert.throws(() => store.backup(dir, keep, day(2026, 1, 3)), RangeError, String(keep));
+    assert.deepEqual(readdirSync(dir).sort(), ["tablescore-2026-01-01.db", "tablescore-2026-01-02.db"]);
+  }
+});
+
+test("a backup with keep 1 keeps exactly the newest", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ts-bk-"));
+  const store = openDb(":memory:");
+  for (let d = 1; d <= 3; d++) store.backup(dir, 1, day(2026, 1, d));
+  assert.deepEqual(readdirSync(dir), ["tablescore-2026-01-03.db"]);
+});
+
+test("a backup never deletes the file it just wrote, even when later-dated backups exist", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ts-bk-"));
+  writeFileSync(join(dir, "tablescore-2027-01-01.db"), "a");
+  writeFileSync(join(dir, "tablescore-2027-01-02.db"), "b");
+  const file = openDb(":memory:").backup(dir, 1, day(2026, 1, 5));
+  assert.equal(file, join(dir, "tablescore-2026-01-05.db"));
+  assert.deepEqual(readdirSync(dir).sort(), ["tablescore-2026-01-05.db", "tablescore-2027-01-02.db"]);
+});
+
+test("a failed snapshot keeps today's earlier backup and prunes nothing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ts-bk-"));
+  const store = openDb(":memory:");
+  store.createGame({ name: "A" });
+  store.backup(dir, 14, day(2026, 1, 1));
+  const file = store.backup(dir, 14, day(2026, 1, 2));
+  const before = readFileSync(file);
+  assert.throws(() => fakeStore(() => { throw new Error("disk full"); }).backup(dir, 1, day(2026, 1, 2)), /disk full/);
+  assert.deepEqual(readFileSync(file), before);
+  assert.deepEqual(readdirSync(dir).sort(), ["tablescore-2026-01-01.db", "tablescore-2026-01-02.db"]);
+});
+
+test("a snapshot that fails its check is rejected and leaves no temporary file", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ts-bk-"));
+  const store = openDb(":memory:");
+  store.createGame({ name: "A" });
+  store.backup(dir, 14, day(2026, 1, 1));
+  const file = store.backup(dir, 14, day(2026, 1, 2));
+  const before = readFileSync(file);
+  assert.throws(() => fakeStore((path) => writeFileSync(path, "not a database")).backup(dir, 1, day(2026, 1, 2)));
+  assert.deepEqual(readFileSync(file), before);
+  assert.deepEqual(readdirSync(dir).sort(), ["tablescore-2026-01-01.db", "tablescore-2026-01-02.db"]);
+});
+
+test("a second backup on the same day replaces the first", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ts-bk-"));
+  const store = openDb(":memory:");
+  store.createGame({ name: "A" });
+  store.backup(dir, 14, day(2026, 1, 1));
+  store.createGame({ name: "B" });
+  const file = store.backup(dir, 14, day(2026, 1, 1));
+  assert.deepEqual(readdirSync(dir), ["tablescore-2026-01-01.db"]);
+  assert.deepEqual(openDb(file).listGames().map((g) => g.name).sort(), ["A", "B"]);
+});
+
+test("a backup sweeps temporary files left by an interrupted run", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ts-bk-"));
+  writeFileSync(join(dir, "tablescore-2025-12-31.db.tmp"), "junk");
+  writeFileSync(join(dir, "tablescore-2026-01-01.db.tmp"), "junk");
+  writeFileSync(join(dir, "tablescore-2026-01-01.db.tmp-journal"), "junk");
+  openDb(":memory:").backup(dir, 14, day(2026, 1, 1));
+  assert.deepEqual(readdirSync(dir), ["tablescore-2026-01-01.db"]);
+});
+
+test("a backup of a file-backed store leaves only the backup file", () => {
+  const live = mkdtempSync(join(tmpdir(), "ts-live-"));
+  const dir = mkdtempSync(join(tmpdir(), "ts-bk-"));
+  const store = openDb(join(live, "live.db"));
+  store.createGame({ name: "A" });
+  const file = store.backup(dir, 14, day(2026, 1, 1));
+  assert.deepEqual(readdirSync(dir), ["tablescore-2026-01-01.db"]);
+  assert.equal(openDb(file).listGames()[0].name, "A");
+});
+
 test("import explains a folder, missing path or non-xlsx file instead of crashing", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ts-imp-"));
   await assert.rejects(readWorkbook(dir), /is a folder, not a spreadsheet/);
@@ -513,6 +905,173 @@ test("hideExpansions setting persists and is validated", async () => {
   }
 });
 
+// ---------- input validation ----------
+
+test("PUT /api/settings rejects weights that are missing, malformed, out of range or total 0, and saves nothing", async () => {
+  const t = await startApp();
+  try {
+    const w = DEFAULT_SETTINGS.weights;
+    const { theme, ...missing } = w;
+    const bad = [
+      Object.fromEntries(Object.keys(w).map((k) => [k, 0])),
+      null,
+      "40,15,10,10,10,10,5",
+      [40, 15, 10, 10, 10, 10, 5],
+      missing,
+      { ...w, art: -1 },
+      { ...w, art: 1001 },
+      { ...w, art: "10" },
+    ];
+    for (const weights of bad) {
+      const r = await t.call("PUT", "/api/settings", { weights, stretch: 2 });
+      assert.equal(r.status, 400, JSON.stringify(weights));
+      assert.match(r.body.error, /weights/);
+    }
+    // JSON.parse reads 1e999 as Infinity, which JSON.stringify can't send.
+    const raw = await fetch(`${t.base}/api/settings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: `{"weights":{"desire":1e999,"table":15,"depth":10,"interaction":10,"replay":10,"art":10,"theme":5}}`,
+    });
+    assert.equal(raw.status, 400);
+    assert.match((await raw.json()).error, /weights/);
+    const { settings } = (await t.call("GET", "/api/state")).body;
+    assert.deepEqual(settings.weights, w);
+    assert.equal(settings.stretch, 1.25);
+  } finally {
+    t.close();
+  }
+});
+
+test("PUT /api/settings keeps weights that total other than 100, and only the seven criteria", async () => {
+  const t = await startApp();
+  try {
+    const weights = { ...DEFAULT_SETTINGS.weights, desire: 30 };
+    const r = await t.call("PUT", "/api/settings", { weights: { ...weights, bogus: 7 } });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body.weights, weights);
+    assert.deepEqual((await t.call("GET", "/api/state")).body.settings.weights, weights);
+  } finally {
+    t.close();
+  }
+});
+
+test("PATCH rejects each bad game field with a 400 naming it, and saves nothing", async () => {
+  const t = await startApp();
+  try {
+    const { body: g } = await t.call("POST", "/api/games", { name: "Bookwyrm" });
+    const bad = [
+      [{ campaignEnd: "2026-13-01" }, /campaignEnd/],
+      [{ campaignEnd: "2026-00-10" }, /campaignEnd/],
+      [{ campaignEnd: "2026-01-32" }, /campaignEnd/],
+      [{ campaignEnd: "2026-01-00" }, /campaignEnd/],
+      [{ notes: null }, /notes/],
+      [{ notes: 5 }, /notes/],
+      [{ notes: "x".repeat(10001) }, /notes/],
+      [{ name: null }, /name/],
+      [{ name: 5 }, /name/],
+      [{ name: "  " }, /name/],
+      [{ name: "x".repeat(201) }, /name/],
+      [{ plays: "3" }, /plays/],
+      [{ plays: -1 }, /plays/],
+      [{ plays: 1.5 }, /plays/],
+      [{ plays: null }, /plays/],
+      [{ type: "expansion" }, /type/],
+      [{ type: null }, /type/],
+      [{ status: "Sold" }, /status/],
+      [{ status: null }, /status/],
+      [{ avoidTheme: "false" }, /avoidTheme/],
+      [{ wontScore: 1 }, /wontScore/],
+      [{ calibration: null }, /calibration/],
+      [{ bestPlayers: null }, /bestPlayers/],
+      [{ bestPlayers: "x".repeat(41) }, /bestPlayers/],
+      [{ notes: { a: 1 } }, /notes/],
+      [{ plays: [1] }, /plays/],
+    ];
+    for (const [patch, msg] of bad) {
+      const r = await t.call("PATCH", `/api/games/${g.id}`, { plays: 7, ...patch, wontScore: patch.wontScore ?? true });
+      assert.equal(r.status, 400, JSON.stringify(patch));
+      assert.match(r.body.error, msg, JSON.stringify(patch));
+    }
+    const after = t.store.getGame(g.id);
+    assert.equal(after.plays, 0);
+    assert.equal(after.wontScore, false);
+    assert.equal(after.name, "Bookwyrm");
+  } finally {
+    t.close();
+  }
+});
+
+test("PATCH accepts every status and type, whole plays, booleans, and trims the name", async () => {
+  const t = await startApp();
+  try {
+    const { body: g } = await t.call("POST", "/api/games", { name: "Bookwyrm" });
+    for (const status of STATUSES) {
+      const r = await t.call("PATCH", `/api/games/${g.id}`, { status });
+      assert.equal(r.status, 200, status);
+      assert.equal(r.body.status, status);
+    }
+    for (const type of GAME_TYPES) assert.equal((await t.call("PATCH", `/api/games/${g.id}`, { type })).body.type, type);
+    const r = await t.call("PATCH", `/api/games/${g.id}`, {
+      name: "  Bookwyrm Deluxe ", plays: 0, notes: "", bestPlayers: "3-4", avoidTheme: false, calibration: true,
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.name, "Bookwyrm Deluxe");
+    assert.equal(r.body.plays, 0);
+    assert.equal(r.body.calibration, true);
+    assert.equal(r.body.bestPlayers, "3-4");
+  } finally {
+    t.close();
+  }
+});
+
+test("a game already holding a value the rules refuse can still have its other fields saved", async () => {
+  const t = await startApp();
+  try {
+    // Stored before validation, or by sync and the import CLIs, which createGame doesn't check.
+    const g = t.store.createGame({ name: "Old", status: "For trade", type: "boardgame", plays: 2 });
+    const r = await t.call("PATCH", `/api/games/${g.id}`, { notes: "still saves", scores: { desire: 8 } });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.status, "For trade");
+    assert.equal(r.body.notes, "still saves");
+  } finally {
+    t.close();
+  }
+});
+
+test("POST /api/games rejects a bad name, type, status or bggId with a 400 and adds nothing", async () => {
+  const t = await startApp();
+  try {
+    const bad = [
+      [{ name: 5 }, /name/],
+      [{ name: "  " }, /name/],
+      [{}, /name/],
+      [{ name: "Root", type: null }, /type/],
+      [{ name: "Root", type: "Expansions" }, /type/],
+      [{ name: "Root", status: null }, /status/],
+      [{ name: "Root", bggId: "abc" }, /bggId/],
+      [{ name: "Root", bggId: "13" }, /bggId/],
+      [{ name: "Root", bggId: 1.5 }, /bggId/],
+      [{ name: "Root", bggId: -4 }, /bggId/],
+      [{ name: "Root", bggId: {} }, /bggId/],
+    ];
+    for (const [body, msg] of bad) {
+      const r = await t.call("POST", "/api/games", body);
+      assert.equal(r.status, 400, JSON.stringify(body));
+      assert.match(r.body.error, msg, JSON.stringify(body));
+    }
+    assert.equal(t.store.listGames().length, 0);
+    const ok = await t.call("POST", "/api/games", { name: " Root ", bggId: null, type: "Expansion", status: "Want" });
+    assert.equal(ok.status, 201);
+    assert.equal(ok.body.name, "Root");
+    assert.equal(ok.body.type, "Expansion");
+    assert.equal((await t.call("POST", "/api/games", { name: "Catan", bggId: 13 })).status, 201);
+    assert.equal((await t.call("POST", "/api/games", { name: "Catan again", bggId: 13 })).status, 409);
+  } finally {
+    t.close();
+  }
+});
+
 // ---------- watchlist ----------
 
 const pick = (obj, like) => Object.fromEntries(Object.keys(like).map((k) => [k, obj[k]]));
@@ -561,6 +1120,27 @@ test("an old database opens with its games intact and the watch fields present a
     } finally {
       t.close();
     }
+  }
+});
+
+test("on open, a prediction on a game with a different BGG ID is detached from it, once", () => {
+  const file = join(mkdtempSync(join(tmpdir(), "ts-mig-")), "reused.db");
+  const store = openDb(file);
+  const g = store.createGame({ name: "Wrong game", bggId: 600 });
+  const wrong = store.createPrediction({ bggId: 500, gameId: g.id, name: "Brass: Extra", model: "m" });
+  const right = store.createPrediction({ bggId: 600, gameId: g.id, name: "Wrong game", model: "m" });
+  const local = store.createPrediction({ gameId: g.id, name: "No BGG", model: "m" });
+  store.db.close();
+  const gameIds = () => {
+    const db = new DatabaseSync(file);
+    const rows = db.prepare("SELECT id, game_id FROM predictions ORDER BY id").all();
+    db.close();
+    return rows.map((r) => [r.id, r.game_id]);
+  };
+  const expected = [[wrong.id, null], [right.id, g.id], [local.id, g.id]];
+  for (let open = 1; open <= 2; open++) {
+    openDb(file).db.close();
+    assert.deepEqual(gameIds(), expected);
   }
 });
 

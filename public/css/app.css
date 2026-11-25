@@ -43,6 +43,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html { -webkit-text-size-adjust: 100%; }
 body {
   margin: 0;
@@ -161,7 +162,6 @@ label.field > span { display: block; font-size: 0.85rem; color: var(--ink-2); ma
   display: grid; place-items: center; padding: 0; border: 0; background: none;
   color: var(--muted); cursor: pointer;
 }
-.search-clear[hidden] { display: none; }
 .search-clear svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; }
 .search-clear:hover, .search-clear:focus-visible { color: var(--ink); }
 .list-count { margin: 0; padding: 0 0 8px; font-size: 0.85rem; }
@@ -196,6 +196,7 @@ label.field > span { display: block; font-size: 0.85rem; color: var(--ink-2); ma
 .score-badge .num.predicted { color: var(--accent); font-style: italic; font-weight: 500; font-size: 1.05rem; }
 .score-badge .lbl { font-size: 0.7rem; color: var(--muted); }
 .empty { padding: 32px 0; text-align: center; color: var(--muted); }
+.boot-retry { justify-content: center; }
 
 /* Scorer */
 .score-head {

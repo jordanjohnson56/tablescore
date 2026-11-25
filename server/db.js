@@ -1,9 +1,9 @@
 // SQLite storage. One file holds every game, its rubric scores and the settings.
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, readdirSync, rmSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { CRITERIA, DEFAULT_SETTINGS, finalScore } from "../public/js/rubric.js";
-import { PLATFORMS, STAGE_KEYS } from "../public/js/watchlist.js";
+import { GAME_TYPES, PLATFORMS, STAGE_KEYS, STATUSES } from "../public/js/watchlist.js";
 
 const SCORE_COLS = CRITERIA.map((c) => `s_${c.key}`);
 
@@ -37,7 +37,12 @@ export const WATCH_FIELDS = {
 // message a 400 carries otherwise.
 // One decimal at most, allowing for float error (7.3 * 10 isn't exactly 73).
 const oneDecimal = (v) => Math.abs(v * 10 - Math.round(v * 10)) < 1e-9;
-const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v) && new Date(`${v}T00:00:00Z`).toISOString().startsWith(v);
+// A real calendar day: 2026-02-30 rolls over to March, and 2026-13-01 is Invalid Date.
+const isDate = (v) => {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
+  const d = new Date(`${v}T00:00:00Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().startsWith(v);
+};
 const WATCH_RULES = {
   watchStage: [(v) => STAGE_KEYS.includes(v), `watchStage must be one of ${STAGE_KEYS.join(", ")} or null`],
   campaignUrl: [(v) => typeof v === "string" && /^https?:\/\/\S+$/.test(v), "campaignUrl must be an http(s) URL or null"],
@@ -65,6 +70,37 @@ export function checkWatchFields(fields) {
   return out;
 }
 
+// One check per user field, as for watch fields, but null is never allowed:
+// every user column is NOT NULL.
+const isText = (max) => (v) => typeof v === "string" && v.length <= max;
+const isFlag = (v) => typeof v === "boolean";
+const USER_RULES = {
+  name: [(v) => isText(200)(v) && v.trim() !== "", "name must be text of 1 to 200 characters"],
+  type: [(v) => GAME_TYPES.includes(v), `type must be one of ${GAME_TYPES.join(", ")}`],
+  status: [(v) => STATUSES.includes(v), `status must be one of ${STATUSES.filter(Boolean).join(", ")} or empty`],
+  plays: [(v) => Number.isInteger(v) && v >= 0, "plays must be a whole number from 0"],
+  avoidTheme: [isFlag, "avoidTheme must be true or false"],
+  wontScore: [isFlag, "wontScore must be true or false"],
+  calibration: [isFlag, "calibration must be true or false"],
+  notes: [isText(10000), "notes must be text of at most 10000 characters"],
+  bestPlayers: [isText(40), "bestPlayers must be text of at most 40 characters"],
+};
+
+/**
+ * Validate user fields in a patch or new game from the API and return their
+ * normalized values (name trimmed). Throws a 400 HttpError on a bad value.
+ * Keys that aren't user fields are ignored.
+ */
+export function checkUserFields(fields) {
+  const out = {};
+  for (const [k, [ok, msg]] of Object.entries(USER_RULES)) {
+    if (fields[k] === undefined) continue;
+    if (!ok(fields[k])) throw new HttpError(400, msg);
+    out[k] = k === "name" ? fields[k].trim() : fields[k];
+  }
+  return out;
+}
+
 const BGG_FIELDS = {
   bggId: "bgg_id",
   name: "name",
@@ -82,6 +118,10 @@ const BGG_FIELDS = {
   image: "image",
   thumbnail: "thumbnail",
 };
+
+// A daily backup's file name in the backups folder: tablescore-YYYY-MM-DD.db.
+export const SNAPSHOT_NAME = /^tablescore-(\d{4}-\d{2}-\d{2})\.db$/;
+export const snapshotName = (day) => `tablescore-${day}.db`;
 
 export function openDb(file) {
   if (file !== ":memory:") mkdirSync(dirname(file), { recursive: true });
@@ -116,6 +156,8 @@ export function openDb(file) {
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     -- Claude's predicted scores. Keyed by BGG ID so a game can be predicted
     -- without adding it; game_id covers games in the list that have no BGG ID.
+    -- A deleted game's predictions keep its game_id, and createGame never
+    -- gives a new game an id a prediction still holds.
     CREATE TABLE IF NOT EXISTS predictions (
       id INTEGER PRIMARY KEY,
       bgg_id INTEGER,
@@ -191,11 +233,22 @@ function migrate(db) {
   // BGG's thumbnail for a predicted game that isn't in the list.
   const predCols = new Set(db.prepare("PRAGMA table_info(predictions)").all().map((c) => c.name));
   if (!predCols.has("thumbnail")) db.exec("ALTER TABLE predictions ADD COLUMN thumbnail TEXT");
+  // Before createGame stopped reusing ids, a deleted game's predictions could
+  // land on the next game. Where the BGG IDs disagree that is provable (a
+  // game's BGG ID is only ever set from empty), so detach them; their BGG ID
+  // still finds them.
+  db.exec(`UPDATE predictions SET game_id = NULL WHERE bgg_id IS NOT NULL AND game_id IN
+    (SELECT id FROM games g WHERE g.bgg_id IS NOT NULL AND g.bgg_id != predictions.bgg_id)`);
 }
 
 export class Store {
   constructor(db) {
     this.db = db;
+  }
+
+  /** Close the database. SQLite checkpoints the WAL and removes -wal and -shm on the last close. */
+  close() {
+    this.db.close();
   }
 
   getSettings() {
@@ -209,7 +262,7 @@ export class Store {
     const stmt = this.db.prepare(
       "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     );
-    for (const key of ["weights", "stretch", "hideExpansions", "includeWatching", "tasteProfile", "recommendFrequency", "recommendNominees"]) {
+    for (const key of ["weights", "stretch", "hideExpansions", "includeWatching", "tasteProfile", "recommendFrequency", "recommendNominees", "dailyPredictionCap"]) {
       if (patch[key] !== undefined) stmt.run(key, JSON.stringify(patch[key]));
     }
     return this.getSettings();
@@ -241,8 +294,14 @@ export class Store {
     }
     if (!cols.name) throw new HttpError(400, "name is required");
     const names = Object.keys(cols);
+    // A deleted game's predictions keep its id, and SQLite would hand a deleted
+    // highest id to the next game, which would then show them as its own. So
+    // the new id is above every game id and every prediction's game_id. One
+    // statement, so the CLIs writing to the same file can't race it.
+    const nextId =
+      "(SELECT MAX(IFNULL((SELECT MAX(id) FROM games), 0), IFNULL((SELECT MAX(game_id) FROM predictions), 0)) + 1)";
     const { lastInsertRowid } = this.db
-      .prepare(`INSERT INTO games (${names.join(", ")}) VALUES (${names.map(() => "?").join(", ")})`)
+      .prepare(`INSERT INTO games (id, ${names.join(", ")}) VALUES (${nextId}, ${names.map(() => "?").join(", ")})`)
       .run(...Object.values(cols));
     return this.getGame(Number(lastInsertRowid));
   }
@@ -252,7 +311,9 @@ export class Store {
     const sets = [];
     const vals = [];
     const watch = checkWatchFields(patch);
+    const user = checkUserFields(patch);
     for (const [k, v] of Object.entries(patch)) {
+      if (v === undefined) continue; // an internal caller's absent field
       if (k in watch) {
         sets.push(`${WATCH_FIELDS[k][0]} = ?`);
         vals.push(watch[k]);
@@ -265,10 +326,9 @@ export class Store {
           sets.push(`s_${ck} = ?`);
           vals.push(cv);
         }
-      } else if (USER_FIELDS[k]) {
-        if (k === "name" && !String(v).trim()) throw new HttpError(400, "name is required");
+      } else if (k in user) {
         sets.push(`${USER_FIELDS[k]} = ?`);
-        vals.push(toSql(v));
+        vals.push(toSql(user[k]));
       } else {
         throw new HttpError(400, `field ${k} is not editable`);
       }
@@ -398,27 +458,65 @@ export class Store {
   /**
    * Predicted vs actual for every game scored in the app after a prediction:
    * the latest finished prediction made before the game's first full score.
+   * Besides the error on the final it reports bias (positive = Claude scores
+   * higher), the error on each criterion and by Claude's confidence, and two
+   * free baselines to compare with, each worked out without the judged game.
    */
   predictionAccuracy() {
     const settings = this.getSettings();
-    const pairs = [];
-    for (const row of this.db.prepare("SELECT * FROM games WHERE scored_at IS NOT NULL").all()) {
+    const games = this.db.prepare("SELECT * FROM games").all().map((row) => {
       const game = toGame(row);
-      const actual = finalScore(game.scores, settings);
-      if (actual == null) continue;
-      const before = this.db
-        .prepare(
-          `SELECT * FROM predictions WHERE status = 'done' AND created_at < ? AND (bgg_id = ? OR game_id = ?)
-           ORDER BY created_at DESC, id DESC LIMIT 1`,
-        )
-        .get(row.scored_at, game.bggId, game.id);
+      return { game, scoredAt: row.scored_at, tablescore: finalScore(game.scores, settings) };
+    });
+    const withScore = games.filter((g) => g.tablescore != null);
+    // A prediction is taken by game id only when it names no other BGG game, so
+    // one left on a reused id by a deleted BGG game can't pair with this one.
+    const latestBefore = this.db.prepare(
+      `SELECT * FROM predictions WHERE status = 'done' AND created_at < ?
+         AND (bgg_id = ? OR (game_id = ? AND bgg_id IS NULL))
+       ORDER BY created_at DESC, id DESC LIMIT 1`,
+    );
+    const pairs = [];
+    for (const { game, scoredAt, tablescore: actual } of games) {
+      if (!scoredAt || actual == null) continue;
+      const before = latestBefore.get(scoredAt, game.bggId, game.id);
       if (!before) continue;
       const p = toPrediction(before, settings);
-      pairs.push({ gameId: game.id, name: game.name, predictionId: p.id, predicted: p.final, actual, error: Math.round((p.final - actual) * 10) / 10 });
+      if (p.final == null) continue;
+      const others = withScore.filter((g) => g.game.id !== game.id);
+      pairs.push({
+        gameId: game.id,
+        name: game.name,
+        predictionId: p.id,
+        predicted: p.final,
+        actual,
+        error: round1(p.final - actual),
+        confidence: p.confidence,
+        criteria: Object.fromEntries(CRITERIA.map((c) => [c.key, round1(p.scores[c.key] - game.scores[c.key])])),
+        baselines: { mean: meanBaseline(others), bggAvg: bggAvgBaseline(others, game.bggAvg) },
+      });
     }
-    const n = pairs.length;
-    const meanAbsError = n ? Math.round((pairs.reduce((t, x) => t + Math.abs(x.predicted - x.actual), 0) / n) * 100) / 100 : null;
-    return { n, meanAbsError, pairs };
+    const finalErrors = (list) => list.map((x) => x.predicted - x.actual);
+    const baseline = (kind) => {
+      const covered = pairs.filter((x) => x.baselines[kind] != null);
+      return {
+        ...summarise(covered.map((x) => x.baselines[kind] - x.actual)),
+        claudeMeanAbsError: summarise(finalErrors(covered)).meanAbsError,
+      };
+    };
+    const all = summarise(finalErrors(pairs));
+    return {
+      n: all.n,
+      meanAbsError: all.meanAbsError,
+      bias: all.bias,
+      criteria: CRITERIA.map((c) => ({ key: c.key, ...summarise(pairs.map((x) => x.criteria[c.key])) })),
+      byConfidence: CONFIDENCES.map((confidence) => ({
+        confidence,
+        ...summarise(finalErrors(pairs.filter((x) => x.confidence === confidence))),
+      })),
+      baselines: { mean: baseline("mean"), bggAvg: baseline("bggAvg") },
+      pairs,
+    };
   }
 
   // ---------- recommendations ----------
@@ -481,6 +579,18 @@ export class Store {
       .map(toRecommendation);
   }
 
+  /**
+   * How many of the newest finished runs failed in a row, counting at most
+   * `limit`. A run still going doesn't count either way.
+   */
+  failedRunStreak(limit = 2) {
+    const rows = this.db
+      .prepare("SELECT status FROM recommendation_runs WHERE status != 'running' ORDER BY started_at DESC, id DESC LIMIT ?")
+      .all(limit);
+    const ok = rows.findIndex((r) => r.status !== "failed");
+    return ok === -1 ? rows.length : ok;
+  }
+
   /** The newest finished run, or null. */
   lastRecommendationRun(status = "done") {
     const row = this.db
@@ -530,6 +640,18 @@ export class Store {
       .map((r) => ({ bggId: r.bgg_id, name: r.name }));
   }
 
+  /**
+   * Claude conversations started at or after `since` (an ISO time), for the
+   * daily prediction cap: every prediction row, whatever its status, plus one
+   * per run for its nomination. `oldest` is the earliest of their start times.
+   */
+  claudeUsageSince(since) {
+    const p = this.db.prepare("SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM predictions WHERE created_at >= ?").get(since);
+    const r = this.db.prepare("SELECT COUNT(*) AS n, MIN(started_at) AS oldest FROM recommendation_runs WHERE started_at >= ?").get(since);
+    const oldest = [p.oldest, r.oldest].filter(Boolean).sort()[0] ?? null;
+    return { used: p.n + r.n, oldest };
+  }
+
   /** The newest finished prediction for a BGG ID made after `since` (an ISO time), or null. */
   recentPrediction(bggId, since) {
     const row = this.db
@@ -573,20 +695,61 @@ export class Store {
     }
   }
 
-  /** Daily snapshot into dir, keeping the newest `keep` files. */
+  /**
+   * Daily backup into dir, then keeps the newest `keep` backups (a whole number of 1 or more).
+   * The snapshot goes to a temporary file, is checked and synced, and only then replaces
+   * today's backup, so a failure throws and leaves every existing backup in place.
+   * The file just written is never deleted.
+   */
   backup(dir, keep = 14, now = new Date()) {
+    if (!Number.isInteger(keep) || keep < 1) throw new RangeError("keep must be an integer of 1 or more");
     mkdirSync(dir, { recursive: true });
-    const file = join(dir, `tablescore-${now.toISOString().slice(0, 10)}.db`);
-    rmSync(file, { force: true });
-    this.db.prepare("VACUUM INTO ?").run(file);
+    const file = join(dir, snapshotName(now.toISOString().slice(0, 10)));
+    const tmp = `${file}.tmp`;
+    for (const f of readdirSync(dir)) {
+      if (/^tablescore-\d{4}-\d{2}-\d{2}\.db\.tmp(-journal|-wal|-shm)?$/.test(f)) rmSync(join(dir, f), { force: true });
+    }
+    try {
+      this.db.prepare("VACUUM INTO ?").run(tmp);
+      const check = new DatabaseSync(tmp, { readOnly: true });
+      try {
+        const rows = check.prepare("PRAGMA quick_check").all();
+        if (rows.length !== 1 || Object.values(rows[0])[0] !== "ok") throw new Error(`backup check failed: ${JSON.stringify(rows)}`);
+      } finally {
+        check.close();
+      }
+      const fd = openSync(tmp, "r+");
+      try {
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(tmp, file);
+    } catch (e) {
+      for (const suffix of ["", "-journal", "-wal", "-shm"]) rmSync(tmp + suffix, { force: true });
+      throw e;
+    }
     const old = readdirSync(dir)
-      .filter((f) => /^tablescore-\d{4}-\d{2}-\d{2}\.db$/.test(f))
+      .filter((f) => SNAPSHOT_NAME.test(f))
       .sort()
       .reverse()
-      .slice(keep);
+      .slice(keep)
+      .filter((f) => f !== basename(file));
     for (const f of old) rmSync(join(dir, f));
     return file;
   }
+}
+
+/**
+ * Reads BACKUP_KEEP: a whole number of 1 or more in plain digits. Unset or blank gives
+ * the fallback; anything else gives the fallback with invalid set, for a start-up warning.
+ */
+export function parseBackupKeep(raw, fallback = 14) {
+  const s = raw == null ? "" : String(raw).trim();
+  if (s === "") return { keep: fallback, invalid: false };
+  const n = Number(s);
+  if (!/^\d+$/.test(s) || n < 1 || !Number.isSafeInteger(n)) return { keep: fallback, invalid: true };
+  return { keep: n, invalid: false };
 }
 
 export class HttpError extends Error {
@@ -660,6 +823,56 @@ function toRecommendation(r) {
     rank: r.rank,
     dropped: r.dropped,
   };
+}
+
+// ---------- prediction accuracy ----------
+
+const CONFIDENCES = ["high", "medium", "low"];
+/** The BGG average baseline needs at least this many other games to fit its line. */
+const BASELINE_MIN_GAMES = 10;
+
+const round1 = (x) => Math.round(x * 10) / 10 || 0; // `|| 0` turns -0 into 0
+const round2 = (x) => Math.round(x * 100) / 100 || 0;
+
+/** Mean absolute and mean signed error, to two decimals; null means when there are none. */
+function summarise(errors) {
+  const n = errors.length;
+  if (!n) return { n, meanAbsError: null, bias: null };
+  return {
+    n,
+    meanAbsError: round2(errors.reduce((t, e) => t + Math.abs(e), 0) / n),
+    bias: round2(errors.reduce((t, e) => t + e, 0) / n),
+  };
+}
+
+/** Guessing the mean Tablescore of the other games every time. */
+function meanBaseline(others) {
+  if (!others.length) return null;
+  return round1(others.reduce((t, g) => t + g.tablescore, 0) / others.length);
+}
+
+/** A least-squares line from BGG average to Tablescore over the other games, read at this game's BGG average. */
+function bggAvgBaseline(others, bggAvg) {
+  if (bggAvg == null) return null;
+  const line = fitLine(others.filter((g) => g.game.bggAvg != null).map((g) => [g.game.bggAvg, g.tablescore]));
+  if (!line) return null;
+  return round1(Math.max(0, Math.min(10, line.a + line.b * bggAvg)));
+}
+
+/** Tablescore = a + b × x, or null with too few points or every x the same. */
+function fitLine(points) {
+  if (points.length < BASELINE_MIN_GAMES) return null;
+  const mx = points.reduce((t, [x]) => t + x, 0) / points.length;
+  const my = points.reduce((t, [, y]) => t + y, 0) / points.length;
+  let sxx = 0;
+  let sxy = 0;
+  for (const [x, y] of points) {
+    sxx += (x - mx) ** 2;
+    sxy += (x - mx) * (y - my);
+  }
+  if (sxx === 0) return null;
+  const b = sxy / sxx;
+  return { a: my - b * mx, b };
 }
 
 /** The final score is worked out with the current weights, like a game's. */

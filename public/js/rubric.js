@@ -136,6 +136,8 @@ export const DEFAULT_SETTINGS = {
   // How often Claude refreshes the recommendations, and how many games it nominates per run.
   recommendFrequency: "weekly",
   recommendNominees: 10,
+  // The most Claude conversations (predictions plus each run's nomination) started in any 24 hours.
+  dailyPredictionCap: 30,
 };
 
 export const RECOMMEND_FREQUENCIES = [
@@ -164,6 +166,28 @@ export function scaleEntry(score) {
 
 export function weightTotal(weights) {
   return CRITERIA.reduce((t, c) => t + (Number(weights[c.key]) || 0), 0);
+}
+
+/** The most one criterion can weigh. */
+export const MAX_WEIGHT = 1000;
+
+/**
+ * Why these weights can't be saved, or null if they can: each criterion needs
+ * a number from 0 to MAX_WEIGHT, and the total must be above 0 or every game
+ * reads as unscored. A total other than 100 is allowed.
+ */
+export function weightsProblem(weights) {
+  if (weights === null || typeof weights !== "object" || Array.isArray(weights)) {
+    return "weights must be an object with a number for every criterion";
+  }
+  for (const c of CRITERIA) {
+    const w = weights[c.key];
+    if (!(typeof w === "number" && Number.isFinite(w) && w >= 0 && w <= MAX_WEIGHT)) {
+      return `weights needs a number from 0 to ${MAX_WEIGHT} for ${c.key}`;
+    }
+  }
+  if (weightTotal(weights) <= 0) return "weights must total above 0, or no game has a Tablescore";
+  return null;
 }
 
 export function scoredCount(scores = {}) {
